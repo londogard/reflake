@@ -14,10 +14,14 @@ from ..client_state import LocalClientState
 from ..domain import (
     BranchRefState,
     CommitObject,
+    EmptyBranchError,
     NonFastForwardError,
     RefConflictError,
+    UnknownCommitError,
+    UnknownRefError,
 )
 from ..objects import ObjectStore
+from ..repository_support import is_ancestor_commit
 
 
 class _BoundedCache(OrderedDict[str, CommitObject]):
@@ -91,18 +95,18 @@ class RefManager:
             current_token = self.store.version_token("ref", branch_or_commit)
             if current_token == cached_branch_ref.version_token:
                 if not cached_branch_ref.commit_id:
-                    raise ValueError(f"Branch has no commits: {branch_or_commit}")
+                    raise EmptyBranchError(branch_or_commit)
                 return cached_branch_ref.commit_id
 
         branch_ref = self.store.read_branch_ref(branch_or_commit)
         if branch_ref is not None:
             self._resolved_ref_cache[branch_or_commit] = branch_ref
             if not branch_ref.commit_id:
-                raise ValueError(f"Branch has no commits: {branch_or_commit}")
+                raise EmptyBranchError(branch_or_commit)
             return branch_ref.commit_id
         if self.store.object_exists("commit", branch_or_commit):
             return branch_or_commit
-        raise ValueError(f"Unknown branch or commit: {branch_or_commit}")
+        raise UnknownRefError(branch_or_commit)
 
     def branch(self, name: str) -> Path:
         if not name or "/" in name or name.startswith("."):
@@ -134,7 +138,7 @@ class RefManager:
             pass
         commit_payload = self.store.read_commit_bytes(commit_id)
         if commit_payload is None:
-            raise ValueError(f"Unknown commit: {commit_id}")
+            raise UnknownCommitError(commit_id)
         data = json.loads(commit_payload.decode("utf-8"))
         parents_raw = data.get("parents") or []
         commit = CommitObject(
@@ -163,7 +167,7 @@ class RefManager:
 
         branch_state = self.store.read_branch_ref(branch)
         if branch_state is None:
-            raise ValueError(f"Unknown branch: {branch}")
+            raise UnknownRefError(branch)
         self.client_state.write_branch_snapshot(
             branch,
             commit_id=branch_state.commit_id,
@@ -186,18 +190,11 @@ class RefManager:
         return branch_ref.commit_id
 
     def is_ancestor(self, *, ancestor_commit: str, descendant_commit: str) -> bool:
-        ancestor = self.read_commit(ancestor_commit)
-        descendant = self.read_commit(descendant_commit)
-        if descendant.generation < ancestor.generation:
-            return False
-        if descendant.generation == ancestor.generation:
-            return descendant_commit == ancestor_commit
-        current_commit: str | None = descendant_commit
-        while current_commit:
-            if current_commit == ancestor_commit:
-                return True
-            current_commit = self.read_commit(current_commit).first_parent
-        return False
+        return is_ancestor_commit(
+            ancestor_commit,
+            descendant_commit,
+            read_commit=self.read_commit,
+        )
 
     def fast_forward_branch(
         self,

@@ -23,13 +23,20 @@ from .backends import (
     SourceObjectMetadata,
     StorageBackend,
 )
-from .base import ObjectStore
+from .base import (
+    ObjectIO,
+    ObjectStore,
+    RefCas,
+    StoreInventory,
+    TreeQuery,
+)
 from .local import LocalObjectStore
 from .s3 import S3ObjectStore
 from .source import (
     S3StorageBackend,
     _s3_is_404,
     _s3_is_precondition_failed,
+    build_s3_client,
     describe_source_uri,
     iter_s3_objects,
     open_source_uri,
@@ -46,7 +53,9 @@ __all__ = [
     "BranchRefState",
     "LocalObjectStore",
     "LocalStorageBackend",
+    "ObjectIO",
     "ObjectStore",
+    "RefCas",
     "S3BlobTransferBackend",
     "S3ObjectMetadata",
     "S3ObjectStore",
@@ -54,7 +63,10 @@ __all__ = [
     "S5CmdBlobTransferBackend",
     "SourceObjectMetadata",
     "StorageBackend",
+    "StoreInventory",
+    "TreeQuery",
     "build_blob_transfer_backend",
+    "build_s3_client",
     "describe_source_uri",
     "iter_s3_objects",
     "open_source_uri",

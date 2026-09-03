@@ -6,17 +6,22 @@ from dataclasses import dataclass
 from json import JSONDecodeError
 from pathlib import Path
 from pathlib import PurePosixPath
+
+import msgspec
 from typing import Callable, Iterable, Iterator
 
+from .entry_codec import (
+    LeafRecord,
+    decode_leaf_parts,
+    encode_leaf,
+    leaf_kind_for,
+    validate_leaf,
+)
 from .hashing import blake3_digest_file
 
 SUPPORTED_IDENTITY_MODES = frozenset({"blake3", "meta"})
 _BLAKE3_HEX_LENGTH = 64
 _HEX_DIGITS = frozenset("0123456789abcdef")
-_BLOB_BACKED_MANIFEST_TAG = "b"
-_META_ONLY_MANIFEST_TAG = "m"
-_BLOB_BACKED_PARQUET_TAG = "bp"
-_META_ONLY_PARQUET_TAG = "mp"
 
 
 def _is_hex_digest(value: str) -> bool:
@@ -48,27 +53,24 @@ def _validate_hex_digest(value: str, *, field_name: str) -> None:
 
 @dataclass(frozen=True)
 class ManifestEntry:
+    """A leaf entry addressed by its full logical path.
+
+    ``identity_value`` and ``blob_hash`` are derived, not stored: the identity
+    is always ``hash``, and the blob hash exists exactly when the entry is
+    content-verified (``identity_mode == "blake3"``).
+    """
+
     path: str
     hash: str
     size: int
     mtime_ns: int
     identity_mode: str = "blake3"
-    identity_value: str | None = None
-    blob_hash: str | None = None
     source_uri: str | None = None
     footer: str | None = None
 
     def __post_init__(self) -> None:
-        if self.identity_value is None:
-            object.__setattr__(self, "identity_value", self.hash)
-
         _validate_manifest_path(self.path)
         _validate_hex_digest(self.hash, field_name="hash")
-
-        identity_value = self.identity_value
-        if identity_value is None:
-            raise ValueError("Manifest entry identity_value cannot be empty")
-        _validate_hex_digest(identity_value, field_name="identity_value")
 
         if self.identity_mode not in SUPPORTED_IDENTITY_MODES:
             supported_modes = ", ".join(sorted(SUPPORTED_IDENTITY_MODES))
@@ -79,39 +81,21 @@ class ManifestEntry:
             raise ValueError("Manifest entry size cannot be negative")
         if self.mtime_ns < 0:
             raise ValueError("Manifest entry mtime_ns cannot be negative")
-        if identity_value != self.hash:
-            raise ValueError("Manifest entry identity_value must match hash")
-
-        if self.blob_hash is not None:
-            _validate_hex_digest(self.blob_hash, field_name="blob_hash")
-
         if self.source_uri is not None and not self.source_uri.strip():
             raise ValueError("Manifest entry source_uri cannot be empty")
-
         if self.footer is not None:
             _validate_hex_digest(self.footer, field_name="footer")
 
-        if self.identity_mode == "meta":
-            if self.blob_hash is not None:
-                raise ValueError(
-                    "Metadata-only manifest entries cannot include blob_hash"
-                )
-            if self.source_uri is None:
-                raise ValueError(
-                    "Metadata-only manifest entries must include source_uri"
-                )
-        elif self.blob_hash is not None and self.blob_hash != self.hash:
-            raise ValueError("Blob-backed manifest entries must keep blob_hash aligned")
+        kind = leaf_kind_for(self.identity_mode, has_footer=self.footer is not None)
+        validate_leaf(kind, source_uri=self.source_uri, footer=self.footer)
 
-        if self.footer is not None:
-            if self.identity_mode == "meta" and self.blob_hash is not None:
-                raise ValueError(
-                    "Metadata-only parquet entries cannot include blob_hash"
-                )
-            if self.identity_mode == "blake3" and self.blob_hash is None:
-                raise ValueError(
-                    "Blob-backed parquet entries must include blob_hash"
-                )
+    @property
+    def identity_value(self) -> str:
+        return self.hash
+
+    @property
+    def blob_hash(self) -> str | None:
+        return self.hash if self.identity_mode == "blake3" else None
 
     @property
     def is_verified(self) -> bool:
@@ -125,56 +109,25 @@ class ManifestEntry:
         return self.identity_mode == "blake3"
 
     def serialize(self) -> str:
-        if self.identity_mode == "blake3":
-            if self.footer is not None:
-                payload: list[object] = [
-                    _BLOB_BACKED_PARQUET_TAG,
-                    self.path,
-                    self.hash,
-                    self.size,
-                    self.mtime_ns,
-                    self.footer,
-                ]
-            else:
-                payload = [
-                    _BLOB_BACKED_MANIFEST_TAG,
-                    self.path,
-                    self.hash,
-                    self.size,
-                    self.mtime_ns,
-                ]
-        elif self.identity_mode == "meta":
-            if self.footer is not None:
-                payload = [
-                    _META_ONLY_PARQUET_TAG,
-                    self.path,
-                    self.hash,
-                    self.size,
-                    self.mtime_ns,
-                    self.source_uri,
-                    self.footer,
-                ]
-            else:
-                payload = [
-                    _META_ONLY_MANIFEST_TAG,
-                    self.path,
-                    self.hash,
-                    self.size,
-                    self.mtime_ns,
-                    self.source_uri,
-                ]
-        else:
-            supported_modes = ", ".join(sorted(SUPPORTED_IDENTITY_MODES))
-            raise ValueError(
-                f"Manifest entry identity_mode must be one of: {supported_modes}"
+        return encode_leaf(
+            LeafRecord(
+                kind=leaf_kind_for(
+                    self.identity_mode, has_footer=self.footer is not None
+                ),
+                name=self.path,
+                hash=self.hash,
+                size=self.size,
+                mtime_ns=self.mtime_ns,
+                source_uri=self.source_uri,
+                footer=self.footer,
             )
-        return json.dumps(payload, separators=(",", ":"))
+        )
 
     @staticmethod
     def deserialize(payload_text: str) -> "ManifestEntry":
         try:
             payload = _load_manifest_payload(payload_text)
-        except JSONDecodeError as error:
+        except (JSONDecodeError, msgspec.DecodeError) as error:
             raise ValueError("Corrupt manifest entry payload") from error
         return _manifest_entry_from_payload(payload)
 
@@ -182,7 +135,7 @@ class ManifestEntry:
     def path_from_payload(payload_text: str) -> str:
         try:
             payload = _load_manifest_payload(payload_text)
-        except JSONDecodeError as error:
+        except (JSONDecodeError, msgspec.DecodeError) as error:
             raise ValueError("Corrupt manifest entry payload") from error
         if not isinstance(payload, list) or len(payload) < 2:
             raise ValueError("Manifest entry payload must be a JSON array")
@@ -195,13 +148,6 @@ class ManifestEntry:
         hash_value = str(data.get("hash") or data.get("identity_value") or "")
         if not hash_value:
             raise ValueError("Manifest entry must include hash or identity_value")
-        identity_mode = str(data.get("identity_mode") or "blake3")
-        identity_value = data.get("identity_value")
-        blob_hash = data.get("blob_hash")
-        if blob_hash is None and "blob_hash" not in data and identity_mode == "blake3":
-            blob_hash = hash_value
-        source_uri = data.get("source_uri")
-        footer = data.get("footer")
 
         try:
             path = str(data["path"])
@@ -216,89 +162,46 @@ class ManifestEntry:
                 "Manifest entry size and mtime_ns must be integers"
             ) from error
 
+        source_uri = data.get("source_uri")
+        footer = data.get("footer")
         return ManifestEntry(
             path=path,
             hash=hash_value,
             size=size,
             mtime_ns=mtime_ns,
-            identity_mode=identity_mode,
-            identity_value=(
-                str(identity_value) if identity_value is not None else hash_value
-            ),
-            blob_hash=str(blob_hash) if blob_hash is not None else None,
+            identity_mode=str(data.get("identity_mode") or "blake3"),
             source_uri=str(source_uri) if source_uri is not None else None,
             footer=str(footer) if footer is not None else None,
         )
 
 
 def _load_manifest_payload(payload_text: str) -> object:
-    return json.loads(payload_text)
+    return msgspec.json.decode(payload_text)
 
 
 def _manifest_entry_from_payload(payload: object) -> ManifestEntry:
-
     if not isinstance(payload, list):
         raise ValueError("Manifest entry payload must be a JSON array")
-    if len(payload) == 5 and payload[0] == _BLOB_BACKED_MANIFEST_TAG:
-        _, path, hash_value, size, mtime_ns = payload
-        return ManifestEntry(
-            path=str(path),
-            hash=str(hash_value),
-            size=int(size),
-            mtime_ns=int(mtime_ns),
-            identity_mode="blake3",
-            identity_value=str(hash_value),
-            blob_hash=str(hash_value),
-            source_uri=None,
-        )
-    if len(payload) == 6 and payload[0] == _META_ONLY_MANIFEST_TAG:
-        _, path, hash_value, size, mtime_ns, source_uri = payload
-        return ManifestEntry(
-            path=str(path),
-            hash=str(hash_value),
-            size=int(size),
-            mtime_ns=int(mtime_ns),
-            identity_mode="meta",
-            identity_value=str(hash_value),
-            blob_hash=None,
-            source_uri=str(source_uri),
-        )
-    if len(payload) == 6 and payload[0] == _BLOB_BACKED_PARQUET_TAG:
-        _, path, hash_value, size, mtime_ns, footer = payload
-        return ManifestEntry(
-            path=str(path),
-            hash=str(hash_value),
-            size=int(size),
-            mtime_ns=int(mtime_ns),
-            identity_mode="blake3",
-            identity_value=str(hash_value),
-            blob_hash=str(hash_value),
-            source_uri=None,
-            footer=str(footer),
-        )
-    if len(payload) == 7 and payload[0] == _META_ONLY_PARQUET_TAG:
-        _, path, hash_value, size, mtime_ns, source_uri, footer = payload
-        return ManifestEntry(
-            path=str(path),
-            hash=str(hash_value),
-            size=int(size),
-            mtime_ns=int(mtime_ns),
-            identity_mode="meta",
-            identity_value=str(hash_value),
-            blob_hash=None,
-            source_uri=str(source_uri),
-            footer=str(footer),
-        )
-    raise ValueError("Manifest entry payload has an unsupported shape")
+    record = decode_leaf_parts(payload)
+    return ManifestEntry(
+        path=record.name,
+        hash=record.hash,
+        size=record.size,
+        mtime_ns=record.mtime_ns,
+        identity_mode="blake3" if record.kind in ("b", "bp") else "meta",
+        source_uri=record.source_uri,
+        footer=record.footer,
+    )
 
 
 def _manifest_entry_path_for_index(payload_text: str) -> str:
-    """Extract the path from a compact-serialized manifest entry without full JSON parse.
+    """Extract the path from a serialized manifest entry.
 
-    The compact JSON format is always ``["b","path",...]`` or ``["m","path",...]``
-    with ``separators=(",",":")`` — the path is the third quoted field.
+    Parses the payload as JSON so paths containing quotes or escapes are
+    extracted correctly (the previous quote-splitting shortcut mangled them,
+    corrupting derived-manifest index keys).
     """
-    return payload_text.split('"', 4)[3]
+    return ManifestEntry.path_from_payload(payload_text)
 
 
 class ManifestWriter:
@@ -389,7 +292,7 @@ class ManifestReader:
                     continue
                 try:
                     payload = _load_manifest_payload(line)
-                except JSONDecodeError as error:
+                except (JSONDecodeError, msgspec.DecodeError) as error:
                     raise ValueError(
                         f"Corrupt manifest JSON at line {line_number} in {self.manifest_path}"
                     ) from error
@@ -419,9 +322,6 @@ def build_manifest_entries(
             size=stat.st_size,
             mtime_ns=stat.st_mtime_ns,
             identity_mode="blake3",
-            identity_value=digest,
-            blob_hash=digest,
-            source_uri=file_path.as_uri(),
         )
 
 

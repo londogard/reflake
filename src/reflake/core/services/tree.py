@@ -29,6 +29,7 @@ from blake3 import blake3
 
 from ..client_state import LocalClientState
 from ..domain import CommitObject
+from ..entry_codec import LeafRecord, encode_leaf, leaf_kind_for
 from ..hashing import blake3_digest_file
 from ..manifest import FileEntry, ManifestEntry, ManifestWriter, walk_files
 from ..objects.query import TreeWalker
@@ -44,7 +45,7 @@ from ..objects.tree import (
     leaf_to_tree_entry,
 )
 from ..objects import ObjectStore
-from ..repository_support import metadata_identity
+from ..repository_support import merge_sorted_streams, metadata_identity
 from .refs import RefManager
 
 #: Derived-manifest block size for the optional client-side point-lookup cache.
@@ -91,15 +92,17 @@ def _leaf_line(
     source_uri: str | None,
     footer: str | None,
 ) -> str:
-    if kind == KIND_BLOB:
-        payload: list[object] = [kind, name, hash_value, size, mtime_ns]
-    elif kind == KIND_META:
-        payload = [kind, name, hash_value, size, mtime_ns, source_uri]
-    elif kind == KIND_BP:
-        payload = [kind, name, hash_value, size, mtime_ns, footer]
-    else:  # KIND_MP
-        payload = [kind, name, hash_value, size, mtime_ns, source_uri, footer]
-    return json.dumps(payload, separators=(",", ":"))
+    return encode_leaf(
+        LeafRecord(
+            kind=kind,
+            name=name,
+            hash=hash_value,
+            size=size,
+            mtime_ns=mtime_ns,
+            source_uri=source_uri,
+            footer=footer,
+        )
+    )
 
 
 def _subtree_line(kind: str, name: str, hash_value: str) -> str:
@@ -107,21 +110,16 @@ def _subtree_line(kind: str, name: str, hash_value: str) -> str:
 
 
 def _entry_to_leaf_line(entry: ManifestEntry) -> str:
-    name = entry.path.rsplit("/", 1)[-1]
-    if entry.identity_mode == "blake3":
-        kind = KIND_BP if entry.footer is not None else KIND_BLOB
-        source_uri: str | None = None
-    else:
-        kind = KIND_MP if entry.footer is not None else KIND_META
-        source_uri = entry.source_uri
-    return _leaf_line(
-        kind=kind,
-        name=name,
-        hash_value=entry.hash,
-        size=entry.size,
-        mtime_ns=entry.mtime_ns,
-        source_uri=source_uri,
-        footer=entry.footer,
+    return encode_leaf(
+        LeafRecord(
+            kind=leaf_kind_for(entry.identity_mode, has_footer=entry.footer is not None),
+            name=entry.path.rsplit("/", 1)[-1],
+            hash=entry.hash,
+            size=entry.size,
+            mtime_ns=entry.mtime_ns,
+            source_uri=entry.source_uri if entry.identity_mode == "meta" else None,
+            footer=entry.footer,
+        )
     )
 
 
@@ -142,39 +140,35 @@ class TreeWriter:
 
     def _write_tree_bytes(self, payload: bytes) -> str:
         tree_hash = blake3(payload).hexdigest()
-        if self.store.object_exists("tree", tree_hash):
-            return tree_hash
-        with NamedTemporaryFile(mode="wb", suffix=".tree", delete=False) as temp:
-            temp_path = Path(temp.name)
-            temp.write(payload)
-        try:
-            self.store.write_tree_file(tree_hash, temp_path, if_missing=True)
-        finally:
-            temp_path.unlink(missing_ok=True)
+        # object_exists check omitted: write_tree_bytes with if_missing=True
+        # uses IfNoneMatch=* (S3) or path.exists() (local) as an atomic guard.
+        # A 412 / early-return on conflict is handled inside write_tree_bytes.
+        self.store.write_tree_bytes(tree_hash, payload, if_missing=True)
         return tree_hash
 
-    def _build_children(self, children: list[_Child]) -> str:
+    def _build_children(self, children: list[_Child], *, already_sorted: bool = False) -> str:
         """Build (and shard) a tree object from children; returns its hash.
 
         Children are sorted by name here — directory frames close lazily
         during a walk, so callers may hand us out-of-order lists (e.g. root
         files appended while an earlier sibling directory is still open).
+        Pass already_sorted=True when the caller guarantees sorted order.
         """
-        if len(children) > 1:
+        if not already_sorted and len(children) > 1:
             children = sorted(children, key=lambda item: item[0])
         if len(children) <= MAX_TREE_ENTRIES:
-            payload = ("\n".join(line for _, line in children) + "\n").encode("utf-8")
+            payload = b"\n".join(line.encode() for _, line in children) + b"\n"
             return self._write_tree_bytes(payload)
 
         shard_children: list[_Child] = []
         for start in range(0, len(children), MAX_TREE_ENTRIES):
             chunk = children[start : start + MAX_TREE_ENTRIES]
-            shard_hash = self._build_children(chunk)
+            shard_hash = self._build_children(chunk, already_sorted=True)
             shard_name = chunk[0][0]
             shard_children.append(
                 (shard_name, _subtree_line(KIND_SHARD, shard_name, shard_hash))
             )
-        return self._build_children(shard_children)
+        return self._build_children(shard_children, already_sorted=True)
 
     # ── Full-commit builder (worktree walk + parent reuse) ───────────────
 
@@ -198,7 +192,7 @@ class TreeWriter:
         source file is gone).  Staged removals are pruned in a final pass.
         """
         removed = set(removed_paths)
-        root_hash = self._build_worktree_inner(
+        root_hash, leftover_addition_dirs = self._build_worktree_inner(
             worktree_root=worktree_root,
             parent_tree=parent_tree,
             identity_mode=identity_mode,
@@ -212,32 +206,20 @@ class TreeWriter:
                 root_hash = self._write_tree_bytes(b"")
             else:
                 root_hash = pruned
-        if staged_additions:
-            leftovers = self._unconsumed_additions(staged_additions)
+        if staged_additions and leftover_addition_dirs:
+            leftovers = [
+                entry
+                for entry in staged_additions
+                if _parent_dir(entry.path) in leftover_addition_dirs
+            ]
             if leftovers:
+                leftovers.sort(key=lambda entry: entry.path)
                 root_hash = self.overlay_staged(
                     parent_tree=root_hash,
                     additions=leftovers,
                     removed_prefixes=set(),
                 )
         return root_hash
-
-    def _unconsumed_additions(
-        self, additions: list[ManifestEntry]
-    ) -> list[ManifestEntry]:
-        """Staged additions whose directory never opened during the walk.
-
-        Only directories with worktree files get frames, so additions under
-        otherwise-empty directories are never merged into a parent frame and
-        must be overlaid onto the built tree afterwards.
-        """
-        leftover_dirs = getattr(self, "_leftover_additions_dirs", None)
-        if not leftover_dirs:
-            return []
-        return sorted(
-            (entry for entry in additions if _parent_dir(entry.path) in leftover_dirs),
-            key=lambda entry: entry.path,
-        )
 
     def _build_worktree_inner(
         self,
@@ -248,7 +230,13 @@ class TreeWriter:
         removed_paths: set[str],
         staged_additions: list[ManifestEntry] | None,
         capture_footers: bool,
-    ) -> str:
+    ) -> tuple[str, set[str]]:
+        """Build the tree; also report staged-addition dirs that never opened.
+
+        Only directories with worktree files get frames, so additions under
+        otherwise-empty directories are never merged into a parent frame;
+        callers overlay them onto the built tree afterwards.
+        """
         root_children: list[_Child] = []
         stack: list[_Frame] = []
 
@@ -260,7 +248,6 @@ class TreeWriter:
                 additions_by_dir.setdefault(dir_path, {})[parts[-1]] = (
                     leaf_to_tree_entry(entry)
                 )
-        self._leftover_additions_dirs = set()
 
         def parent_children(dir_path: str) -> dict[str, TreeEntry] | None:
             merged: dict[str, TreeEntry] = {}
@@ -321,12 +308,12 @@ class TreeWriter:
         while stack:
             _close_frame(stack, root_children, self)
 
-        self._leftover_additions_dirs = set(additions_by_dir)
+        leftover_addition_dirs = set(additions_by_dir)
 
         merged_root = _merge_parent_children(root_children, root_parent)
         if merged_root:
-            return self._build_children(merged_root)
-        return self._write_tree_bytes(b"")
+            return self._build_children(merged_root), leftover_addition_dirs
+        return self._write_tree_bytes(b""), leftover_addition_dirs
 
     def _materialize_worktree_file(
         self,
@@ -513,8 +500,6 @@ class TreeWriter:
         auto-keep identical additions, and report a conflict for every path
         modified on both sides.  Returns ``(merged_tree_hash, conflict_paths)``.
         """
-        from ..domain import MergeConflictError  # noqa: F401  (re-exported below)
-
         base_iter = (
             iter(())
             if base_tree is None
@@ -524,8 +509,6 @@ class TreeWriter:
         theirs_iter = self._walker.iter_all_entries(theirs_tree)
 
         conflicts: list[str] = []
-        merged: list[ManifestEntry] = []
-        seen_paths: set[str] = set()
 
         def same(left: ManifestEntry | None, right: ManifestEntry | None) -> bool:
             if left is None or right is None:
@@ -536,52 +519,52 @@ class TreeWriter:
         ours = next(ours_iter, None)
         theirs = next(theirs_iter, None)
 
-        def advance() -> None:
+        def merged_stream() -> Iterator[ManifestEntry]:
             nonlocal base, ours, theirs
-            path = min(
-                p.path for p in (base, ours, theirs) if p is not None
-            )
-            if base is not None and base.path == path:
-                base = next(base_iter, None)
-            if ours is not None and ours.path == path:
-                ours = next(ours_iter, None)
-            if theirs is not None and theirs.path == path:
-                theirs = next(theirs_iter, None)
 
-        while base is not None or ours is not None or theirs is not None:
-            path = min(p.path for p in (base, ours, theirs) if p is not None)
-            b = base if base is not None and base.path == path else None
-            o = ours if ours is not None and ours.path == path else None
-            t = theirs if theirs is not None and theirs.path == path else None
+            def advance() -> None:
+                nonlocal base, ours, theirs
+                path = min(
+                    p.path for p in (base, ours, theirs) if p is not None
+                )
+                if base is not None and base.path == path:
+                    base = next(base_iter, None)
+                if ours is not None and ours.path == path:
+                    ours = next(ours_iter, None)
+                if theirs is not None and theirs.path == path:
+                    theirs = next(theirs_iter, None)
 
-            if o is not None and t is not None:
-                if same(o, t):
-                    merged.append(o)
-                elif b is not None and same(o, b):
-                    merged.append(t)
-                elif b is not None and same(t, b):
-                    merged.append(o)
-                else:
-                    conflicts.append(path)
-                    merged.append(o)
-            elif o is not None:
-                if b is None or not same(o, b):
-                    if b is not None:
-                        conflicts.append(path)  # we changed; they removed
-                    merged.append(o)
-            elif t is not None:
-                if b is None or not same(t, b):
-                    if b is not None:
-                        conflicts.append(path)  # they changed; we removed
-                    merged.append(t)
-            # base-only: both sides removed — drop
+            while base is not None or ours is not None or theirs is not None:
+                path = min(p.path for p in (base, ours, theirs) if p is not None)
+                b = base if base is not None and base.path == path else None
+                o = ours if ours is not None and ours.path == path else None
+                t = theirs if theirs is not None and theirs.path == path else None
 
-            if path in seen_paths:
-                raise ValueError(f"Merge produced duplicate path: {path}")
-            seen_paths.add(path)
-            advance()
+                if o is not None and t is not None:
+                    if same(o, t):
+                        yield o
+                    elif b is not None and same(o, b):
+                        yield t
+                    elif b is not None and same(t, b):
+                        yield o
+                    else:
+                        conflicts.append(path)
+                        yield o
+                elif o is not None:
+                    if b is None or not same(o, b):
+                        if b is not None:
+                            conflicts.append(path)  # we changed; they removed
+                        yield o
+                elif t is not None:
+                    if b is None or not same(t, b):
+                        if b is not None:
+                            conflicts.append(path)  # they changed; we removed
+                        yield t
+                # base-only: both sides removed — drop
 
-        merged_tree = self.build_from_entries(iter(merged))
+                advance()
+
+        merged_tree = self.build_from_entries(merged_stream())
         return merged_tree, conflicts
 
     def merge_trees(
@@ -602,6 +585,164 @@ class TreeWriter:
 
     # ── Commits ──────────────────────────────────────────────────────────
 
+    def splice_tree(
+        self,
+        parent_tree: str | None,
+        additions: list[ManifestEntry],
+        removed_prefixes: set[str],
+    ) -> str:
+        """Merge additions and removals into the parent tree via recursive path-splicing.
+
+        Unlike full-manifest flattening, this only visits directories along the path
+        of modified leaves. Untouched subtrees are reused purely by content hash in O(1).
+        """
+        if not parent_tree:
+            if not additions:
+                return self._write_tree_bytes(b"")
+            sorted_adds = sorted(additions, key=lambda entry: entry.path)
+            return self.build_from_entries(iter(sorted_adds))
+
+        result = self._splice_directory(
+            dir_path="",
+            tree_hash=parent_tree,
+            additions=additions,
+            removed_prefixes=set(removed_prefixes),
+        )
+        if result is None:
+            return self._write_tree_bytes(b"")
+        return result
+
+    def _splice_directory(
+        self,
+        dir_path: str,
+        tree_hash: str | None,
+        additions: list[ManifestEntry],
+        removed_prefixes: set[str],
+    ) -> str | None:
+        local_leaf_additions: dict[str, ManifestEntry] = {}
+        child_additions: dict[str, list[ManifestEntry]] = {}
+
+        prefix_len = len(dir_path) + 1 if dir_path else 0
+        for entry in additions:
+            rel = entry.path[prefix_len:] if prefix_len else entry.path
+            parts = rel.split("/", 1)
+            if len(parts) == 1:
+                local_leaf_additions[parts[0]] = entry
+            else:
+                child_additions.setdefault(parts[0], []).append(entry)
+
+        kept: list[_Child] = []
+        changed = False
+
+        if tree_hash is not None:
+            entries = self._walker.load_entries(tree_hash)
+            if entries is None:
+                raise ValueError(f"Unknown tree object: {tree_hash}")
+
+            if any(e.kind == KIND_SHARD for e in entries):
+                unpacked: list[TreeEntry] = []
+                for e in entries:
+                    shard_entries = self._walker.load_entries(e.hash)
+                    if shard_entries:
+                        unpacked.extend(shard_entries)
+                entries = unpacked
+
+            handled_leaf_additions: set[str] = set()
+            handled_child_dirs: set[str] = set()
+
+            for entry in entries:
+                name = entry.name
+                full = f"{dir_path}/{name}" if dir_path else name
+
+                if entry.is_leaf:
+                    if _path_is_removed(full, removed_prefixes):
+                        changed = True
+                        if name in local_leaf_additions:
+                            new_leaf = local_leaf_additions[name]
+                            kept.append((name, _entry_to_leaf_line(new_leaf)))
+                            handled_leaf_additions.add(name)
+                        continue
+
+                    if name in local_leaf_additions:
+                        new_leaf = local_leaf_additions[name]
+                        kept.append((name, _entry_to_leaf_line(new_leaf)))
+                        handled_leaf_additions.add(name)
+                        changed = True
+                        continue
+
+                    kept.append((name, entry.serialize()))
+                else:
+                    is_completely_removed = _path_is_removed(full, removed_prefixes)
+                    if is_completely_removed and name not in child_additions:
+                        changed = True
+                        continue
+
+                    has_additions = name in child_additions
+                    has_removals_inside = any(
+                        prefix == full or prefix.startswith(f"{full}/")
+                        for prefix in removed_prefixes
+                    )
+
+                    if not is_completely_removed and not has_removals_inside and not has_additions:
+                        kept.append((name, _subtree_line(entry.kind, name, entry.hash)))
+                        continue
+
+                    sub_adds = child_additions.get(name, [])
+                    handled_child_dirs.add(name)
+                    new_sub_hash = self._splice_directory(
+                        dir_path=full,
+                        tree_hash=entry.hash if not is_completely_removed else None,
+                        additions=sub_adds,
+                        removed_prefixes=removed_prefixes,
+                    )
+                    if new_sub_hash is None:
+                        changed = True
+                    else:
+                        if new_sub_hash != entry.hash:
+                            changed = True
+                        kept.append((name, _subtree_line(KIND_TREE, name, new_sub_hash)))
+
+            for name, new_leaf in local_leaf_additions.items():
+                if name not in handled_leaf_additions:
+                    kept.append((name, _entry_to_leaf_line(new_leaf)))
+                    changed = True
+
+            for child_name, sub_adds in child_additions.items():
+                if child_name not in handled_child_dirs:
+                    child_dir = f"{dir_path}/{child_name}" if dir_path else child_name
+                    new_sub_hash = self._splice_directory(
+                        dir_path=child_dir,
+                        tree_hash=None,
+                        additions=sub_adds,
+                        removed_prefixes=removed_prefixes,
+                    )
+                    if new_sub_hash is not None:
+                        kept.append((child_name, _subtree_line(KIND_TREE, child_name, new_sub_hash)))
+                        changed = True
+
+        else:
+            for name, new_leaf in local_leaf_additions.items():
+                kept.append((name, _entry_to_leaf_line(new_leaf)))
+                changed = True
+
+            for child_name, sub_adds in child_additions.items():
+                child_dir = f"{dir_path}/{child_name}" if dir_path else child_name
+                new_sub_hash = self._splice_directory(
+                    dir_path=child_dir,
+                    tree_hash=None,
+                    additions=sub_adds,
+                    removed_prefixes=removed_prefixes,
+                )
+                if new_sub_hash is not None:
+                    kept.append((child_name, _subtree_line(KIND_TREE, child_name, new_sub_hash)))
+                    changed = True
+
+        if not kept:
+            return None
+        if not changed and tree_hash is not None:
+            return tree_hash
+        return self._build_children(kept)
+
     def overlay_staged(
         self,
         *,
@@ -609,31 +750,12 @@ class TreeWriter:
         additions: list[ManifestEntry],
         removed_prefixes: set[str],
     ) -> str:
-        """Merge materialized staged additions/removals into the parent tree.
-
-        Implemented as a leaf-stream merge: the parent tree is flattened, the
-        overlay is applied, and the tree is rebuilt.  O(N) compute, but
-        unchanged subtrees reuse their hashes (content-addressing), so the
-        metadata write stays O(changes).
-        """
-        removed = set(removed_prefixes)
-        additions_by_path = {entry.path: entry for entry in additions}
-
-        def merged() -> Iterator[ManifestEntry]:
-            for entry in self._walker.iter_all_entries(parent_tree):
-                if _path_is_removed(entry.path, removed):
-                    continue
-                overlay = additions_by_path.pop(entry.path, None)
-                if overlay is not None:
-                    yield overlay
-                    continue
-                yield entry
-            for path in sorted(additions_by_path):
-                yield additions_by_path[path]
-
-        return self.build_from_entries(merged())
-
-    # ── Commits ──────────────────────────────────────────────────────────
+        """Merge materialized staged additions/removals into the parent tree via path-splicing."""
+        return self.splice_tree(
+            parent_tree=parent_tree,
+            additions=additions,
+            removed_prefixes=removed_prefixes,
+        )
 
     def write_commit_object(
         self,

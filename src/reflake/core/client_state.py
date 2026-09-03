@@ -18,7 +18,8 @@ class LocalClientState:
         self.root = Path(root).resolve()
         self.reflake_dir = self.root / ".reflake"
         self.refs_dir = self.reflake_dir / "refs"
-        self.branch_state_dir = self.refs_dir / "heads"
+        self.state_dir = self.reflake_dir / "state"
+        self.branch_state_dir = self.state_dir / "branch-snapshots"
         self.staging_dir = self.reflake_dir / "staging"
         self.cache_dir = self.reflake_dir / "cache"
         self.reflog_dir = self.reflake_dir / "reflog"
@@ -27,6 +28,7 @@ class LocalClientState:
         for path in (
             self.reflake_dir,
             self.refs_dir,
+            self.state_dir,
             self.branch_state_dir,
             self.staging_dir,
             self.cache_dir,
@@ -133,6 +135,11 @@ class LocalClientState:
         self._atomic_write_text(self.branch_snapshot_path(branch), f"{payload}\n")
 
     def branch_snapshot_path(self, branch: str) -> Path:
+        """Client-local snapshot location, outside the shared refs namespace.
+
+        Snapshots live under ``state/branch-snapshots/`` so they can never be
+        mistaken for branch pointers by shared-store enumeration.
+        """
         return self.branch_state_dir / f"{branch}.json"
 
     def stage_path(self, branch: str) -> Path:

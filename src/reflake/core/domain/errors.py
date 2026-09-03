@@ -77,3 +77,27 @@ class NotARepositoryError(ReflakeError):
         super().__init__(
             f"not a reflake repository (or any of the parent directories): .reflake"
         )
+
+
+class UnknownRefError(ReflakeError):
+    """Raised when a branch or commit reference cannot be resolved."""
+
+    def __init__(self, ref: str) -> None:
+        self.ref = ref
+        super().__init__(f"Unknown branch or commit: {ref}")
+
+
+class EmptyBranchError(ReflakeError):
+    """Raised when a branch exists but has no commits yet."""
+
+    def __init__(self, branch: str) -> None:
+        self.branch = branch
+        super().__init__(f"Branch has no commits: {branch}")
+
+
+class UnknownCommitError(ReflakeError):
+    """Raised when a commit object does not exist in the store."""
+
+    def __init__(self, commit_id: str) -> None:
+        self.commit_id = commit_id
+        super().__init__(f"Unknown commit: {commit_id}")

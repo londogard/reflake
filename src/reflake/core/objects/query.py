@@ -14,7 +14,7 @@ the same bytes.
 
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections import OrderedDict
 from typing import Callable, Iterator
 
@@ -32,53 +32,15 @@ from .tree import (
 
 
 def _leaf_to_manifest(entry: TreeEntry, path: str) -> ManifestEntry:
-    if entry.kind == KIND_BLOB:
-        return ManifestEntry(
-            path=path,
-            hash=entry.hash,
-            size=entry.size,
-            mtime_ns=entry.mtime_ns,
-            identity_mode="blake3",
-            identity_value=entry.hash,
-            blob_hash=entry.hash,
-            source_uri=None,
-        )
-    if entry.kind == KIND_BP:
-        return ManifestEntry(
-            path=path,
-            hash=entry.hash,
-            size=entry.size,
-            mtime_ns=entry.mtime_ns,
-            identity_mode="blake3",
-            identity_value=entry.hash,
-            blob_hash=entry.hash,
-            source_uri=None,
-            footer=entry.footer,
-        )
-    if entry.kind == KIND_META:
-        return ManifestEntry(
-            path=path,
-            hash=entry.hash,
-            size=entry.size,
-            mtime_ns=entry.mtime_ns,
-            identity_mode="meta",
-            identity_value=entry.hash,
-            blob_hash=None,
-            source_uri=entry.source_uri,
-        )
-    if entry.kind == KIND_MP:
-        return ManifestEntry(
-            path=path,
-            hash=entry.hash,
-            size=entry.size,
-            mtime_ns=entry.mtime_ns,
-            identity_mode="meta",
-            identity_value=entry.hash,
-            blob_hash=None,
-            source_uri=entry.source_uri,
-            footer=entry.footer,
-        )
-    raise ValueError(f"Not a leaf entry: {entry.kind} {entry.name}")
+    return ManifestEntry(
+        path=path,
+        hash=entry.hash,
+        size=entry.size,
+        mtime_ns=entry.mtime_ns,
+        identity_mode="blake3" if entry.kind in (KIND_BLOB, KIND_BP) else "meta",
+        source_uri=entry.source_uri,
+        footer=entry.footer,
+    )
 
 
 class TreeCache:
@@ -129,9 +91,8 @@ def _descend(entries: list[TreeEntry], part: str) -> TreeEntry | None:
     Returns an exact match, or — when the tree is sharded — the name-range
     shard whose range contains *part*.
     """
-    names = [entry.name for entry in entries]
-    idx = bisect_left(names, part)
-    if idx < len(names) and names[idx] == part:
+    idx = bisect_left(entries, part, key=lambda entry: entry.name)
+    if idx < len(entries) and entries[idx].name == part:
         return entries[idx]
     previous = idx - 1
     if previous >= 0 and entries[previous].kind == KIND_SHARD:

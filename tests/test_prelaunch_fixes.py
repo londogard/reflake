@@ -8,15 +8,10 @@ from reflake import (
     ReflakeFileSystem,
     NotARepositoryError,
     S3ObjectStore,
-    cat,
-    catalog,
-    commit,
-    gc,
     open_repository,
     parse_where_clause,
     plan_pruned_scan,
     prune_row_groups,
-    reflog,
     run_cli,
 )
 
@@ -27,10 +22,8 @@ def test_top_level_exports_and_star_import() -> None:
     assert hasattr(reflake, "parse_where_clause")
     assert hasattr(reflake, "plan_pruned_scan")
     assert hasattr(reflake, "prune_row_groups")
-    assert hasattr(reflake, "cat")
-    assert hasattr(reflake, "catalog")
-    assert hasattr(reflake, "gc")
-    assert hasattr(reflake, "reflog")
+    assert hasattr(reflake, "open_repository")
+    assert hasattr(reflake, "ReflakeRepository")
     assert hasattr(reflake, "NotARepositoryError")
 
 
@@ -86,28 +79,29 @@ def test_vfs_s3_dataset_roots(
     assert entries[0]["name"] == "reflake://remote@main/data.txt"
 
 
-def test_standalone_convenience_functions(tmp_path: Path) -> None:
+def test_repository_methods_cover_convenience_operations(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("content a")
-    commit_id = commit(tmp_path, "commit 1")
+    repo = open_repository(tmp_path)
+    commit_id = repo.commit("commit 1")
     assert len(commit_id) == 64
 
     # Test cat
-    data = cat(tmp_path, "main", "a.txt")
+    data = repo.cat("main", "a.txt")
     assert data == b"content a"
 
     # Test reflog
-    logs = list(reflog(tmp_path, "main"))
+    logs = list(repo.reflog("main"))
     assert len(logs) >= 1
     assert "commit" in logs[0]
 
     # Test catalog
-    cat_entries = catalog(tmp_path)
+    cat_entries = repo.catalog()
     assert len(cat_entries) == 1
     assert cat_entries[0]["branch"] == "main"
     assert cat_entries[0]["commit_id"] == commit_id
 
     # Test gc
-    gc_res = gc(tmp_path, dry_run=True)
+    gc_res = repo.gc(dry_run=True)
     assert gc_res.reachable_commits == 1
     assert gc_res.orphan_commits == 0
 

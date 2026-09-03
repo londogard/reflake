@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Literal
 
 import msgspec
@@ -48,7 +50,14 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
     def save(self, root: str | Path) -> Path:
         path = Path(root).resolve() / ".reflake" / CONFIG_FILENAME
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(msgspec.json.encode(self) + b"\n")
+        payload = msgspec.json.encode(self) + b"\n"
+        with NamedTemporaryFile(dir=path.parent, delete=False) as temp:
+            temp_path = Path(temp.name)
+            temp.write(payload)
+        try:
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
         return path
 
     def validate(self) -> None:

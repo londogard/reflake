@@ -1,8 +1,62 @@
 # Reflake
 
-Reflake is a serverless (client-first), object-storage-first data versioning engine.
+**Reflake is a serverless, object-storage-first data versioning engine** — think Git semantics for datasets, where the only infrastructure you need is a folder or an S3 bucket.
 
-The design is deliberately opinionated: keep canonical data storage boring and immutable, and put intelligence in metadata and access layers.
+Canonical data storage stays boring and immutable; all intelligence lives in metadata and access layers.
+
+---
+
+## Overview
+
+```
+                 ┌─────────────────────────────────────────────┐
+                 │                reflake CLI                  │
+                 │  commit · branch · merge · diff · push …    │
+                 └──────────────────┬──────────────────────────┘
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        │                        core                             │
+        │                                                         │
+        │   services          objects            domain           │
+        │   ┌─────────┐      ┌────────────┐     ┌───────────┐    │
+        │   │ TreeWriter│────▶│ObjectStore │────▶│ types +   │    │
+        │   │ RefManager│     │ ├ local    │     │ errors    │    │
+        │   │ StagingArea      │ └ s3       │     └───────────┘    │
+        │   │ EntryFactory     └────────────┘                      │
+        │   └─────────┘      vfs + query (fsspec, DuckDB, pruning) │
+        └─────────────────────────────────────────────────────────┘
+```
+
+Reflake separates data into three layers:
+
+1. **Canonical layer (`blobs/`)**
+   Content-addressed objects keyed by Blake3 digest, stored at `<hash[:2]>/<hash[2:]>`.
+2. **Metadata layer (`trees/`, `commits/`, `refs/heads/`)**
+   Merkle trees of JSONL entries map logical paths to content hashes; commits point at tree roots and form a DAG with full parent history; branches are CAS-updated pointers. Metadata operations (diff, log, status, rm, mv) never read blob bytes.
+3. **Access layer**
+   `reflake://<dataset>@<branch_or_commit>/<path>` resolves through the metadata layer and reads either canonical blobs or the original source URI (for metadata-only imports).
+
+### Mental model
+
+| Concept | What it is |
+|---|---|
+| **Repository** | A `.reflake/` directory locally, or an `s3://bucket/prefix` prefix remotely — same commands against both. |
+| **Tree** | A content-addressed Merkle node: sorted JSONL lines addressing child trees or leaf files. Directories over 10k entries shard automatically. |
+| **Commit** | `{tree, parents[], message, generation}` — parents form a real DAG, so merges are first-class. |
+| **Branch** | A pointer updated with compare-and-swap (S3 conditional writes) — safe under concurrent clients without locks. |
+| **Staging** | Per-client, per-branch overlay of adds/removes applied onto the parent tree by `commit --staged`. |
+| **Identity modes** | `blake3` (content hash, default) or `meta` (path+size hash, unverifiable until promoted). |
+
+### Command map
+
+| Area | Commands |
+|---|---|
+| Ingest | `init`, `add`, `commit [--staged]`, `verify` |
+| Inspect | `status`, `log`, `diff`, `list`, `cat`, `catalog`, `reflog` |
+| Branch | `branch`, `checkout`, `merge` (fast-forward + 3-way metadata merge) |
+| Mutate | `rm`, `mv`, `gc [--prune]`, `restore` |
+| Sync | `push`, `pull`, `fetch`, `transfer` |
+| Analyze | `query build` (DuckDB/Parquet), `query prune` (row-group pruning) |
 
 ## Guardrails (Strict)
 
@@ -12,73 +66,26 @@ The design is deliberately opinionated: keep canonical data storage boring and i
 - Use Blake3 for all content hashing.
 - Prefer JSONL manifests for stream-safe, O(1)-memory behavior.
 
-## Core Philosophy
-
-Reflake separates the platform into three layers:
-
-1. **Canonical Layer (`blobs/`)**
-	- Content-addressed objects keyed by Blake3 digest.
-	- Physical layout is simple and deterministic (`<hash[:2]>/<hash[2:]>`).
-2. **Metadata Layer (`manifests/`, `commits/`, `refs/`)**
-	- JSONL manifests map logical path -> identity + metadata.
-	- Commit objects (JSON) and branch refs provide Git-like lineage semantics.
-3. **Access Layer (`fsspec`)**
-	- `reflake://<dataset>@<branch_or_commit>/<path>` resolves metadata, then reads either canonical blob bytes or source URI bytes for metadata-only entries.
-
-## MVP Status (Current)
-
-Reflake is intentionally in MVP mode.
-
-### Implemented
-
-- Commit snapshots over a dataset root (`reflake commit`).
-- Repository URI support via `--repo <path|s3://bucket/prefix>` and `open_repository(...)`.
-- Repository initialization (`reflake init`) with local or S3 backend.
-- Remote sync workflow (`reflake fetch`, `reflake pull`, `reflake push`).
-- Operator-facing S3 lock inspection and cleanup (`reflake lock list`, `reflake lock cleanup`).
-- Streaming S3 ingress from `s3://` objects and prefixes via staged `reflake add ... --identity meta --as ...` followed by `reflake commit --staged`.
-- Branch-scoped staging workflow (`reflake add`, `reflake rm`, `reflake status`, `reflake commit --staged`).
-- Incremental ingress paths that preserve existing manifest entries while adding only new content metadata/blobs.
-- Commit identity modes: `blake3` (default) and `meta` (`hash(path+size)`).
-- Verify command to promote metadata-only entries to canonical blobs (`reflake verify`).
-- Zero-copy branch pointers (`reflake branch`).
-- Fast-forward-only branch merge (`reflake merge`).
-- Metadata-only diff between refs (`reflake diff`).
-- Metadata-only manifest mutations for committed refs via the staged flow (`reflake rm ...`, `reflake mv ... ...`, then `reflake commit --staged`).
-- File restoration from refs (`reflake restore <ref> [--path ...] [--force]`).
-- Disposable analytical index from manifest (`reflake index build`, DuckDB + optional Parquet export).
-- `fsspec` provider for `reflake://` URI reads.
-- Local + S3 storage backend abstractions available in code.
-- Human-readable output by default; `--json` flag on all commands for programmatic use.
-
 ## Technical Stack
 
 - Python 3.11+
 - `blake3` for hashing
-- JSONL manifests + JSON commit objects
+- Merkle trees + JSONL commit/tree objects
 - `fsspec` for URI access abstraction
 - `duckdb` for disposable analytical indexing
 
 ## Install
+
 ```bash
 uv pip install reflake
 ```
 
 ### Developer mode in repo
+
 ```bash
 uv sync
 uv run reflake --help
 ```
-
-## License And Support
-
-Reflake is licensed under the GNU Affero General Public License v3.0 or later.
-
-- The license keeps copyright and license notices attached to redistributed copies.
-- Modified networked deployments must make their corresponding source available under the AGPL terms.
-- That gives companies a practical reason to fund maintenance if they depend on Reflake while keeping the project genuinely open source.
-
-If your company uses Reflake, sponsor ongoing maintenance at <https://github.com/sponsors/londogard>.
 
 ## Quickstart
 
@@ -102,9 +109,6 @@ uv run reflake branch --repo /tmp/reflake-demo feature
 uv run reflake checkout --repo /tmp/reflake-demo feature
 uv run reflake add --repo /tmp/reflake-demo data/new.csv
 uv run reflake add --repo /tmp/reflake-demo --as imports/raw.csv /tmp/outside-repo/raw.csv
-uv run reflake add --repo /tmp/reflake-demo --as imports/bundle /tmp/outside-repo/bundle
-uv run reflake add --repo /tmp/reflake-demo --identity meta --as imports/bootstrap.csv s3://my-bucket/bootstrap.csv
-uv run reflake add --repo /tmp/reflake-demo --identity meta --as imports/bootstrap s3://my-bucket/bootstrap
 uv run reflake status --repo /tmp/reflake-demo
 uv run reflake commit --repo /tmp/reflake-demo --staged -m "feature updates"
 uv run reflake checkout --repo /tmp/reflake-demo main
@@ -118,19 +122,12 @@ uv run reflake restore --repo /tmp/reflake-demo main --force
 echo "hello v2" > /tmp/reflake-demo/a.txt
 uv run reflake commit --repo /tmp/reflake-demo -m "update"
 
-uv run reflake branch --repo /tmp/reflake-demo experiment
 uv run reflake diff --repo /tmp/reflake-demo <from_ref> <to_ref>
 
 # Stage and commit metadata mutations
 uv run reflake rm --repo /tmp/reflake-demo old-prefix
 uv run reflake mv --repo /tmp/reflake-demo raw/images curated/images
-uv run reflake status --repo /tmp/reflake-demo
 uv run reflake commit --repo /tmp/reflake-demo -m "clean up old files and rename image prefix"
-
-# Or stage the mutation and commit it with a single message
-uv run reflake rm --repo /tmp/reflake-demo logs/2025
-uv run reflake mv --repo /tmp/reflake-demo incoming/images curated/images
-uv run reflake commit --repo /tmp/reflake-demo --staged -m "remove old logs and rename prefix"
 
 # remote repo metadata operations from the current working tree
 uv run reflake branch --repo s3://my-bucket/datasets/demo feature
@@ -141,39 +138,8 @@ uv run reflake commit --repo s3://my-bucket/datasets/demo --staged -m "drop obso
 
 # JSON output for programmatic use (all commands support --json)
 uv run reflake status --repo /tmp/reflake-demo --json
-uv run reflake add --repo /tmp/reflake-demo data/new.csv --json
 uv run reflake diff --repo /tmp/reflake-demo main feature --json
 ```
-
-## Analytical Index (Derived, Disposable)
-
-```bash
-uv run reflake index build --repo /tmp/reflake-demo --parquet
-```
-
-`reflake index build` writes a DuckDB database (and optional Parquet export) for the current branch's manifest to `.reflake/index/<commit_id>.duckdb`. Query it with the DuckDB CLI:
-
-```bash
-duckdb /path/to/<commit>.duckdb "SELECT COUNT(*) FROM files"
-```
-
-If the index is deleted, Reflake remains fully functional from manifests and commits.
-
-## `fsspec` URI Example
-
-```python
-from reflake.core import ReflakeFileSystem
-
-fs = ReflakeFileSystem(dataset_roots={"my_data": "/tmp/reflake-demo"})
-with fs.open("reflake://my_data@main/a.txt", "rb") as handle:
-	 data = handle.read()
-
-# include branch staged (not-yet-committed) changes
-with fs.open("reflake://my_data@feature+staged/a.txt", "rb") as handle:
-	 staged_data = handle.read()
-```
-
-In `meta` snapshots, Reflake reads from `source_uri` when no canonical `blobs/` object exists.
 
 ## Identity Modes
 
@@ -241,8 +207,6 @@ uv run reflake verify --repo /tmp/reflake-demo --dry-run
 
 ## Incremental Ingress
 
-Reflake's efficient content-ingress paths are:
-
 ```bash
 uv run reflake add --repo /tmp/reflake-demo local/new.csv
 uv run reflake add --repo /tmp/reflake-demo --as imports/new.csv /tmp/random/new.csv
@@ -258,6 +222,125 @@ uv run reflake verify --repo /tmp/reflake-demo --path images --path root.txt
 - `verify` reads bytes only for selected metadata-only entries that still need canonical blobs.
 - Existing manifest entries are preserved without re-uploading unchanged blob content.
 
+## Merge Command
+
+`reflake merge` updates a target branch from a source ref:
+
+```bash
+uv run reflake merge --repo /tmp/reflake-demo feature main
+```
+
+- The source ref can be a branch or commit; the target must be a branch.
+- Fast-forward when the target head is an ancestor of the source.
+- **Diverged histories get a metadata-only three-way merge** against the merge base: one-sided changes win, identical additions are kept, and conflicts raise `MergeConflictError` listing the paths. Merge commits record both parents.
+- Ancestry checks walk the full parent DAG, so merged branches fast-forward, push, and pull correctly afterwards.
+
+## Metadata-Only Remove And Move
+
+`reflake rm` and `reflake mv` stage metadata-only mutations; `reflake commit --staged` writes a new commit:
+
+```bash
+uv run reflake rm --repo /tmp/reflake-demo logs/2025
+uv run reflake mv --repo /tmp/reflake-demo incoming/images curated/images
+uv run reflake commit --repo /tmp/reflake-demo --staged -m "remove old logs and rename prefix"
+```
+
+- These operations read tree metadata only; they do not download unchanged blob payloads.
+- `rm` accepts file paths or path prefixes and removes all matching logical entries.
+- `mv` accepts a file path or prefix and rewrites matching logical paths.
+- `reflake status` shows staged removals and renames before `reflake commit --staged`.
+
+## Sync (push/pull/fetch)
+
+```bash
+uv run reflake push  --repo . s3://my-bucket/datasets/demo
+uv run reflake pull  --repo . s3://my-bucket/datasets/demo
+uv run reflake fetch --repo . s3://my-bucket/datasets/demo
+```
+
+- Objects transfer plan-first: the exact missing set (commits, trees, footers, blobs) is computed, then executed via `boto3` per-object or batched through [`s5cmd`](https://github.com/peak/s5cmd) when configured (`config set transfer_backend s5cmd`).
+- Divergent history is rejected before any bytes move (`NonFastForwardError`); the final ref update is a CAS, so concurrent pushes surface conflicts instead of overwriting.
+- Push after a local merge transfers the entire merged lineage, including both parents' commits.
+- S3-compatible endpoints (MinIO, Ministack, …) configured via `reflake init --s3-endpoint …` (or `config set s3.endpoint_url …`) are honored for repository operations; direct `s3://` remotes use the ambient AWS configuration chain.
+
+## Analytical Index (Derived, Disposable)
+
+```bash
+uv run reflake query build --repo /tmp/reflake-demo --parquet
+```
+
+`reflake query build` writes a DuckDB database (and optional Parquet export) for the current branch's tree to `.reflake/index/<commit_id>.duckdb`. Query it with the DuckDB CLI:
+
+```bash
+duckdb /path/to/<commit>.duckdb "SELECT COUNT(*) FROM files"
+```
+
+If the index is deleted, Reflake remains fully functional from trees and commits.
+
+### Row-group pruning
+
+With `config set parquet_footer true`, parquet ingests also capture compact footer statistics (schema + per-row-group min/max/nulls) under `footers/<hash>`. `reflake query prune` then selects the row groups that may match a WHERE-style predicate — reading metadata only, never data pages:
+
+```bash
+uv run reflake query prune --repo /tmp/reflake-demo <ref> images/ --where "id >= 100 AND active = true"
+```
+
+## `fsspec` URI Example
+
+```python
+from reflake.core import ReflakeFileSystem
+
+fs = ReflakeFileSystem(dataset_roots={"my_data": "/tmp/reflake-demo"})
+with fs.open("reflake://my_data@main/a.txt", "rb") as handle:
+    data = handle.read()
+
+# include branch staged (not-yet-committed) changes
+with fs.open("reflake://my_data@feature+staged/a.txt", "rb") as handle:
+    staged_data = handle.read()
+```
+
+In `meta` snapshots, Reflake reads from `source_uri` when no canonical `blobs/` object exists.
+
+## Repository Layout
+
+Reflake creates `.reflake/` under each dataset root:
+
+- `blobs/` - canonical content-addressed object store
+- `trees/` - Merkle tree nodes (sorted JSONL, content-addressed)
+- `footers/` - parquet footer-stats objects (when enabled)
+- `commits/` - commit metadata objects
+- `refs/heads/` - branch pointers only (CAS-updated)
+- `refs/HEAD` - symbolic active branch reference (default `main`)
+- `state/` - client-local branch snapshots (never shared, never a ref)
+- `staging/`, `cache/`, `index/`, `reflog/` - client-local state
+
+Every object kind has exactly one physical location, defined by
+`layout.object_relative_key()` — the local filesystem and the S3 key space are
+guaranteed to stay in sync because both derive from that single mapping.
+
+## Concurrency Model
+
+There are no locks. Every shared mutation goes through compare-and-swap:
+
+- Local repos use version tokens (mtime+size) checked before writing.
+- S3 repos use conditional `PutObject` (`IfMatch`/`IfNoneMatch`) so the check-and-write is atomic server-side.
+- `commit --staged` re-applies its overlay onto the new parent and retries on conflict; other mutations surface `RefConflictError` with both commit ids.
+
+## Mandatory Validation Coverage
+
+Current tests cover required invariants:
+
+- Metadata-only diff reads no blob payloads.
+- Manifest generation for 100k entries stays under RAM cap.
+- `reflake://my_data@main/test.csv` resolves and returns expected bytes.
+- Staged commits stay correct regardless of path sort order; merged lineages survive push/pull.
+
+Run test suite:
+
+```bash
+uv run pytest tests
+```
+
 ## S3 Integration Tests
 
 Reflake includes `integration`-marked tests for real S3-compatible behavior. The preferred target is Ministack.
@@ -270,24 +353,10 @@ bash scripts/run_s3_integration.sh
 
 That script starts a temporary Ministack container on `127.0.0.1:4566`, waits for the health endpoint, resets emulator state, runs `tests/test_s3_integration.py`, and cleans up the container when the test run finishes.
 
-If you prefer task-runner aliases, the repo also provides:
-
-```bash
-make test-s3-integration
-```
-
-GitHub Actions runs the same script in the dedicated S3 integration job.
-
 Start Ministack locally:
 
 ```bash
 docker run --rm -p 4566:4566 nahuelnucera/ministack
-```
-
-If you also want MiniStack features that launch real sidecar containers such as RDS, ECS, or Docker-backed Lambda runtimes, mount the Docker socket:
-
-```bash
-docker run --rm -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock nahuelnucera/ministack
 ```
 
 Verify the emulator is ready:
@@ -321,54 +390,12 @@ To wipe the local emulator state between runs without restarting the container:
 curl -X POST http://127.0.0.1:4566/_ministack/reset
 ```
 
-## Merge Command
+## License And Support
 
-`reflake merge` updates a target branch by fast-forward only:
+Reflake is licensed under the GNU Affero General Public License v3.0 or later.
 
-```bash
-uv run reflake merge --repo /tmp/reflake-demo feature main
-```
+- The license keeps copyright and license notices attached to redistributed copies.
+- Modified networked deployments must make their corresponding source available under the AGPL terms.
+- That gives companies a practical reason to fund maintenance if they depend on Reflake while keeping the project genuinely open source.
 
-- The source ref can be a branch or commit.
-- The target ref must be a branch.
-- The merge succeeds only when the target branch head is an ancestor of the source ref.
-- Non-fast-forward merges are rejected.
-
-## Metadata-Only Remove And Move
-
-`reflake rm` and `reflake mv` stage metadata-only mutations; `reflake commit --staged` writes a new manifest and commit:
-
-```bash
-uv run reflake rm --repo /tmp/reflake-demo logs/2025
-uv run reflake mv --repo /tmp/reflake-demo incoming/images curated/images
-uv run reflake commit --repo /tmp/reflake-demo --staged -m "remove old logs and rename prefix"
-```
-
-- These operations read manifest metadata only; they do not download unchanged blob payloads.
-- `rm` accepts file paths or path prefixes and removes all matching logical entries.
-- `mv` accepts a file path or prefix and rewrites matching logical paths in the manifest.
-- `reflake status` shows staged removals and renames before `reflake commit --staged`.
-
-## Repository Layout
-
-Reflake creates `.reflake/` under each dataset root:
-
-- `blobs/` - canonical content-addressed object store
-- `manifests/` - JSONL path->hash snapshots
-- `commits/` - commit metadata objects
-- `refs/heads/` - branch pointers
-- `refs/HEAD` - symbolic active branch reference (default `main`)
-
-## Mandatory Validation Coverage
-
-Current tests cover required invariants:
-
-- Metadata-only diff reads no blob payloads.
-- Manifest generation for 100k entries stays under RAM cap.
-- `reflake://my_data@main/test.csv` resolves and returns expected bytes.
-
-Run test suite:
-
-```bash
-uv run pytest tests
-```
+If your company uses Reflake, sponsor ongoing maintenance at <https://github.com/sponsors/londogard>.

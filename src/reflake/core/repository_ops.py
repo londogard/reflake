@@ -9,7 +9,14 @@ manifests; unchanged subtrees are reused by content-addressing.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterator, Literal
-from .repository import StageChange
+
+from .domain import (
+    MoveResult,
+    RemoveResult,
+    StageChange,
+    StageStatus,
+    VerifyResult,
+)
 from .hashing import blake3_digest_file
 
 from .manifest import ManifestEntry
@@ -23,13 +30,7 @@ from .repository_support import (
 )
 
 if TYPE_CHECKING:
-    from .repository import (
-        ReflakeRepository,
-        MoveResult,
-        RemoveResult,
-        StageStatus,
-        VerifyResult,
-    )
+    from .repository import ReflakeRepository
 
 
 def repo_add(
@@ -140,19 +141,22 @@ def repo_remove_paths(
     normalized_paths = normalize_logical_paths(paths)
     removed_paths: set[str] = set()
 
-    def iter_entries() -> Iterator[ManifestEntry]:
-        nonlocal removed_paths
-        for entry in repo.store.iter_all_entries(base_commit.tree):
-            if matches_any_logical_path(entry.path, normalized_paths):
-                removed_paths.add(entry.path)
-                continue
-            yield entry
+    for path in normalized_paths:
+        exact = repo.store.lookup_entry(base_commit.tree, path)
+        if exact is not None:
+            removed_paths.add(exact.path)
+        for prefix_entry in repo.store.iter_entries_for_prefix(base_commit.tree, path):
+            removed_paths.add(prefix_entry.path)
 
-    root_tree = repo.tree_writer.build_from_entries(iter_entries())
     if not removed_paths:
         missing = ", ".join(normalized_paths)
         raise FileNotFoundError(f"Path not found in branch '{branch}': {missing}")
 
+    root_tree = repo.tree_writer.splice_tree(
+        parent_tree=base_commit.tree,
+        additions=[],
+        removed_prefixes=set(normalized_paths),
+    )
     commit_id = repo.tree_writer.write_commit_object(
         branch=branch,
         message=message,
@@ -161,9 +165,7 @@ def repo_remove_paths(
         expected_version_token=branch_state.version_token,
         operation="rm",
     )
-    from .repository import RemoveResult as RR
-
-    return RR(
+    return RemoveResult(
         ref=branch,
         commit_id=commit_id,
         removed_paths=sorted(removed_paths),
@@ -191,45 +193,45 @@ def repo_move(
     if destination.startswith(f"{source}/"):
         raise ValueError("Cannot move a path into itself")
 
-    existing_paths: set[str] = set()
-    source_paths: list[str] = []
-    moved_paths: list[str] = []
-    path_map: dict[str, str] = {}
-    updated_entries: dict[str, ManifestEntry] = {}
+    source_entries: list[ManifestEntry] = []
+    exact_source = repo.store.lookup_entry(base_commit.tree, source)
+    if exact_source is not None:
+        source_entries.append(exact_source)
+    for prefix_entry in repo.store.iter_entries_for_prefix(base_commit.tree, source):
+        if not exact_source or prefix_entry.path != exact_source.path:
+            source_entries.append(prefix_entry)
 
-    for entry in repo.store.iter_all_entries(base_commit.tree):
-        existing_paths.add(entry.path)
-        if not matches_logical_path(entry.path, source):
-            updated_entries[entry.path] = entry
-            continue
+    if not source_entries:
+        raise FileNotFoundError(f"Path not found in branch '{branch}': {source}")
+
+    source_path_set = {entry.path for entry in source_entries}
+    moved_entries: list[ManifestEntry] = []
+    moved_paths: list[str] = []
+
+    for entry in source_entries:
         moved_path = move_logical_path(
             entry.path,
             source_path=source,
             destination_path=destination,
         )
-        source_paths.append(entry.path)
         moved_paths.append(moved_path)
-        path_map[entry.path] = moved_path
-        relocated_entry = relocate_manifest_entry(entry, moved_path)
-        updated_entries[relocated_entry.path] = relocated_entry
+        moved_entries.append(relocate_manifest_entry(entry, moved_path))
 
-    if not path_map:
-        raise FileNotFoundError(f"Path not found in branch '{branch}': {source}")
     if len(set(moved_paths)) != len(moved_paths):
         raise ValueError("Move would create duplicate logical paths")
 
-    source_path_set = set(source_paths)
     for moved_path in moved_paths:
-        if moved_path in existing_paths and moved_path not in source_path_set:
+        collision = repo.store.lookup_entry(base_commit.tree, moved_path)
+        if collision is not None and collision.path not in source_path_set:
             raise ValueError(
                 f"Destination already exists in branch '{branch}': {moved_path}"
             )
 
-    def iter_entries() -> Iterator[ManifestEntry]:
-        for path in sorted(updated_entries):
-            yield updated_entries[path]
-
-    root_tree = repo.tree_writer.build_from_entries(iter_entries())
+    root_tree = repo.tree_writer.splice_tree(
+        parent_tree=base_commit.tree,
+        additions=moved_entries,
+        removed_prefixes={source},
+    )
     commit_id = repo.tree_writer.write_commit_object(
         branch=branch,
         message=message,
@@ -238,9 +240,7 @@ def repo_move(
         expected_version_token=branch_state.version_token,
         operation="mv",
     )
-    from .repository import MoveResult as MR
-
-    return MR(
+    return MoveResult(
         ref=branch,
         commit_id=commit_id,
         source_path=source,
@@ -358,16 +358,11 @@ def repo_verify(
                 size=entry.size,
                 mtime_ns=entry.mtime_ns,
                 identity_mode="blake3",
-                identity_value=digest,
-                blob_hash=digest,
-                source_uri=entry.source_uri,
             )
 
     root_tree = repo.tree_writer.build_from_entries(iter_verified_entries())
     if verified_entries == 0:
-        from .repository import VerifyResult as VR
-
-        return VR(
+        return VerifyResult(
             commit_id=base_commit_id,
             verified_entries=0,
             candidate_entries=candidate_entries,
@@ -384,9 +379,7 @@ def repo_verify(
         expected_version_token=branch_state.version_token,
         operation="verify",
     )
-    from .repository import VerifyResult as VR
-
-    return VR(
+    return VerifyResult(
         commit_id=commit_id,
         verified_entries=verified_entries,
         candidate_entries=candidate_entries,

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import BinaryIO, Iterator, Literal
+from typing import Any, BinaryIO, Iterator, Literal
 
 from blake3 import blake3
 
 from .client_state import LocalClientState
-from .config import BaseConfig, LocalConfig, S3Config
+from .config import BaseConfig, S3Config
 from .hashing import blake3_digest_file
 from .layout import initialize_reflake_layout
 from .manifest import ManifestEntry
@@ -15,16 +15,22 @@ from .objects import (
     ObjectStore,
     S3ObjectStore,
 )
-from .repository_support import matches_logical_path
+from .repository_support import merge_base_commit, matches_logical_path
 from .services.entries import EntryFactory
 from .services.refs import RefManager
 from .services.staging import StagingArea
 from .services.tree import TreeWriter
-from .objects import BlobTransferBackend, build_blob_transfer_backend, parse_s3_uri
+from .objects import (
+    BlobTransferBackend,
+    build_blob_transfer_backend,
+    build_s3_client,
+    parse_s3_uri,
+)
 
 from .domain import (
     CommitObject,
     DiffEntry,
+    EmptyBranchError,
     GcResult,
     MergeResult,
     MoveResult,
@@ -46,7 +52,8 @@ class ReflakeRepository:
         client_state: LocalClientState | None = None,
         blob_transfer: BlobTransferBackend | None = None,
     ) -> None:
-        self.layout = initialize_reflake_layout(root)
+        is_remote_store = isinstance(store, S3ObjectStore)
+        self.layout = initialize_reflake_layout(root, create_dirs=not is_remote_store)
         config = BaseConfig.load(root)
         if config is not None:
             config.validate()
@@ -66,11 +73,10 @@ class ReflakeRepository:
             refs=self.refs,
             client_state=self.client_state,
         )
-        config_for_entries = BaseConfig.load(root) or LocalConfig()
         self.entries = EntryFactory(
             root=self.layout.root,
             store=self.store,
-            capture_footers=bool(config_for_entries.parquet_footer),
+            capture_footers=bool(config.parquet_footer) if config else False,
         )
         self.staging = StagingArea(
             client_state=self.client_state,
@@ -166,20 +172,8 @@ class ReflakeRepository:
         )
 
     def _merge_base(self, commit_a: str, commit_b: str) -> CommitObject | None:
-        """Deepest common ancestor of two commits (linear parent chains)."""
-        seen: dict[str, CommitObject] = {}
-        current: str | None = commit_a
-        while current and current not in seen:
-            commit = self.refs.read_commit(current)
-            seen[current] = commit
-            current = commit.first_parent
-        current = commit_b
-        while current:
-            if current in seen:
-                return seen[current]
-            commit = self.refs.read_commit(current)
-            current = commit.first_parent
-        return None
+        """Deepest common ancestor of two commits (merge-aware DAG walk)."""
+        return merge_base_commit(commit_a, commit_b, read_commit=self.refs.read_commit)
 
     def fast_forward_branch(
         self,
@@ -209,6 +203,7 @@ class ReflakeRepository:
         identity_mode = config.identity if config else "blake3"
         if identity_mode not in ("blake3", "meta"):
             identity_mode = "blake3"
+        capture_footers = bool(config.parquet_footer) if config else False
 
         branch = self.current_branch()
         self.refs.ensure_branch_exists(branch)
@@ -239,6 +234,7 @@ class ReflakeRepository:
             additions.sort(key=lambda entry: entry.path)
 
         retries = self._STAGED_COMMIT_RETRIES if staged_only else 1
+        commit_id: str | None = None
         for attempt in range(retries):
             # Ref advancement is a mutation boundary: use the client-side
             # snapshot as the expected state. If another client advanced
@@ -269,7 +265,7 @@ class ReflakeRepository:
                     identity_mode=identity_mode,
                     removed_paths=staged_removed_paths,
                     staged_additions=additions or None,
-                    capture_footers=bool(config.parquet_footer),
+                    capture_footers=capture_footers,
                 )
 
             try:
@@ -287,6 +283,13 @@ class ReflakeRepository:
                     raise
                 continue
 
+        if commit_id is None:
+            raise RefConflictError(
+                branch=branch,
+                operation="commit",
+                expected_commit_id=None,
+                current_commit_id=None,
+            )
         self.staging.save(branch, {})
         return commit_id
 
@@ -356,6 +359,18 @@ class ReflakeRepository:
 
         return repo_move(self, source_path, destination_path, message, ref=ref)
 
+    def move_staged(
+        self,
+        source_path: str,
+        destination_path: str,
+        *,
+        ref: str | None = None,
+    ) -> StageStatus:
+        """Stage a move operation without committing."""
+        from .repository_ops import repo_move_staged
+
+        return repo_move_staged(self, source_path, destination_path, ref=ref)
+
     def status(
         self, *, ref: str | None = None, working_tree: bool = False
     ) -> StageStatus:
@@ -367,10 +382,8 @@ class ReflakeRepository:
     def log(self, ref: str) -> Iterator[CommitObject]:
         try:
             commit_id = self.refs.resolve_ref(ref)
-        except ValueError as e:
-            if "Branch has no commits:" in str(e):
-                return
-            raise
+        except EmptyBranchError:
+            return
 
         while commit_id:
             commit = self.refs.read_commit(commit_id)
@@ -649,6 +662,36 @@ class ReflakeRepository:
             pruned=pruned_any,
         )
 
+    def cat(self, ref: str, path: str) -> bytes:
+        entry = self.resolve_entry(ref, path)
+        if entry is None:
+            raise FileNotFoundError(f"Path not found in ref '{ref}': {path}")
+        if entry.blob_hash:
+            return self.read_blob(entry.blob_hash)
+        if entry.source_uri:
+            from .objects import open_source_uri
+
+            with open_source_uri(entry.source_uri) as handle:
+                return handle.read()
+        raise FileNotFoundError(f"Entry has no readable content: {path}")
+
+    def reflog(self, branch: str | None = None) -> Iterator[str]:
+        branch_name = branch or self.current_branch()
+        yield from self.client_state.iter_reflog(branch_name)
+
+    def catalog(self) -> list[dict[str, Any]]:
+        datasets: list[dict[str, Any]] = []
+        for branch_name in sorted(self.store.iter_branches()):
+            state = self.store.read_branch_ref(branch_name)
+            commit_id = state.commit_id if state else None
+            message = None
+            if commit_id:
+                message = self.read_commit(commit_id).message
+            datasets.append(
+                {"branch": branch_name, "commit_id": commit_id, "message": message}
+            )
+        return datasets
+
 
 def _default_remote_client_root(worktree_root: Path, repo_uri: str) -> Path:
     repo_id = blake3(repo_uri.encode("utf-8")).hexdigest()[:16]
@@ -675,12 +718,10 @@ def open_repository(
     worktree: str | Path | None = None,
     client_root: str | Path | None = None,
     s3_client: object | None = None,
+    s3_endpoint: str | None = None,
     blob_transfer: BlobTransferBackend | str | None = None,
     must_exist: bool = False,
 ) -> ReflakeRepository:
-    if isinstance(blob_transfer, str):
-        blob_transfer = build_blob_transfer_backend(blob_transfer)
-
     if isinstance(root, str) and root.startswith("s3://"):
         bucket, prefix = parse_s3_uri(root)
         worktree_root = Path(worktree or ".").resolve()
@@ -689,12 +730,17 @@ def open_repository(
             if client_root
             else _default_remote_client_root(worktree_root, root)
         )
+        store_client = s3_client if s3_client is not None else build_s3_client(s3_endpoint)
+        if isinstance(blob_transfer, str):
+            blob_transfer = build_blob_transfer_backend(
+                blob_transfer, endpoint_url=s3_endpoint
+            )
         return ReflakeRepository(
             worktree_root,
             store=S3ObjectStore(
                 bucket,
                 prefix,
-                client=s3_client,
+                client=store_client,
                 branch_root=worktree_root / ".reflake" / "refs" / "heads",
                 blob_transfer=blob_transfer,
             ),
@@ -713,25 +759,31 @@ def open_repository(
 
     config = BaseConfig.load(repo_root)
 
+    endpoint = s3_endpoint
+    if endpoint is None and isinstance(config, S3Config):
+        endpoint = config.endpoint_url
+
     if blob_transfer is None and config is not None and config.transfer_backend:
-        blob_transfer = build_blob_transfer_backend(config.transfer_backend)
+        blob_transfer = build_blob_transfer_backend(
+            config.transfer_backend, endpoint_url=endpoint
+        )
+    elif isinstance(blob_transfer, str):
+        blob_transfer = build_blob_transfer_backend(blob_transfer, endpoint_url=endpoint)
 
     if isinstance(config, S3Config):
         bucket = config.bucket
         prefix = config.prefix
         worktree_root = Path(worktree or repo_root)
-        if worktree or client_root:
-            resolved_client_root = (
-                Path(client_root).resolve() if client_root else worktree_root
-            )
-        else:
-            resolved_client_root = worktree_root
+        resolved_client_root = (
+            Path(client_root).resolve() if client_root else worktree_root
+        )
+        store_client = s3_client if s3_client is not None else build_s3_client(endpoint)
         return ReflakeRepository(
             worktree_root,
             store=S3ObjectStore(
                 bucket,
                 prefix,
-                client=s3_client,
+                client=store_client,
                 branch_root=worktree_root / ".reflake" / "refs" / "heads",
                 blob_transfer=blob_transfer,
             ),
@@ -745,217 +797,3 @@ def open_repository(
         store=LocalObjectStore(repo_root),
         client_state=LocalClientState(resolved_client_root),
     )
-
-
-def commit(
-    root: str | Path,
-    message: str,
-    *,
-    staged_only: bool = False,
-) -> str:
-    return open_repository(root).commit(
-        message,
-        staged_only=staged_only,
-    )
-
-
-def import_s3(
-    root: str | Path,
-    source_uri: str,
-    message: str,
-    identity_mode: Literal["blake3", "meta"] = "blake3",
-    *,
-    path_patterns: list[str] | None = None,
-    ref: str | None = None,
-    blob_transfer: BlobTransferBackend | str | None = None,
-) -> str:
-    return open_repository(root, blob_transfer=blob_transfer).import_s3(
-        source_uri,
-        message,
-        identity_mode=identity_mode,
-        path_patterns=path_patterns,
-        ref=ref,
-    )
-
-
-def branch(root: str | Path, name: str) -> Path:
-    return open_repository(root).branch(name)
-
-
-def merge(root: str | Path, source_ref: str, target_ref: str) -> MergeResult:
-    return open_repository(root).merge(source_ref, target_ref)
-
-
-def add(
-    root: str | Path,
-    paths: list[str],
-    *,
-    ref: str | None = None,
-    identity_mode: str = "blake3",
-    destination_path: str | None = None,
-    blob_transfer: BlobTransferBackend | str | None = None,
-) -> StageStatus:
-    return open_repository(root, blob_transfer=blob_transfer).add(
-        paths,
-        ref=ref,
-        identity_mode=identity_mode,
-        destination_path=destination_path,
-    )
-
-
-def rm(root: str | Path, paths: list[str], *, ref: str | None = None) -> StageStatus:
-    return open_repository(root).rm(paths, ref=ref)
-
-
-def remove(
-    root: str | Path,
-    paths: list[str],
-    message: str,
-    *,
-    ref: str | None = None,
-) -> RemoveResult:
-    return open_repository(root).remove_paths(paths, message, ref=ref)
-
-
-def move(
-    root: str | Path,
-    source_path: str,
-    destination_path: str,
-    message: str,
-    *,
-    ref: str | None = None,
-) -> MoveResult:
-    return open_repository(root).move(
-        source_path,
-        destination_path,
-        message,
-        ref=ref,
-    )
-
-
-def move_staged(
-    root: str | Path,
-    source_path: str,
-    destination_path: str,
-    *,
-    ref: str | None = None,
-) -> StageStatus:
-    """Stage a move operation without committing."""
-    from .repository_ops import repo_move_staged
-
-    return repo_move_staged(
-        open_repository(root), source_path, destination_path, ref=ref
-    )
-
-
-def status(
-    root: str | Path, *, ref: str | None = None, working_tree: bool = True
-) -> StageStatus:
-    return open_repository(root, must_exist=True).status(
-        ref=ref, working_tree=working_tree
-    )
-
-
-def diff(root: str | Path, from_ref: str, to_ref: str) -> list[DiffEntry]:
-    return open_repository(root).diff(from_ref=from_ref, to_ref=to_ref)
-
-
-def verify(
-    root: str | Path,
-    ref: str | None = None,
-    path_prefixes: list[str] | None = None,
-    *,
-    dry_run: bool = False,
-    blob_transfer: BlobTransferBackend | str | None = None,
-) -> VerifyResult:
-    return open_repository(root, blob_transfer=blob_transfer).verify(
-        ref=ref, path_prefixes=path_prefixes, dry_run=dry_run
-    )
-
-
-def log(root: str | Path, ref: str) -> Iterator[CommitObject]:
-    return open_repository(root).log(ref)
-
-
-def checkout(root: str | Path, branch: str) -> None:
-    open_repository(root).set_current_branch(branch)
-
-
-def restore_files(
-    root: str | Path,
-    ref: str,
-    paths: list[str] | None = None,
-    *,
-    force: bool = False,
-    blob_transfer: BlobTransferBackend | str | None = None,
-) -> list[str]:
-    return open_repository(root, blob_transfer=blob_transfer).restore_files(
-        ref, paths=paths, force=force
-    )
-
-
-def generate_transfer_commands(
-    root: str | Path,
-    ref: str | None = None,
-    *,
-    mode: str = "upload",
-    include_metadata: bool = False,
-) -> list[str]:
-    repo_root = Path(root).resolve()
-    return ReflakeRepository(repo_root).generate_transfer_commands(
-        ref, mode=mode, include_metadata=include_metadata
-    )
-
-
-def gc(
-    root: str | Path = ".",
-    *,
-    dry_run: bool = True,
-) -> GcResult:
-    return open_repository(root, must_exist=True).gc(dry_run=dry_run)
-
-
-def cat(
-    root: str | Path,
-    ref: str,
-    path: str,
-) -> bytes:
-    repo = open_repository(root, must_exist=True)
-    entry = repo.resolve_entry(ref, path)
-    if entry is None:
-        raise FileNotFoundError(f"Path not found in ref '{ref}': {path}")
-    if entry.blob_hash:
-        return repo.read_blob(entry.blob_hash)
-    elif entry.source_uri:
-        from .objects import open_source_uri
-
-        with open_source_uri(entry.source_uri) as handle:
-            return handle.read()
-    else:
-        raise FileNotFoundError(f"Entry has no readable content: {path}")
-
-
-def reflog(
-    root: str | Path = ".",
-    branch: str | None = None,
-) -> Iterator[str]:
-    repo = open_repository(root, must_exist=True)
-    branch_name = branch or repo.current_branch()
-    yield from repo.client_state.iter_reflog(branch_name)
-
-
-def catalog(
-    root: str | Path = ".",
-) -> list[dict[str, Any]]:
-    repo = open_repository(root, must_exist=True)
-    datasets = []
-    for branch_name in sorted(repo.store.iter_branches()):
-        state = repo.store.read_branch_ref(branch_name)
-        commit_id = state.commit_id if state else None
-        message = None
-        if commit_id:
-            message = repo.read_commit(commit_id).message
-        datasets.append(
-            {"branch": branch_name, "commit_id": commit_id, "message": message}
-        )
-    return datasets

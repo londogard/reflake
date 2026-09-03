@@ -2,20 +2,36 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Any, Iterator
-
-import boto3
+from typing import Any, Iterator, Sequence
 
 from .backends import S3ObjectMetadata
-from .source import S3StorageBackend, _mtime_ns, parse_s3_uri
+from .source import S3StorageBackend, _mtime_ns, build_s3_client, parse_s3_uri
 
 
 class S3BlobTransferBackend:
     """Blob transfer backend using boto3 directly."""
 
-    def __init__(self, client: Any | None = None) -> None:
-        self._client = client or boto3.client("s3")
+    def __init__(
+        self,
+        client: Any | None = None,
+        *,
+        endpoint_url: str | None = None,
+    ) -> None:
+        self._client = client or build_s3_client(endpoint_url)
         self._backends: dict[str, S3StorageBackend] = {}
+
+    def supports_batch(self) -> bool:
+        return False
+
+    def upload_batch(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        if_not_exists: bool = False,
+    ) -> int:
+        for local_path, remote_uri in pairs:
+            self.upload(local_path, remote_uri, if_not_exists=if_not_exists)
+        return len(pairs)
 
     def _backend(self, remote_uri: str) -> tuple[S3StorageBackend, str]:
         bucket, key = parse_s3_uri(remote_uri)
@@ -80,6 +96,24 @@ class S5CmdBlobTransferBackend:
     ) -> None:
         self._s5cmd_path = s5cmd_path
         self._endpoint = endpoint_url
+
+    def supports_batch(self) -> bool:
+        return True
+
+    def upload_batch(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        if_not_exists: bool = False,
+    ) -> int:
+        lines: list[str] = []
+        for local_path, remote_uri in pairs:
+            if if_not_exists:
+                lines.append(f"cp --if-not-exists {local_path} {remote_uri}")
+            else:
+                lines.append(f"cp {local_path} {remote_uri}")
+        self._run(["run"], input_data="\n".join(lines) + "\n")
+        return len(pairs)
 
     def _run(
         self,
@@ -156,19 +190,19 @@ class S5CmdBlobTransferBackend:
 
 def build_blob_transfer_backend(
     backend_type: str = "boto3",
-    **kwargs: object,
+    **kwargs: Any,
 ) -> "S3BlobTransferBackend | S5CmdBlobTransferBackend":
     """Factory to create a BlobTransferBackend by name.
 
     Args:
         backend_type: "boto3" (default) or "s5cmd"
-        **kwargs: Passed to the backend constructor.
+        **kwargs: Passed to the backend constructor (e.g. endpoint_url).
 
     Returns:
         A BlobTransferBackend instance.
     """
     if backend_type == "boto3":
-        return S3BlobTransferBackend(**kwargs)  # type: ignore[arg-type]
+        return S3BlobTransferBackend(**kwargs)
     if backend_type == "s5cmd":
-        return S5CmdBlobTransferBackend(**kwargs)  # type: ignore[arg-type]
+        return S5CmdBlobTransferBackend(**kwargs)
     raise ValueError(f"Unknown blob transfer backend: {backend_type}")

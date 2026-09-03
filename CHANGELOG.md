@@ -6,6 +6,77 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
 
 ## Unreleased
 
+### Changed
+
+- **Structural refactor — capability-split store protocols**: `ObjectStore` is
+  now the composition of `ObjectIO`, `RefCas`, `TreeQuery`, and
+  `StoreInventory`; services annotate against the narrow capability they use
+  (e.g. sync transfers and footer capture depend on `ObjectIO` only).
+- **Structural refactor — unified key-space**: `layout.object_relative_key()`
+  is the single mapping from `(kind, id)` to a repository-relative location;
+  the local filesystem layout and S3 key scheme both derive from it and can no
+  longer drift.
+- **Structural refactor — client state out of the shared refs namespace**:
+  per-branch snapshots moved from `refs/heads/<branch>.json` to
+  `state/branch-snapshots/<branch>.json`, so client-local files can never be
+  mistaken for branch pointers (`iter_branches` no longer filters `.json`).
+  Existing alpha clones with stale snapshot files can delete them safely.
+- **`merge_sorted_streams` helper**: canonical k-way merge of path-sorted
+  entry streams; staged overlays now build on it, keeping the tree sortedness
+  invariant in one place.
+- **Unified leaf-entry codec** (`core/entry_codec.py`): kind derivation, shape
+  dispatch, field rules, encoding, and decoding now live in exactly one module
+  shared by manifests and trees; adding a leaf attribute touches the codec and
+  the record types instead of every serializer.
+- **Slimmer `ManifestEntry`** *(breaking)*: `identity_value` and `blob_hash`
+  are derived properties (identity is always `hash`; the blob hash exists
+  exactly when `identity_mode == "blake3"`) and are no longer constructor
+  fields. Blob-backed entries can no longer carry `source_uri` — previously it
+  was stored in memory but silently dropped on serialization.
+- **Repository facade removal** *(breaking)*: the ~20 module-level convenience
+  functions (`commit(root, ...)`, `add(root, ...)`, `cat`, `catalog`, …) are
+  gone; the Python API is `open_repository()` plus `ReflakeRepository`
+  methods, which now include `move_staged`, `cat`, `reflog`, and `catalog`.
+  `repository_ops` imports its types from `domain`, eliminating all runtime
+  circular imports.
+- New typed domain errors: `UnknownRefError`, `EmptyBranchError`,
+  `UnknownCommitError` (all `ReflakeError` subclasses) replace bare
+  `ValueError`s with magic strings.
+- `BlobTransferBackend` gains `supports_batch()` / `upload_batch()` so sync no
+  longer dispatches on backend class names.
+- The three-way metadata merge streams merged entries into tree construction
+  instead of materializing the full result in memory.
+- `status --working-tree` skips content hashing when file sizes already differ.
+- Removed dead code: unused `RepositoryObjectKind` members, duplicate
+  `AnalyticalIndexPaths` definition, unreachable manifest validation branches,
+  and the hidden `_leftover_additions_dirs` side channel.
+
+### Fixed
+
+- **`commit --staged` no longer fails when a newly staged path sorts before an
+  existing one**: the staged overlay now merges the parent tree and the
+  additions as two sorted streams instead of appending leftovers at the end.
+- **Merge-aware ancestry everywhere**: `is_ancestor`, fast-forward checks,
+  merge-base computation, and push/pull commit collection now traverse *all*
+  parent edges. Previously only first parents were walked, so after a 3-way
+  merge a branch could not fast-forward to its own merge commit, and push
+  silently omitted the merged-in lineage's commits.
+- **`S3Config.endpoint_url` is now honored** when building boto3 clients and
+  s5cmd invocations (previously stored but ignored; only ambient AWS env config
+  worked).
+- Source-URI reads for `file://` URIs decode percent-escaped paths, so files
+  with quotes or spaces in their names can be staged, restored, and read back.
+- Temp files are cleaned up when blob ingestion from a source URI or S3 stream
+  is interrupted mid-copy.
+- Derived-manifest index keys are extracted with real JSON parsing, so paths
+  containing quote characters no longer corrupt block lookups.
+- Local commits, branch refs, and repository config are written atomically
+  (temp file + rename), preventing torn objects on crash.
+- `transfer --execute` runs generated commands via argument lists instead of
+  `shell=True`.
+- `reflake gc`, sync planning, and tree-walk lookups are fully covered by the
+  `ObjectStore` protocol; the type checker reports zero errors again.
+
 ## [0.1.0] - 2026-08-16
 
 ### Added

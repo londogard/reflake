@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import json
 import struct
-from dataclasses import dataclass, field
-from typing import Any, BinaryIO
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any, BinaryIO, Callable
 
 from blake3 import blake3
+
+from .base import ObjectIO
 
 _PARQUET_MAGIC = b"PAR1"
 _MAX_FOOTER_SIZE = 64 * 1024 * 1024
@@ -136,7 +140,7 @@ class _Reader:
 
 
 def _read_fields(
-    reader: _Reader, handlers: dict[int, object]
+    reader: _Reader, handlers: dict[int, Callable[[int], None]]
 ) -> None:
     """Read a thrift-compact struct, dispatching fields by id.
 
@@ -396,7 +400,7 @@ def _parse_column_metadata(reader: _Reader) -> ColumnStats:
             reader.skip(field_type)
             return
 
-        def stats_field(field_id: int) -> object:
+        def stats_field(field_id: int) -> Callable[[int], None]:
             # Parquet Statistics: field 1 = max, 2 = min (deprecated);
             # field 5 = max_value, 6 = min_value.
             def handler(field_type: int) -> None:
@@ -496,7 +500,7 @@ def parse_footer_stats(payload: str | bytes) -> FooterStats:
     )
 
 
-def capture_footer_stats(store: object, source: BinaryIO) -> str | None:
+def capture_footer_stats(store: ObjectIO, source: BinaryIO) -> str | None:
     """Capture a parquet footer from a seekable *source* into the store.
 
     Returns the content hash of the stats object, or ``None`` when *source*
@@ -510,9 +514,6 @@ def capture_footer_stats(store: object, source: BinaryIO) -> str | None:
     stats_hash = blake3(payload).hexdigest()
     if store.object_exists("footer", stats_hash):
         return stats_hash
-    from pathlib import Path
-    from tempfile import NamedTemporaryFile
-
     with NamedTemporaryFile(mode="wb", suffix=".footer", delete=False) as temp:
         temp_path = Path(temp.name)
         temp.write(payload)

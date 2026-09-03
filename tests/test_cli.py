@@ -972,7 +972,7 @@ def test_cli_checkout_command(tmp_path: Path, capsys, monkeypatch) -> None:
     # Attempt checking out non-existent branch should fail
     assert run_cli(["checkout", "--repo", str(tmp_path), "non-existent"]) == 1
     err_out = capsys.readouterr().err.strip()
-    assert "Unknown branch: non-existent" in err_out
+    assert "Unknown branch or commit: non-existent" in err_out
 
 
 def test_cli_checkout_restore_all_files(tmp_path: Path, capsys) -> None:

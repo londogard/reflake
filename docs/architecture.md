@@ -4,6 +4,21 @@
 parquet-footer scoping, conflict-retry in P0, restore/checkout materialization, `generation`
 semantics; rev. 3 ships the two remaining rollout items — the `repository_store/` + `storage/`
 → `objects/` store unification (§1/§12) and the footer-stats query pruning engine (§4)).
+**Post-review hardening (2026-08):** ancestry checks (`is_ancestor`, fast-forward pre-checks,
+merge-base, push/pull collection) now traverse the full parent DAG instead of first-parent
+chains; the staged overlay merges sorted streams so `commit --staged` is order-safe;
+`ObjectStore` covers enumeration/deletion/paths so gc and sync are protocol-typed; local
+commits/refs/config writes are atomic.
+**Structural refactor (2026-08):** `ObjectStore` is split into composable capabilities
+(`ObjectIO`, `RefCas`, `TreeQuery`, `StoreInventory`) with consumers annotated against the
+narrow view they need; one key-space mapping (`layout.object_relative_key`) now defines
+physical locations for both adapters; client branch snapshots moved out of `refs/heads/`
+into `state/branch-snapshots/` (§5's filename-coupling fix); a canonical
+`merge_sorted_streams` helper owns the sorted-stream invariant used by staged overlays;
+leaf serialization/validation is unified in `core/entry_codec.py` and `ManifestEntry`
+derives `identity_value`/`blob_hash` instead of storing redundant copies; the module-level
+repository facade functions are gone — the Python API is `open_repository()` +
+`ReflakeRepository` methods.
 **P0 shipped:** tree objects (`core/objects/tree.py`), tree-walk lookups with a client-side
 prefix cache (`core/objects/query.py`), `TreeWriter` (`core/services/tree.py`), `commit → tree`
 with `{tree, parents}`, staged-overlay commits with CAS retry, derived manifests

@@ -10,9 +10,11 @@ from .errors import (
     RefConflictError,
     StorageUnavailableError,
     NotARepositoryError,
+    UnknownRefError,
+    EmptyBranchError,
+    UnknownCommitError,
 )
 from .models import (
-    AnalyticalIndexPaths,
     BranchRefState,
     CommitObject,
     DiffEntry,
@@ -30,10 +32,10 @@ from .models import (
 )
 
 __all__ = [
-    "AnalyticalIndexPaths",
     "BranchRefState",
     "CommitObject",
     "DiffEntry",
+    "EmptyBranchError",
     "FetchResult",
     "ReflakeError",
     "GcResult",
@@ -52,5 +54,7 @@ __all__ = [
     "RepositoryObjectKind",
     "StageChange",
     "StageStatus",
+    "UnknownCommitError",
+    "UnknownRefError",
     "VerifyResult",
 ]

@@ -135,7 +135,7 @@ Unimplemented note:
 
 Acceptance criteria:
 
-- Concurrent updates6 7 do not silently overwrite each other.
+- Concurrent updates do not silently overwrite each other.
 - Fast-forward merge remains safe under concurrent clients.
 
 ## Phase 4: Repo URI Support

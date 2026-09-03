@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import msgspec
 
-RepositoryObjectKind = Literal["blob", "commit", "manifest", "manifest-index", "ref", "tree", "footer"]
+RepositoryObjectKind = Literal["blob", "commit", "ref", "tree", "footer"]
 
 
 @dataclass(frozen=True)
@@ -146,9 +144,3 @@ class PullResult:
     pulled_commits: int
     pulled_blobs: int
     updated: bool
-
-
-@dataclass(frozen=True)
-class AnalyticalIndexPaths:
-    db_path: Path
-    parquet_dir: Path | None

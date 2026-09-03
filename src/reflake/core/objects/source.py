@@ -39,6 +39,13 @@ def _s3_is_404(error: ClientError) -> bool:
     }
 
 
+def build_s3_client(endpoint_url: str | None = None) -> Any:
+    """Create a boto3 S3 client, honoring an explicit endpoint when given."""
+    if endpoint_url:
+        return boto3.client("s3", endpoint_url=endpoint_url)
+    return boto3.client("s3")
+
+
 def _s3_is_precondition_failed(error: ClientError) -> bool:
     return error.response.get("Error", {}).get("Code", "") in {
         "PreconditionFailed",
@@ -76,7 +83,7 @@ def iter_s3_objects(
     client: Any | None = None,
 ) -> Iterator[S3ObjectMetadata]:
     bucket, prefix = parse_s3_uri(source_uri)
-    s3_client = client or boto3.client("s3")
+    s3_client = client or build_s3_client()
     paginator = s3_client.get_paginator("list_objects_v2")
     try:
         pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
@@ -102,7 +109,7 @@ def describe_source_uri(
         bucket, key = parse_s3_uri(source_uri)
         if not key or key.endswith("/"):
             raise ValueError(f"S3 source must be an object, not a prefix: {source_uri}")
-        s3_client = client or boto3.client("s3")
+        s3_client = client or build_s3_client()
         try:
             response = s3_client.head_object(Bucket=bucket, Key=key)
         except ClientError as error:
@@ -140,7 +147,7 @@ def open_source_uri(
 ) -> Iterator[BinaryIO]:
     if source_uri.startswith("s3://"):
         bucket, key = parse_s3_uri(source_uri)
-        s3_client = client or boto3.client("s3")
+        s3_client = client or build_s3_client()
         try:
             response = s3_client.get_object(Bucket=bucket, Key=key)
         except ClientError as error:
@@ -150,6 +157,12 @@ def open_source_uri(
             yield body
         finally:
             body.close()
+        return
+    parsed = urlparse(source_uri)
+    if parsed.scheme == "file":
+        path = Path(unquote(parsed.path))
+        with path.open("rb") as handle:
+            yield handle
         return
     with fsspec.open(source_uri, mode="rb") as handle:
         yield handle  # type: ignore[invalid-yield]
@@ -165,7 +178,7 @@ class S3StorageBackend:
     ) -> None:
         self.bucket = bucket
         self.prefix = prefix.strip("/")
-        self.client = client or boto3.client("s3")
+        self.client = client or build_s3_client()
 
     def _key(self, relative_path: str) -> str:
         if self.prefix:

@@ -204,7 +204,7 @@ def test_manifest_entry_validation_rejects_invalid_payloads() -> None:
                 "mtime_ns": 1,
                 "identity_mode": "meta",
             },
-            "must include source_uri",
+            "Source-pointer entries must carry a non-empty source_uri",
         ),
     ]
 

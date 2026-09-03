@@ -23,18 +23,26 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from blake3 import blake3
+import msgspec
 
+from ..entry_codec import (
+    KIND_BLOB,
+    KIND_BP,
+    KIND_META,
+    KIND_MP,
+    LEAF_KINDS,
+    LeafRecord,
+    decode_leaf_parts,
+    encode_leaf,
+    leaf_kind_for,
+    validate_leaf,
+)
 from ..manifest import ManifestEntry
 
 KIND_TREE = "t"
 KIND_SHARD = "s"
-KIND_BLOB = "b"
-KIND_META = "m"
-KIND_BP = "bp"
-KIND_MP = "mp"
 
 SUBTREE_KINDS = frozenset({KIND_TREE, KIND_SHARD})
-LEAF_KINDS = frozenset({KIND_BLOB, KIND_META, KIND_BP, KIND_MP})
 SUPPORTED_KINDS = frozenset({KIND_TREE, KIND_SHARD, *LEAF_KINDS})
 
 #: A tree object holds at most this many direct entries before it is split
@@ -83,23 +91,12 @@ class TreeEntry:
         if self.kind in SUBTREE_KINDS:
             if self.size or self.mtime_ns or self.source_uri or self.footer:
                 raise ValueError("Subtree entries only carry a name and hash")
-        else:
-            if self.kind in {KIND_BLOB, KIND_BP}:
-                if self.source_uri is not None:
-                    raise ValueError("Blob-backed entries cannot carry source_uri")
-            if self.kind in {KIND_META, KIND_MP}:
-                if not self.source_uri:
-                    raise ValueError(
-                        "Source-pointer entries must carry a non-empty source_uri"
-                    )
-            if self.kind in {KIND_BP, KIND_MP}:
-                if not self.footer or not _is_hex_digest(self.footer):
-                    raise ValueError(
-                        "Parquet entries must carry a footer hash (64 hex chars)"
-                    )
-            else:
-                if self.footer is not None:
-                    raise ValueError("Non-parquet entries cannot carry a footer")
+            return
+        validate_leaf(self.kind, source_uri=self.source_uri, footer=self.footer)
+        if self.footer is not None and not _is_hex_digest(self.footer):
+            raise ValueError(
+                "Parquet entries must carry a footer hash (64 hex chars)"
+            )
 
     @property
     def is_subtree(self) -> bool:
@@ -111,84 +108,61 @@ class TreeEntry:
 
     def serialize(self) -> str:
         if self.kind in SUBTREE_KINDS:
-            payload: list[object] = [self.kind, self.name, self.hash]
-        elif self.kind == KIND_BLOB:
-            payload = [self.kind, self.name, self.hash, self.size, self.mtime_ns]
-        elif self.kind == KIND_META:
-            payload = [
-                self.kind,
-                self.name,
-                self.hash,
-                self.size,
-                self.mtime_ns,
-                self.source_uri,
-            ]
-        elif self.kind == KIND_BP:
-            payload = [
-                self.kind,
-                self.name,
-                self.hash,
-                self.size,
-                self.mtime_ns,
-                self.footer,
-            ]
-        else:  # KIND_MP
-            payload = [
-                self.kind,
-                self.name,
-                self.hash,
-                self.size,
-                self.mtime_ns,
-                self.source_uri,
-                self.footer,
-            ]
-        return json.dumps(payload, separators=(",", ":"))
+            return msgspec.json.encode([self.kind, self.name, self.hash]).decode("utf-8")
+        return encode_leaf(self._leaf_record())
+
+    def _leaf_record(self) -> LeafRecord:
+        return LeafRecord(
+            kind=self.kind,
+            name=self.name,
+            hash=self.hash,
+            size=self.size,
+            mtime_ns=self.mtime_ns,
+            source_uri=self.source_uri,
+            footer=self.footer,
+        )
 
     @staticmethod
-    def parse(line: str) -> "TreeEntry":
+    def parse(line: str | bytes) -> "TreeEntry":
         try:
-            payload = json.loads(line)
-        except json.JSONDecodeError as error:
+            payload = msgspec.json.decode(line)
+        except (msgspec.DecodeError, ValueError) as error:
             raise ValueError("Corrupt tree entry payload") from error
         if not isinstance(payload, list) or not payload:
             raise ValueError("Tree entry payload must be a JSON array")
         kind = str(payload[0])
         if kind not in SUPPORTED_KINDS:
             raise ValueError(f"Tree entry payload has an unsupported shape: {kind}")
-        try:
-            name = str(payload[1])
-            hash_value = str(payload[2])
-        except IndexError as error:
-            raise ValueError("Tree entry payload is missing required fields") from error
-
         if kind in SUBTREE_KINDS:
-            size, mtime_ns, source_uri, footer = 0, 0, None, None
-        elif kind == KIND_BLOB:
-            size, mtime_ns = int(payload[3]), int(payload[4])
-            source_uri, footer = None, None
-        elif kind == KIND_META:
-            size, mtime_ns = int(payload[3]), int(payload[4])
-            source_uri, footer = str(payload[5]), None
-        elif kind == KIND_BP:
-            size, mtime_ns = int(payload[3]), int(payload[4])
-            source_uri, footer = None, str(payload[5])
-        else:  # KIND_MP
-            size, mtime_ns = int(payload[3]), int(payload[4])
-            source_uri, footer = str(payload[5]), str(payload[6])
+            try:
+                name, hash_value = str(payload[1]), str(payload[2])
+            except IndexError as error:
+                raise ValueError(
+                    "Tree entry payload is missing required fields"
+                ) from error
+            return TreeEntry(name=name, kind=kind, hash=hash_value)
+
+        record = decode_leaf_parts(payload)
         return TreeEntry(
-            name=name,
-            kind=kind,
-            hash=hash_value,
-            size=size,
-            mtime_ns=mtime_ns,
-            source_uri=source_uri,
-            footer=footer,
+            name=record.name,
+            kind=record.kind,
+            hash=record.hash,
+            size=record.size,
+            mtime_ns=record.mtime_ns,
+            source_uri=record.source_uri,
+            footer=record.footer,
         )
 
     @staticmethod
-    def name_from_payload(line: str) -> str:
+    def name_from_payload(line: str | bytes) -> str:
         """Extract the entry name without a full JSON parse (for sort checks)."""
-        return line.split('"', 4)[3]
+        try:
+            payload = msgspec.json.decode(line)
+        except (msgspec.DecodeError, ValueError) as error:
+            raise ValueError("Corrupt tree entry payload") from error
+        if not isinstance(payload, list) or len(payload) < 2:
+            raise ValueError("Tree entry payload must be a JSON array")
+        return str(payload[1])
 
 
 def serialize_tree_object(entries: Iterable[TreeEntry]) -> bytes:
@@ -217,20 +191,13 @@ def parse_tree_object(payload: bytes) -> list[TreeEntry]:
 
 def leaf_to_tree_entry(entry: ManifestEntry) -> TreeEntry:
     """Convert a leaf manifest entry (full path) into a tree entry (name only)."""
-    name = entry.path.rsplit("/", 1)[-1]
-    if entry.identity_mode == "blake3":
-        kind = KIND_BP if entry.footer is not None else KIND_BLOB
-        source_uri = None
-    else:
-        kind = KIND_MP if entry.footer is not None else KIND_META
-        source_uri = entry.source_uri
     return TreeEntry(
-        name=name,
-        kind=kind,
+        name=entry.path.rsplit("/", 1)[-1],
+        kind=leaf_kind_for(entry.identity_mode, has_footer=entry.footer is not None),
         hash=entry.hash,
         size=entry.size,
         mtime_ns=entry.mtime_ns,
-        source_uri=source_uri,
+        source_uri=entry.source_uri if entry.identity_mode == "meta" else None,
         footer=entry.footer,
     )
 

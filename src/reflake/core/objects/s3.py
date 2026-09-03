@@ -4,7 +4,6 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, BinaryIO, Iterator
 
-import boto3
 from botocore.exceptions import ClientError
 
 from ..domain import (
@@ -15,10 +14,11 @@ from ..domain import (
     RepositoryObjectKind,
     StorageUnavailableError,
 )
-from ..layout import blob_relpath
+from ..layout import object_relative_key
+from ..manifest import ManifestEntry
 from .backends import BlobTransferBackend
 from .query import TreeCache, TreeWalker
-from .source import _s3_is_404, _s3_is_precondition_failed
+from .source import _s3_is_404, _s3_is_precondition_failed, build_s3_client
 
 
 class S3ObjectStore:
@@ -33,7 +33,7 @@ class S3ObjectStore:
     ) -> None:
         self.bucket = bucket
         self.prefix = prefix.strip("/")
-        self.client = client or boto3.client("s3")
+        self.client = client or build_s3_client()
         self.branch_root = Path(branch_root).resolve() if branch_root else None
         self.tree_cache = TreeCache()
         self._walker = TreeWalker(
@@ -48,6 +48,12 @@ class S3ObjectStore:
 
     def object_uri(self, kind: RepositoryObjectKind, object_id: str) -> str:
         return f"s3://{self.bucket}/{self._key(kind, object_id)}"
+
+    def object_path(self, kind: RepositoryObjectKind, object_id: str) -> Path:
+        raise NotImplementedError(
+            "S3ObjectStore keeps objects in bucket storage; transfer plans "
+            "require a local source or destination store"
+        )
 
     def read_commit_bytes(self, commit_id: str) -> bytes | None:
         try:
@@ -95,6 +101,25 @@ class S3ObjectStore:
                 return None
             raise self._translate(error, "read_tree_bytes")
         return response["Body"].read()
+
+    def write_tree_bytes(
+        self,
+        tree_hash: str,
+        payload: bytes,
+        *,
+        if_missing: bool = True,
+    ) -> None:
+        try:
+            self._put_stream(
+                key=self._key("tree", tree_hash),
+                body=payload,
+                if_missing=if_missing,
+                error_message=f"Tree already exists: {tree_hash}",
+            )
+        except OptimisticLockError:
+            if if_missing:
+                return
+            raise
 
     def write_tree_file(
         self,
@@ -360,20 +385,23 @@ class S3ObjectStore:
         if_missing: bool = True,
     ) -> None:
         if self._blob_transfer is not None:
-            with NamedTemporaryFile(delete=False) as temp:
-                temp_path = Path(temp.name)
-                while chunk := source.read(1024 * 1024):
-                    temp.write(chunk)
+            temp_path: Path | None = None
             try:
+                with NamedTemporaryFile(delete=False) as temp:
+                    temp_path = Path(temp.name)
+                    while chunk := source.read(1024 * 1024):
+                        temp.write(chunk)
                 if if_missing and self.object_exists("blob", blob_hash):
                     return
+                assert temp_path is not None
                 self._blob_transfer.upload(
                     str(temp_path),
                     self._blob_uri(blob_hash),
                     if_not_exists=if_missing,
                 )
             finally:
-                temp_path.unlink(missing_ok=True)
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
             return
         try:
             self._put_stream(
@@ -417,15 +445,7 @@ class S3ObjectStore:
         return relative_path
 
     def _relative_path(self, kind: RepositoryObjectKind, object_id: str) -> str:
-        if kind == "blob":
-            return f"blobs/{blob_relpath(object_id).as_posix()}"
-        if kind == "commit":
-            return f"commits/{object_id}.json"
-        if kind == "tree":
-            return f"trees/{object_id}"
-        if kind == "footer":
-            return f"footers/{object_id}"
-        return f"refs/heads/{object_id}"
+        return object_relative_key(kind, object_id)
 
     def _put_stream(
         self,

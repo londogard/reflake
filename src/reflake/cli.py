@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from importlib import metadata
 import json
+import shlex
 import sys
 from dataclasses import asdict, dataclass
 from typing import Literal, Any
@@ -13,20 +14,8 @@ from simple_parsing.helpers import field, flag, subparsers
 from .core import (
     ReflakeError,
     NotARepositoryError,
-    RefConflictError,
     StageStatus,
-    add,
-    branch,
     build_analytical_index,
-    commit,
-    diff,
-    merge,
-    move_staged,
-    rm,
-    status,
-    verify,
-    checkout,
-    restore_files,
     open_repository,
     parse_where_clause,
     plan_pruned_scan,
@@ -44,7 +33,6 @@ HANDLED_CLI_ERRORS = (
     ReflakeError,
     FileNotFoundError,
     PermissionError,
-    RefConflictError,
     ValueError,
 )
 
@@ -855,8 +843,7 @@ def run_cli(argv: list[str] | None = None) -> int:
 
     try:
         if isinstance(command, CommitArgs):
-            commit_id = commit(
-                command.root,
+            commit_id = open_repository(command.root).commit(
                 command.message,
                 staged_only=command.staged_only,
             )
@@ -875,8 +862,7 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, AddArgs):
-            stage = add(
-                root=command.root,
+            stage = open_repository(command.root).add(
                 paths=command.paths,
                 identity_mode=command.identity,
                 destination_path=command.destination_path,
@@ -895,7 +881,7 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, RmArgs):
-            stage = rm(root=command.root, paths=command.paths)
+            stage = open_repository(command.root).rm(paths=command.paths)
             if command.json:
                 print(json.dumps(_stage_payload(stage), indent=2))
             else:
@@ -903,8 +889,7 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, MoveArgs):
-            stage = move_staged(
-                root=command.root,
+            stage = open_repository(command.root).move_staged(
                 source_path=command.source_path,
                 destination_path=command.destination_path,
             )
@@ -915,9 +900,9 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, StatusArgs):
-            stage = status(
-                root=command.root,
-            )
+            stage = open_repository(
+                command.root, must_exist=True
+            ).status(working_tree=True)
             if command.json:
                 print(json.dumps(_stage_payload(stage), indent=2))
             else:
@@ -925,13 +910,12 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, BranchArgs):
-            branch(command.root, command.name)
+            open_repository(command.root).branch(command.name)
             print(f"Created branch '{command.name}'")
             return 0
 
         if isinstance(command, DiffArgs):
-            changes = diff(
-                command.root,
+            changes = open_repository(command.root).diff(
                 command.from_ref,
                 command.to_ref,
             )
@@ -954,10 +938,9 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, MergeArgs):
-            result = merge(
-                root=command.root,
-                source_ref=command.source_ref,
-                target_ref=command.target_ref,
+            result = open_repository(command.root).merge(
+                command.source_ref,
+                command.target_ref,
             )
             if command.json:
                 print(
@@ -983,8 +966,7 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, VerifyArgs):
-            result = verify(
-                root=command.root,
+            result = open_repository(command.root).verify(
                 path_prefixes=_flatten_option_values(command.path),
                 dry_run=command.dry_run,
             )
@@ -1180,28 +1162,13 @@ def run_cli(argv: list[str] | None = None) -> int:
 
         if isinstance(command, CatArgs):
             repo = open_repository(command.root)
-            entry = repo.resolve_entry(command.ref, command.path)
-            if entry is None:
-                raise FileNotFoundError(
-                    f"Path not found in ref '{command.ref}': {command.path}"
-                )
-            if entry.blob_hash:
-                sys.stdout.buffer.write(repo.read_blob(entry.blob_hash))
-            elif entry.source_uri:
-                from .core.objects import open_source_uri
-
-                with open_source_uri(entry.source_uri) as handle:
-                    sys.stdout.buffer.write(handle.read())
-            else:
-                raise FileNotFoundError(
-                    f"Entry has no readable content: {command.path}"
-                )
+            sys.stdout.buffer.write(repo.cat(command.ref, command.path))
             return 0
 
         if isinstance(command, ReflogArgs):
             repo = open_repository(command.root)
             branch_name = command.branch or repo.current_branch()
-            entries = list(repo.client_state.iter_reflog(branch_name))
+            entries = list(repo.reflog(branch_name))
             if command.json:
                 payload = []
                 for line in entries:
@@ -1222,16 +1189,7 @@ def run_cli(argv: list[str] | None = None) -> int:
 
         if isinstance(command, CatalogArgs):
             repo = open_repository(command.root)
-            datasets = []
-            for branch_name in sorted(repo.store.iter_branches()):
-                state = repo.store.read_branch_ref(branch_name)
-                commit_id = state.commit_id if state else None
-                message = None
-                if commit_id:
-                    message = repo.read_commit(commit_id).message
-                datasets.append(
-                    {"branch": branch_name, "commit_id": commit_id, "message": message}
-                )
+            datasets = repo.catalog()
             if command.json:
                 print(json.dumps(datasets, indent=2))
             else:
@@ -1283,13 +1241,12 @@ def run_cli(argv: list[str] | None = None) -> int:
                 return 0
 
         if isinstance(command, CheckoutArgs):
-            checkout(command.root, command.name)
+            open_repository(command.root).set_current_branch(command.name)
             print(f"Switched to branch '{command.name}'")
             return 0
 
         if isinstance(command, RestoreArgs):
-            restored = restore_files(
-                command.root,
+            restored = open_repository(command.root).restore_files(
                 command.ref,
                 paths=_flatten_option_values(command.path) or None,
                 force=command.force,
@@ -1392,7 +1349,7 @@ def run_cli(argv: list[str] | None = None) -> int:
                 import subprocess
 
                 for cmd in cmds:
-                    subprocess.run(cmd, shell=True, check=True)
+                    subprocess.run(shlex.split(cmd), check=True)
                 print(f"Executed {len(cmds)} transfer commands")
             else:
                 for cmd in cmds:

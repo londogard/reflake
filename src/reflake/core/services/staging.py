@@ -266,11 +266,11 @@ class StagingArea:
         for path in sorted(working_paths & manifest_paths):
             manifest_entry = manifest_by_path[path]
             working_file = working_files[path]
+            if working_file.size != manifest_entry.size:
+                modified_paths.append(path)
+                continue
             current_hash = blake3_digest_file(working_file.path)
-            if (
-                current_hash != manifest_entry.hash
-                or working_file.size != manifest_entry.size
-            ):
+            if current_hash != manifest_entry.hash:
                 modified_paths.append(path)
 
         return added_paths, removed_paths, modified_paths

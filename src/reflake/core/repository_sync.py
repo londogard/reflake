@@ -11,14 +11,17 @@ if TYPE_CHECKING:
     from .repository import ReflakeRepository
 
 
-from .domain import FetchResult, PullResult, PushResult
+from .domain import FetchResult, PullResult, PushResult, RepositoryObjectKind
+from .objects.base import ObjectIO, ObjectStore
+from .objects.backends import BlobTransferBackend
+from .repository_support import is_ancestor_commit
 
 
 @dataclass(frozen=True)
 class TransferItem:
     """One (src → dst) copy in a transfer plan (docs/architecture.md §7)."""
 
-    kind: str  # "blob" | "tree" | "footer" | "commit"
+    kind: RepositoryObjectKind
     object_id: str
     local_path: str
     remote_uri: str
@@ -35,7 +38,7 @@ def _build_plan(
     items: list[TransferItem] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(kind: str, object_id: str) -> None:
+    def add(kind: RepositoryObjectKind, object_id: str) -> None:
         key = (kind, object_id)
         if key in seen or dst_repo.store.object_exists(kind, object_id):
             return
@@ -44,21 +47,15 @@ def _build_plan(
             local_path = src_repo.store.object_path(kind, object_id)
         else:
             local_path = dst_repo.store.object_path(kind, object_id)
-        remote_uri = (
-            src_repo.store.object_uri(kind, object_id)
-            if direction == "download" and hasattr(src_repo.store, "object_uri")
-            else (
-                dst_repo.store.object_uri(kind, object_id)
-                if hasattr(dst_repo.store, "object_uri")
-                else ""
-            )
+        remote_store = (
+            dst_repo.store if direction == "upload" else src_repo.store
         )
         items.append(
             TransferItem(
                 kind=kind,
                 object_id=object_id,
                 local_path=str(local_path),
-                remote_uri=remote_uri,
+                remote_uri=remote_store.object_uri(kind, object_id),
             )
         )
 
@@ -80,42 +77,42 @@ def _build_plan(
 def _copy_item(
     item: TransferItem,
     *,
-    local_store: object,
-    remote_store: object,
+    local_store: ObjectIO,
+    remote_store: ObjectIO,
     direction: str,
 ) -> None:
     kind, object_id = item.kind, item.object_id
     if direction == "upload":
         if kind == "blob":
             with open(item.local_path, "rb") as handle:
-                remote_store.write_blob_stream(object_id, handle, if_missing=True)  # type: ignore[attr-defined]
+                remote_store.write_blob_stream(object_id, handle, if_missing=True)
         elif kind == "tree":
-            remote_store.write_tree_file(object_id, item.local_path, if_missing=True)  # type: ignore[attr-defined]
+            remote_store.write_tree_file(object_id, item.local_path, if_missing=True)
         elif kind == "footer":
-            remote_store.write_footer_file(object_id, item.local_path, if_missing=True)  # type: ignore[attr-defined]
+            remote_store.write_footer_file(object_id, item.local_path, if_missing=True)
         else:
-            remote_store.write_commit_bytes(  # type: ignore[attr-defined]
+            remote_store.write_commit_bytes(
                 object_id, Path(item.local_path).read_bytes(), if_missing=True
             )
         return
     # download
     if kind == "blob":
-        source = remote_store.open_blob(object_id)  # type: ignore[attr-defined]
+        source = remote_store.open_blob(object_id)
         try:
-            local_store.write_blob_stream(object_id, source, if_missing=True)  # type: ignore[attr-defined]
+            local_store.write_blob_stream(object_id, source, if_missing=True)
         finally:
             source.close()
     else:
         if kind == "tree":
-            payload = remote_store.read_tree_bytes(object_id)  # type: ignore[attr-defined]
-            write = local_store.write_tree_file  # type: ignore[attr-defined]
+            payload = remote_store.read_tree_bytes(object_id)
+            write = local_store.write_tree_file
         elif kind == "footer":
-            payload = remote_store.read_footer_bytes(object_id)  # type: ignore[attr-defined]
-            write = local_store.write_footer_file  # type: ignore[attr-defined]
+            payload = remote_store.read_footer_bytes(object_id)
+            write = local_store.write_footer_file
         else:
-            payload = remote_store.read_commit_bytes(object_id)  # type: ignore[attr-defined]
+            payload = remote_store.read_commit_bytes(object_id)
             if payload is not None:
-                local_store.write_commit_bytes(  # type: ignore[attr-defined]
+                local_store.write_commit_bytes(
                     object_id, payload, if_missing=True
                 )
             return
@@ -133,11 +130,11 @@ def _copy_item(
 def execute_transfer_plan(
     items: list[TransferItem],
     *,
-    local_store: object,
-    remote_store: object,
+    local_store: ObjectIO,
+    remote_store: ObjectIO,
     direction: str,
-    batch_backend: object | None = None,
-    progress: object | None = None,
+    batch_backend: BlobTransferBackend | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> int:
     """Execute a transfer plan in one batch (s5cmd) or per-object (boto3).
 
@@ -145,17 +142,14 @@ def execute_transfer_plan(
     """
     if not items:
         return 0
-    if batch_backend is not None and type(batch_backend).__name__ == "S5CmdBlobTransferBackend":
-        lines: list[str] = []
-        for item in items:
-            if direction == "upload":
-                lines.append(f"cp --if-not-exists {item.local_path} {item.remote_uri}")
-            else:
-                lines.append(f"cp {item.remote_uri} {item.local_path}")
-        batch_backend._run(["run"], input_data="\n".join(lines) + "\n")  # type: ignore[attr-defined]
+    if batch_backend is not None and batch_backend.supports_batch():
+        transferred = batch_backend.upload_batch(
+            [(item.local_path, item.remote_uri) for item in items],
+            if_not_exists=direction == "upload",
+        )
         if progress is not None:
-            progress(len(items), len(items))
-        return len(items)
+            progress(transferred, len(items))
+        return transferred
 
     for index, item in enumerate(items):
         _copy_item(
@@ -172,16 +166,22 @@ def execute_transfer_plan(
 def _collect_commits_to_push(
     src_repo: ReflakeRepository, dst_repo: ReflakeRepository, commit_id: str
 ) -> list[str]:
-    """Walk local commit chain and return commits not on remote, oldest first."""
+    """Commits reachable from *commit_id* that are missing on the destination.
+
+    Merge-aware: every parent edge is traversed.  Results are ordered oldest
+    first (parents before children) by generation.
+    """
     commits: list[str] = []
-    current: str | None = commit_id
-    while current:
-        if dst_repo.store.object_exists("commit", current):
-            break
+    seen: set[str] = set()
+    stack: list[str] = [commit_id]
+    while stack:
+        current = stack.pop()
+        if current in seen or dst_repo.store.object_exists("commit", current):
+            continue
+        seen.add(current)
         commits.append(current)
-        commit_obj = src_repo.read_commit(current)
-        current = commit_obj.first_parent
-    commits.reverse()
+        stack.extend(src_repo.read_commit(current).parents)
+    commits.sort(key=lambda cid: src_repo.read_commit(cid).generation)
     return commits
 
 
@@ -190,15 +190,20 @@ def _is_ancestor_in(
     descendant: str,
     repo: ReflakeRepository,
 ) -> bool:
-    """Check whether *ancestor* is an ancestor of *descendant* by walking
-    the commit chain stored in *repo*."""
-    current: str | None = descendant
-    while current:
-        if current == ancestor:
-            return True
-        commit_obj = repo.read_commit(current)
-        current = commit_obj.first_parent
-    return False
+    """Check whether *ancestor* is an ancestor of *descendant* in *repo*.
+
+    Commits missing from *repo* (e.g. a remote-only head) are treated as
+    unreachable rather than fatal.
+    """
+    from .domain import UnknownCommitError
+
+    def read_commit(commit_id: str):
+        try:
+            return repo.read_commit(commit_id)
+        except UnknownCommitError:
+            return None
+
+    return is_ancestor_commit(ancestor, descendant, read_commit=read_commit)
 
 
 def _verify_push_fast_forward(

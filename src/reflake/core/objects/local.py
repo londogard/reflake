@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import BinaryIO, Iterator
 
 from ..domain import BranchRefState, OptimisticLockError, RepositoryObjectKind
-from ..layout import blob_relpath, initialize_reflake_layout
+from ..layout import initialize_reflake_layout, object_relative_key
 from ..manifest import ManifestEntry
 from .query import TreeCache, TreeWalker
 from .tree import parse_tree_object
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=path.parent, delete=False) as temp:
+        temp_path = Path(temp.name)
+        temp.write(payload)
+    try:
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 class LocalObjectStore:
@@ -36,10 +48,9 @@ class LocalObjectStore:
         if_missing: bool = False,
     ) -> None:
         commit_path = self.commit_path(commit_id)
-        commit_path.parent.mkdir(parents=True, exist_ok=True)
         if if_missing and commit_path.exists():
             raise OptimisticLockError(f"Commit already exists: {commit_id}")
-        commit_path.write_bytes(payload)
+        _atomic_write_bytes(commit_path, payload)
 
     # ── Trees ────────────────────────────────────────────────────────────
 
@@ -48,6 +59,19 @@ class LocalObjectStore:
         if not tree_path.exists():
             return None
         return tree_path.read_bytes()
+
+    def write_tree_bytes(
+        self,
+        tree_hash: str,
+        payload: bytes,
+        *,
+        if_missing: bool = True,
+    ) -> None:
+        tree_path = self.tree_path(tree_hash)
+        tree_path.parent.mkdir(parents=True, exist_ok=True)
+        if if_missing and tree_path.exists():
+            return
+        _atomic_write_bytes(tree_path, payload)
 
     def write_tree_file(
         self,
@@ -114,10 +138,8 @@ class LocalObjectStore:
         )
 
     def write_branch_ref(self, branch: str, commit_id: str | None) -> None:
-        branch_path = self.branch_path(branch)
-        branch_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = f"{commit_id}\n" if commit_id else ""
-        branch_path.write_text(payload, encoding="utf-8")
+        payload = f"{commit_id}\n".encode("utf-8") if commit_id else b""
+        _atomic_write_bytes(self.branch_path(branch), payload)
 
     def compare_and_set_branch_ref(
         self,
@@ -127,16 +149,24 @@ class LocalObjectStore:
         expected_version_token: str | None,
         expected_commit_id: str | None = None,
     ) -> bool:
-        current_token = self.version_token("ref", branch)
-        if current_token != expected_version_token:
-            return False
-        if expected_commit_id is not None:
-            current_state = self.read_branch_ref(branch)
-            current_commit_id = current_state.commit_id if current_state else None
-            if current_commit_id != expected_commit_id:
-                return False
-        self.write_branch_ref(branch, commit_id)
-        return True
+        lock_file_path = self.layout.refs_dir / ".lock"
+        lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_file_path, "a") as lock_file:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                current_token = self.version_token("ref", branch)
+                if current_token != expected_version_token:
+                    return False
+                if expected_commit_id is not None:
+                    current_state = self.read_branch_ref(branch)
+                    current_commit_id = current_state.commit_id if current_state else None
+                    if current_commit_id != expected_commit_id:
+                        return False
+                self.write_branch_ref(branch, commit_id)
+                return True
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     # ── Blobs ────────────────────────────────────────────────────────────
 
@@ -187,12 +217,7 @@ class LocalObjectStore:
 
     def iter_branches(self) -> Iterator[str]:
         for path in self.layout.heads_dir.iterdir():
-            # Skip HEAD + client-state snapshots (refs/heads/<branch>.json).
-            if (
-                path.is_file()
-                and not path.name.startswith(".")
-                and not path.name.endswith(".json")
-            ):
+            if path.is_file() and not path.name.startswith("."):
                 yield path.name
 
     def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]:
@@ -214,6 +239,9 @@ class LocalObjectStore:
     def object_path(self, kind: RepositoryObjectKind, object_id: str) -> Path:
         return self._path_for(kind, object_id)
 
+    def object_uri(self, kind: RepositoryObjectKind, object_id: str) -> str:
+        return self._path_for(kind, object_id).as_uri()
+
     # ── Paths ────────────────────────────────────────────────────────────
 
     def object_exists(self, kind: RepositoryObjectKind, object_id: str) -> bool:
@@ -227,27 +255,19 @@ class LocalObjectStore:
         return f"{stat.st_mtime_ns}-{stat.st_size}"
 
     def blob_path(self, blob_hash: str) -> Path:
-        return self.layout.blobs_dir / blob_relpath(blob_hash)
+        return self._path_for("blob", blob_hash)
 
     def commit_path(self, commit_id: str) -> Path:
-        return self.layout.commits_dir / f"{commit_id}.json"
+        return self._path_for("commit", commit_id)
 
     def tree_path(self, tree_hash: str) -> Path:
-        return self.layout.trees_dir / tree_hash
+        return self._path_for("tree", tree_hash)
 
     def footer_path(self, footer_hash: str) -> Path:
-        return self.layout.footers_dir / footer_hash
+        return self._path_for("footer", footer_hash)
 
     def branch_path(self, branch: str) -> Path:
-        return self.layout.heads_dir / branch
+        return self._path_for("ref", branch)
 
     def _path_for(self, kind: RepositoryObjectKind, object_id: str) -> Path:
-        if kind == "blob":
-            return self.blob_path(object_id)
-        if kind == "commit":
-            return self.commit_path(object_id)
-        if kind == "tree":
-            return self.tree_path(object_id)
-        if kind == "footer":
-            return self.footer_path(object_id)
-        return self.branch_path(object_id)
+        return self.layout.reflake_dir / object_relative_key(kind, object_id)

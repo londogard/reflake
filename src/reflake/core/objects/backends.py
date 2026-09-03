@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Protocol
+from typing import Iterator, Protocol, Sequence
 
 from ..domain import OptimisticLockError
 
@@ -77,6 +77,19 @@ class BlobTransferBackend(Protocol):
     def delete(self, remote_uri: str) -> None: ...
 
     def exists(self, remote_uri: str) -> bool: ...
+
+    def supports_batch(self) -> bool:
+        """True when the backend can execute a batch of copies at once."""
+        ...
+
+    def upload_batch(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        if_not_exists: bool = False,
+    ) -> int:
+        """Execute many ``(local_path, remote_uri)`` copies; returns count."""
+        ...
 
 
 class LocalStorageBackend:

@@ -1,16 +1,107 @@
 from __future__ import annotations
 
+import heapq
+from collections import deque
 from dataclasses import replace
 from pathlib import PurePosixPath
+from typing import Callable, Iterable, Iterator
 
 from blake3 import blake3
 
+from .domain import CommitObject
 from .manifest import ManifestEntry
+
+CommitReader = Callable[[str], CommitObject]
+
+
+def merge_sorted_streams(
+    *streams: Iterable[ManifestEntry],
+) -> Iterator[ManifestEntry]:
+    """Stable k-way merge of path-sorted manifest-entry streams.
+
+    Tree entries and manifests are ordered by logical path; every operation
+    that combines streams (staged overlays, imports, metadata rewrites) must
+    merge rather than concatenate, or the sorted invariant breaks downstream.
+    Ties keep the earlier stream's entry first.
+    """
+    return heapq.merge(*streams, key=lambda entry: entry.path)
 
 
 def metadata_identity(relative_path: str, size: int) -> str:
     payload = f"{relative_path}\n{size}".encode("utf-8")
     return blake3(payload).hexdigest()
+
+
+def iter_reachable_commits(
+    start: str, *, read_commit: CommitReader
+) -> Iterator[str]:
+    """Yield every commit id reachable from *start* across all parent edges."""
+    seen: set[str] = set()
+    queue: deque[str] = deque([start])
+    while queue:
+        commit_id = queue.popleft()
+        if commit_id in seen:
+            continue
+        seen.add(commit_id)
+        yield commit_id
+        queue.extend(read_commit(commit_id).parents)
+
+
+def collect_ancestors(start: str, *, read_commit: CommitReader) -> set[str]:
+    """Set of commits reachable from *start*, including *start* itself."""
+    return set(iter_reachable_commits(start, read_commit=read_commit))
+
+
+def is_ancestor_commit(
+    ancestor: str,
+    descendant: str,
+    *,
+    read_commit: Callable[[str], CommitObject | None],
+) -> bool:
+    """True when *ancestor* is reachable from *descendant* (merge-aware).
+
+    ``read_commit`` may return ``None`` for unknown commits (e.g. checking a
+    remote head against a partial local history).  Uses the ``generation``
+    counter to prune branches that cannot reach the ancestor: a commit's
+    ancestors always have strictly smaller generations.
+    """
+    if ancestor == descendant:
+        return True
+    ancestor_commit = read_commit(ancestor)
+    target_generation = (
+        ancestor_commit.generation if ancestor_commit is not None else -1
+    )
+    seen = {descendant}
+    stack = [descendant]
+    while stack:
+        commit_id = stack.pop()
+        if commit_id == ancestor:
+            return True
+        commit = read_commit(commit_id)
+        if commit is None:
+            continue
+        if commit.generation <= target_generation:
+            continue
+        for parent_id in commit.parents:
+            if parent_id not in seen:
+                seen.add(parent_id)
+                stack.append(parent_id)
+    return False
+
+
+def merge_base_commit(
+    commit_a: str, commit_b: str, *, read_commit: CommitReader
+) -> CommitObject | None:
+    """Common ancestor with the highest generation, or ``None`` if unrelated."""
+    ancestors_a = collect_ancestors(commit_a, read_commit=read_commit)
+    best: CommitObject | None = None
+    for commit_id in collect_ancestors(commit_b, read_commit=read_commit):
+        if commit_id not in ancestors_a:
+            continue
+        commit = read_commit(commit_id)
+        if best is None or commit.generation > best.generation:
+            best = commit
+    return best
 
 
 def normalize_repository_path(path: str) -> str:
@@ -88,12 +179,7 @@ def relocate_manifest_entry(
 ) -> ManifestEntry:
     if entry.identity_mode == "meta":
         identity_value = metadata_identity(destination_path, entry.size)
-        return replace(
-            entry,
-            path=destination_path,
-            hash=identity_value,
-            identity_value=identity_value,
-        )
+        return replace(entry, path=destination_path, hash=identity_value)
     return replace(entry, path=destination_path)
 
 

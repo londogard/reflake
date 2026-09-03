@@ -78,10 +78,8 @@ class EntryFactory:
                 continue
             if identity_mode == "blake3":
                 identity_value = self.store_blob_from_source_uri(obj.source_uri)
-                blob_hash = identity_value
             elif identity_mode == "meta":
                 identity_value = metadata_identity(relative_path, obj.size)
-                blob_hash = None
             else:
                 raise ValueError("identity_mode must be one of: blake3, meta")
             yield ManifestEntry(
@@ -90,8 +88,6 @@ class EntryFactory:
                 size=obj.size,
                 mtime_ns=obj.mtime_ns,
                 identity_mode=identity_mode,
-                identity_value=identity_value,
-                blob_hash=blob_hash,
                 source_uri=obj.source_uri,
             )
 
@@ -110,14 +106,10 @@ class EntryFactory:
         footer = self._capture_footer(source_uri)
         if identity_mode == "blake3":
             identity_value = blake3_digest_file(source_path)
-            blob_hash = identity_value
             if store_blob:
-                self.store_blob(source_path, blob_hash)
-            else:
-                blob_hash = None
+                self.store_blob(source_path, identity_value)
         elif identity_mode == "meta":
             identity_value = metadata_identity(relative_path, stat.st_size)
-            blob_hash = None
         else:
             raise ValueError("identity_mode must be one of: blake3, meta")
         return ManifestEntry(
@@ -126,9 +118,7 @@ class EntryFactory:
             size=stat.st_size,
             mtime_ns=stat.st_mtime_ns,
             identity_mode=identity_mode,
-            identity_value=identity_value,
-            blob_hash=blob_hash,
-            source_uri=source_uri,
+            source_uri=source_uri if identity_mode == "meta" else None,
             footer=footer,
         )
 
@@ -160,9 +150,6 @@ class EntryFactory:
                 size=change.size or 0,
                 mtime_ns=0,
                 identity_mode="blake3",
-                identity_value=change.blob_hash,
-                blob_hash=change.blob_hash,
-                source_uri=None,
             )
         raise FileNotFoundError(f"Cannot stage missing file: {change.path}")
 
@@ -178,10 +165,8 @@ class EntryFactory:
         footer = self._capture_footer(source_uri)
         if identity_mode == "blake3":
             identity_value = self.store_blob_from_source_uri(source_uri)
-            blob_hash = identity_value if store_blob else None
         elif identity_mode == "meta":
             identity_value = metadata_identity(logical_path, metadata.size)
-            blob_hash = None
         else:
             raise ValueError("identity_mode must be one of: blake3, meta")
         return ManifestEntry(
@@ -190,9 +175,7 @@ class EntryFactory:
             size=metadata.size,
             mtime_ns=metadata.mtime_ns,
             identity_mode=identity_mode,
-            identity_value=identity_value,
-            blob_hash=blob_hash,
-            source_uri=metadata.source_uri,
+            source_uri=metadata.source_uri if identity_mode == "meta" else None,
             footer=footer,
         )
 
@@ -200,20 +183,24 @@ class EntryFactory:
         self.store.write_blob_file(content_hash, source_file, if_missing=True)
 
     def store_blob_from_source_uri(self, source_uri: str) -> str:
-        with NamedTemporaryFile(mode="wb", delete=False) as temp:
-            temp_path = Path(temp.name)
-            hasher = blake3()
-            with open_source_uri(source_uri) as source:
-                while True:
-                    chunk = source.read(DEFAULT_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
-                    temp.write(chunk)
-        digest = hasher.hexdigest()
-        if self.store.object_exists("blob", digest):
-            temp_path.unlink(missing_ok=True)
+        temp_path: Path | None = None
+        try:
+            with NamedTemporaryFile(mode="wb", delete=False) as temp:
+                temp_path = Path(temp.name)
+                hasher = blake3()
+                with open_source_uri(source_uri) as source:
+                    while True:
+                        chunk = source.read(DEFAULT_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+                        temp.write(chunk)
+            digest = hasher.hexdigest()
+            if self.store.object_exists("blob", digest):
+                return digest
+            assert temp_path is not None
+            self.store.write_blob_file(digest, temp_path, if_missing=True)
             return digest
-        self.store.write_blob_file(digest, temp_path, if_missing=True)
-        temp_path.unlink(missing_ok=True)
-        return digest
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)

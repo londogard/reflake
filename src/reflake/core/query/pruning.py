@@ -13,10 +13,11 @@ no pruning (every group is kept) and are reported as inapplicable.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal, Sequence
+from typing import Any, Literal
 
-from ..objects.base import ObjectStore
+from ..objects.base import ContentQueryStore
 from ..objects.footer import FooterStats, RowGroupStats, parse_footer_stats
 
 Op = Literal["=", "!=", "<", "<=", ">", ">=", "is_null", "is_not_null"]
@@ -100,7 +101,11 @@ def parse_where_clause(text: str) -> list[Predicate]:
             raise ValueError(f"OR is not supported; AND predicates only: {clause!r}")
         null_match = _NULL_CLAUSE.match(clause)
         if null_match is not None:
-            op: Op = "is_null" if null_match.group("op").upper() == "IS NULL" else "is_not_null"
+            op: Op = (
+                "is_null"
+                if null_match.group("op").upper() == "IS NULL"
+                else "is_not_null"
+            )
             predicates.append(Predicate(column=null_match.group("col"), op=op))
             continue
         comparison_match = _COMPARISON_CLAUSE.match(clause)
@@ -141,7 +146,11 @@ def _possible(group: RowGroupStats, predicate: Predicate) -> bool | None:
     ``None`` = undecidable (keep, conservatively).
     """
     column = next(
-        (candidate for candidate in group.columns if candidate.path == predicate.column),
+        (
+            candidate
+            for candidate in group.columns
+            if candidate.path == predicate.column
+        ),
         None,
     )
     if column is None:
@@ -208,7 +217,7 @@ def prune_row_groups(
 
 
 def plan_pruned_scan(
-    store: ObjectStore,
+    store: ContentQueryStore,
     tree_hash: str,
     prefix: str,
     predicates: Sequence[Predicate],

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import io
 import os
-from datetime import datetime, timezone
-from typing import Any, Generator
+from collections.abc import Generator
+from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import boto3
@@ -105,7 +106,7 @@ class FakeS3Client:
             payload = bytes(payload)  # type: ignore[bad-argument-type]
         self._objects[Key] = {
             "Body": payload,
-            "LastModified": datetime.now(timezone.utc),
+            "LastModified": datetime.now(UTC),
             "ETag": self._etag(payload),
         }
         return {"ETag": self._objects[Key]["ETag"]}
@@ -142,7 +143,7 @@ def fake_s3_installer(monkeypatch: pytest.MonkeyPatch):
             {
                 key: {
                     "Body": payload,
-                    "LastModified": datetime(2026, 1, 2, tzinfo=timezone.utc),
+                    "LastModified": datetime(2026, 1, 2, tzinfo=UTC),
                     "ETag": f'"{len(payload):x}-{sum(payload):x}"',
                 }
                 for key, payload in objects.items()
@@ -169,7 +170,8 @@ def _integration_config() -> dict[str, str]:
     )
     if not access_key or not secret_key:
         pytest.skip(
-            "Set REFLAKE_MINISTACK_ACCESS_KEY/SECRET_KEY or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
+            "Set REFLAKE_MINISTACK_ACCESS_KEY/SECRET_KEY"
+            " or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
         )
 
     return {
@@ -196,7 +198,9 @@ def ministack_client(monkeypatch: pytest.MonkeyPatch):
     except (EndpointConnectionError, BotoCoreError, ClientError) as error:
         pytest.skip(f"S3 integration endpoint unavailable: {error}")
 
-    monkeypatch.setattr("reflake.core.objects.boto3.client", lambda service_name: client)
+    monkeypatch.setattr(
+        "reflake.core.objects.boto3.client", lambda service_name: client
+    )
     return client
 
 

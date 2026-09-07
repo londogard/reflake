@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from reflake.core.vfs import ReflakeFileSystem, ReflakeURI, _validate_uri_component
 from reflake.core.repository_support import (
     normalize_import_patterns,
     normalize_repository_path,
 )
+from reflake.core.vfs import ReflakeFileSystem, ReflakeURI, _validate_uri_component
 
 
 class TestNormalizeRepositoryPath:
@@ -122,12 +122,19 @@ class TestReflakeURIValidation:
     def test_valid_uri(self) -> None:
         fs = ReflakeFileSystem()
         uri = fs._parse_uri("reflake://ds@main/path/to/file.txt")
-        assert uri == ReflakeURI(dataset="ds", ref="main", logical_path="path/to/file.txt")
+        assert uri == ReflakeURI(
+            dataset="ds", ref="main", logical_path="path/to/file.txt"
+        )
 
     def test_with_staged_suffix(self) -> None:
         fs = ReflakeFileSystem()
         uri = fs._parse_uri("reflake://ds@feature+staged/path")
-        assert uri == ReflakeURI(dataset="ds", ref="feature", logical_path="path", include_staging=True)
+        assert uri == ReflakeURI(
+            dataset="ds",
+            ref="feature",
+            logical_path="path",
+            include_staging=True,
+        )
 
     def test_empty_path_allowed(self) -> None:
         fs = ReflakeFileSystem()
@@ -270,7 +277,9 @@ class TestReflakeFileSystemDatasetRoot:
         with pytest.raises(FileNotFoundError, match="Unknown Reflake dataset"):
             fs._dataset_root("nonexistent_dataset_name_for_testing")
 
-    def test_unregistered_cwd_folder_dataset_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_unregistered_cwd_folder_dataset_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         (tmp_path / "my_local_folder").mkdir()
         monkeypatch.chdir(tmp_path)
         fs = ReflakeFileSystem()

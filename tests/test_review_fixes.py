@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from reflake import run_cli
-from reflake.core import open_repository
+from reflake.core import create_repository, open_repository
 from reflake.core.domain import StageChange
-from reflake.core.manifest import ManifestEntry, ManifestWriter
+from reflake.core.entry_codec import Entry
+from reflake.core.manifest import ManifestWriter
 from reflake.core.objects.transfer import (
     S3BlobTransferBackend,
     S5CmdBlobTransferBackend,
@@ -38,7 +39,7 @@ def _stage_add(repo, path: str, *, source_uri: str | None = None) -> None:
             path: StageChange(
                 path=path,
                 action="add",
-                identity_mode="blake3",
+                identity_mode="content",
                 source_uri=source_uri or (repo.root / path).as_uri(),
             ),
         },
@@ -49,7 +50,7 @@ def _stage_add(repo, path: str, *, source_uri: str | None = None) -> None:
 
 
 def test_staged_commit_with_earlier_sorting_path(tmp_path: Path) -> None:
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     _make_commit(repo, "z.txt", "base")
 
     (tmp_path / "a.txt").write_text("a-content")
@@ -61,7 +62,7 @@ def test_staged_commit_with_earlier_sorting_path(tmp_path: Path) -> None:
 
 
 def test_staged_commit_with_nested_earlier_sorting_paths(tmp_path: Path) -> None:
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     _make_commit(repo, "t/top.txt", "base")
 
     (tmp_path / "a" / "deep.txt").parent.mkdir(parents=True)
@@ -82,20 +83,22 @@ def test_cli_staged_commit_with_earlier_sorting_path(
     tmp_path: Path, capsys
 ) -> None:
     (tmp_path / "zeta.txt").write_text("zeta")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "base"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "base"]) == 0
     capsys.readouterr()
 
     (tmp_path / "alpha.txt").write_text("alpha")
-    assert run_cli(["add", "--repo", str(tmp_path), "alpha.txt"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "add", "alpha.txt"]) == 0
     capsys.readouterr()
 
     assert (
-        run_cli(["commit", "--repo", str(tmp_path), "--staged", "-m", "alpha"]) == 0
+        run_cli(["--repo", str(tmp_path), "commit", "--staged", "-m", "alpha"]) == 0
     )
     commit_id = capsys.readouterr().out.strip()
     assert commit_id
 
-    assert run_cli(["list", "--repo", str(tmp_path), "--json"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "--json", "list"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert sorted(item["path"] for item in payload) == ["alpha.txt", "zeta.txt"]
 
@@ -118,7 +121,7 @@ def _build_diverged_and_merged(repo):
 
 
 def test_is_ancestor_traverses_merge_second_parent(tmp_path: Path) -> None:
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     _, feature_head, _, merge_commit = _build_diverged_and_merged(repo)
 
     assert repo.refs.is_ancestor(
@@ -130,7 +133,7 @@ def test_is_ancestor_traverses_merge_second_parent(tmp_path: Path) -> None:
 
 
 def test_fast_forward_onto_merge_commit_after_merge(tmp_path: Path) -> None:
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     _, feature_head, _, merge_commit = _build_diverged_and_merged(repo)
 
     assert repo.fast_forward_branch("feature", merge_commit, operation="test")
@@ -146,7 +149,7 @@ def test_push_after_merge_transfers_merged_lineage(
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    repo = open_repository(repo_root)
+    repo = create_repository(repo_root)
     _, _, _, merge_commit = _build_diverged_and_merged(repo)
 
     result = push(repo, remote)
@@ -167,7 +170,7 @@ def test_manifest_index_extraction_handles_quoted_paths(tmp_path: Path) -> None:
     writer = ManifestWriter(tmp_path / "derived.jsonl", block_entry_count=1)
     written = writer.write_entries(
         [
-            ManifestEntry(path=weird, hash="0" * 64, size=1, mtime_ns=2),
+            Entry(path=weird, kind="b", hash="0" * 64, size=1, mtime_ns=2),
         ]
     )
     assert written == 1
@@ -177,7 +180,7 @@ def test_manifest_index_extraction_handles_quoted_paths(tmp_path: Path) -> None:
 
 
 def test_staged_flow_with_quoted_filename(tmp_path: Path) -> None:
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     weird = 'weird"name.txt'
     _make_commit(repo, "z.txt", "base")
 
@@ -196,7 +199,7 @@ def test_staged_flow_with_quoted_filename(tmp_path: Path) -> None:
 
 
 def test_three_way_merge_output_stays_sorted_at_both_ends(tmp_path: Path) -> None:
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     base = _make_commit(repo, "m/mid.txt", "base")
     repo.store.write_branch_ref("theirs", base)
     repo.set_current_branch("theirs")
@@ -240,7 +243,7 @@ def test_endpoint_url_from_config_reaches_s3_client(
     )
     config.save(tmp_path)
 
-    open_repository(tmp_path)
+    create_repository(tmp_path)
     assert captured, "expected a boto3 client to be constructed"
     assert captured[-1].get("endpoint_url") == "http://127.0.0.1:4566"
 
@@ -253,7 +256,9 @@ def test_batch_transfer_backend_capabilities() -> None:
     assert S5CmdBlobTransferBackend().supports_batch() is True
 
 
-def test_upload_batch_on_boto3_backend_uploads_each_pair(tmp_path: Path) -> None:
+def test_transfer_on_boto3_backend_uploads_each_item(tmp_path: Path) -> None:
+    from reflake.core.objects.backends import TransferItem, TransferPlan
+
     class RecordingBackend(S3BlobTransferBackend):
         def __init__(self) -> None:
             super().__init__(client=object())
@@ -263,6 +268,15 @@ def test_upload_batch_on_boto3_backend_uploads_each_pair(tmp_path: Path) -> None
             self.uploads.append((local_path, remote_uri))
 
     backend = RecordingBackend()
-    transferred = backend.upload_batch([("a", "s3://b/k1"), ("c", "s3://b/k2")])
+    plan = TransferPlan(
+        direction="upload",
+        items=(
+            TransferItem(kind="blob", object_id="k1", local_path="a",
+                         remote_uri="s3://b/k1"),
+            TransferItem(kind="blob", object_id="k2", local_path="c",
+                         remote_uri="s3://b/k2"),
+        ),
+    )
+    transferred = backend.transfer(plan)
     assert transferred == 2
     assert backend.uploads == [("a", "s3://b/k1"), ("c", "s3://b/k2")]

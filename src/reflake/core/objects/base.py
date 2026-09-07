@@ -15,11 +15,12 @@ matches their role so accidental coupling shows up in the type checker.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
-from typing import BinaryIO, Iterator, Protocol
+from typing import BinaryIO, Protocol
 
 from ..domain import BranchRefState, RepositoryObjectKind
-from ..manifest import ManifestEntry
+from ..entry_codec import Entry
 
 
 class ObjectIO(Protocol):
@@ -93,15 +94,15 @@ class ObjectIO(Protocol):
 
     def object_exists(self, kind: RepositoryObjectKind, object_id: str) -> bool: ...
 
-    def version_token(
-        self, kind: RepositoryObjectKind, object_id: str
-    ) -> str | None: ...
-
 
 class RefCas(Protocol):
-    """Pure compare-and-swap branch pointers — the only mutable state."""
+    """Pure compare-and-swap branch pointers — the only mutable state.
 
-    def branch_path(self, branch: str) -> Path: ...
+    A ref's content *is* its commit id, so the CAS expectation is the
+    commit id itself: ``expected_commit_id=None`` means "must not exist"
+    (branch creation). Adapters implement the check atomically (local
+    ``fcntl`` lock, S3 conditional ``PutObject``).
+    """
 
     def read_branch_ref(self, branch: str) -> BranchRefState | None: ...
 
@@ -112,23 +113,22 @@ class RefCas(Protocol):
         branch: str,
         commit_id: str | None,
         *,
-        expected_version_token: str | None,
-        expected_commit_id: str | None = None,
+        expected_commit_id: str | None,
     ) -> bool: ...
 
 
 class TreeQuery(Protocol):
     """Tree-walk lookups: exact paths, prefixes, and full walks (§3)."""
 
-    def iter_all_entries(self, tree_hash: str) -> Iterator[ManifestEntry]: ...
+    def iter_all_entries(self, tree_hash: str) -> Iterator[Entry]: ...
 
     def lookup_entry(
         self, tree_hash: str, logical_path: str
-    ) -> ManifestEntry | None: ...
+    ) -> Entry | None: ...
 
     def iter_entries_for_prefix(
         self, tree_hash: str, logical_prefix: str
-    ) -> Iterator[ManifestEntry]: ...
+    ) -> Iterator[Entry]: ...
 
 
 class StoreInventory(Protocol):
@@ -140,15 +140,56 @@ class StoreInventory(Protocol):
 
     def delete_object(self, kind: RepositoryObjectKind, object_id: str) -> None: ...
 
+
+class HasLocalPath(Protocol):
+    """Stores whose objects live on the local filesystem (sync sources/dests)."""
+
     def object_path(self, kind: RepositoryObjectKind, object_id: str) -> Path:
-        """Local filesystem path of an object (local stores only)."""
+        """Local filesystem path of an object."""
         ...
+
+
+class HasRemoteURI(Protocol):
+    """Stores whose objects live behind a remote URI (sync sources/dests)."""
 
     def object_uri(self, kind: RepositoryObjectKind, object_id: str) -> str:
-        """Remote URI of an object (S3 stores only)."""
+        """Remote URI of an object."""
         ...
 
 
-class ObjectStore(ObjectIO, RefCas, TreeQuery, StoreInventory, Protocol):
+class ObjectStore(
+    ObjectIO,
+    RefCas,
+    TreeQuery,
+    StoreInventory,
+    HasLocalPath,
+    HasRemoteURI,
+    Protocol,
+):
     """A complete repository object store: the composition of all capabilities."""
+
+
+# ── Narrow compositions: annotate each consumer with what it uses ────
+
+
+class RefObjectStore(ObjectIO, RefCas, Protocol):
+    """Immutable content + branch refs (e.g. ``RefManager``)."""
+
+
+class ContentQueryStore(ObjectIO, TreeQuery, Protocol):
+    """Immutable content + tree reads (e.g. query pruning)."""
+
+
+class QueryRefStore(RefCas, TreeQuery, Protocol):
+    """Branch refs + tree reads (e.g. ``StagingArea``)."""
+
+
+class RepositoryStore(ObjectIO, RefCas, TreeQuery, StoreInventory, Protocol):
+    """Everything a repository needs except transfer endpoints.
+
+    ``HasLocalPath`` / ``HasRemoteURI`` stay separate: only sync planning
+    touches them, via explicit capability checks (``repository_sync``),
+    so local-only and S3-only adapters type-check without pretending to
+    provide the other side's endpoint.
+    """
 

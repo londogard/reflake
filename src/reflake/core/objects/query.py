@@ -5,7 +5,7 @@ This is the single lookup core of Reflake v2 (§3 of docs/architecture.md):
 - exact-path lookups descend the path chain, binary-searching each level in a
   (cached or freshly fetched) tree object — 0–1 GETs warm;
 - prefix/bulk listings walk the subtree under the prefix, streaming matches;
-- full walks flatten a tree into leaf ``ManifestEntry`` objects (the drop-in
+- full walks flatten a tree into leaf ``Entry`` objects (the drop-in
   replacement for v1's ``iter_manifest_entries``).
 
 Trees are content-addressed, so the cache is never stale: a hash always maps to
@@ -16,31 +16,19 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import OrderedDict
-from typing import Callable, Iterator
+from collections.abc import Callable, Iterator
+from dataclasses import replace
 
-from ..manifest import ManifestEntry
+from ..entry_codec import Entry
 from .tree import (
-    KIND_BLOB,
-    KIND_BP,
-    KIND_META,
-    KIND_MP,
     KIND_SHARD,
     KIND_TREE,
-    TreeEntry,
     parse_tree_object,
 )
 
 
-def _leaf_to_manifest(entry: TreeEntry, path: str) -> ManifestEntry:
-    return ManifestEntry(
-        path=path,
-        hash=entry.hash,
-        size=entry.size,
-        mtime_ns=entry.mtime_ns,
-        identity_mode="blake3" if entry.kind in (KIND_BLOB, KIND_BP) else "meta",
-        source_uri=entry.source_uri,
-        footer=entry.footer,
-    )
+def _leaf_to_manifest(entry: Entry, path: str) -> Entry:
+    return replace(entry, path=path)
 
 
 class TreeCache:
@@ -52,11 +40,11 @@ class TreeCache:
     """
 
     def __init__(self, maxsize: int = 2048) -> None:
-        self._entries: OrderedDict[str, list[TreeEntry]] = OrderedDict()
+        self._entries: OrderedDict[str, list[Entry]] = OrderedDict()
         self._maxsize = maxsize
         self._pinned: set[str] = set()
 
-    def get(self, tree_hash: str) -> list[TreeEntry] | None:
+    def get(self, tree_hash: str) -> list[Entry] | None:
         entries = self._entries.get(tree_hash)
         if entries is not None:
             if tree_hash not in self._pinned:
@@ -64,7 +52,7 @@ class TreeCache:
             return entries
         return None
 
-    def put(self, tree_hash: str, entries: list[TreeEntry]) -> None:
+    def put(self, tree_hash: str, entries: list[Entry]) -> None:
         self._entries[tree_hash] = entries
         if tree_hash not in self._pinned:
             self._entries.move_to_end(tree_hash)
@@ -85,14 +73,14 @@ class TreeCache:
             self._entries.pop(oldest)
 
 
-def _descend(entries: list[TreeEntry], part: str) -> TreeEntry | None:
+def _descend(entries: list[Entry], part: str) -> Entry | None:
     """Find the entry to descend into for *part*.
 
     Returns an exact match, or — when the tree is sharded — the name-range
     shard whose range contains *part*.
     """
-    idx = bisect_left(entries, part, key=lambda entry: entry.name)
-    if idx < len(entries) and entries[idx].name == part:
+    idx = bisect_left(entries, part, key=lambda entry: entry.path)
+    if idx < len(entries) and entries[idx].path == part:
         return entries[idx]
     previous = idx - 1
     if previous >= 0 and entries[previous].kind == KIND_SHARD:
@@ -111,7 +99,7 @@ class TreeWalker:
         self._read_tree = read_tree
         self._cache = cache or TreeCache()
 
-    def _load(self, tree_hash: str) -> list[TreeEntry] | None:
+    def _load(self, tree_hash: str) -> list[Entry] | None:
         cached = self._cache.get(tree_hash)
         if cached is not None:
             return cached
@@ -122,13 +110,13 @@ class TreeWalker:
         self._cache.put(tree_hash, entries)
         return entries
 
-    def load_entries(self, tree_hash: str) -> list[TreeEntry] | None:
+    def load_entries(self, tree_hash: str) -> list[Entry] | None:
         """Parse (and cache) a tree object's entries; ``None`` if unknown."""
         return self._load(tree_hash)
 
     def resolve_subtree(
         self, root_tree_hash: str, directory_path: str
-    ) -> list[TreeEntry] | None:
+    ) -> list[Entry] | None:
         """Return the entries of the subtree at *directory_path*.
 
         Returns ``None`` when the directory does not exist in the tree.
@@ -148,7 +136,7 @@ class TreeWalker:
 
     def _iter_entries(
         self, tree_hash: str
-    ) -> Iterator[tuple[str, TreeEntry]]:
+    ) -> Iterator[tuple[str, Entry]]:
         """Pre-order walk of a tree DAG, yielding ``(full_path, entry)``.
 
         Entries are yielded in ascending path order.  A frame stack resumes a
@@ -164,7 +152,7 @@ class TreeWalker:
             index = resume_index
             while index < len(entries) and not entries[index].is_subtree:
                 entry = entries[index]
-                yield prefix + entry.name, entry
+                yield prefix + entry.path, entry
                 index += 1
             if index < len(entries):
                 subtree = entries[index]
@@ -172,16 +160,16 @@ class TreeWalker:
                 child_prefix = (
                     prefix
                     if subtree.kind == KIND_SHARD
-                    else f"{prefix}{subtree.name}/"
+                    else f"{prefix}{subtree.path}/"
                 )
                 stack.append((subtree.hash, child_prefix, 0))
 
-    def iter_all_entries(self, tree_hash: str) -> Iterator[ManifestEntry]:
+    def iter_all_entries(self, tree_hash: str) -> Iterator[Entry]:
         """Flatten a tree into leaf entries in ascending path order."""
         for path, entry in self._iter_entries(tree_hash):
             yield _leaf_to_manifest(entry, path)
 
-    def lookup_entry(self, tree_hash: str, logical_path: str) -> ManifestEntry | None:
+    def lookup_entry(self, tree_hash: str, logical_path: str) -> Entry | None:
         """Exact-path lookup: descend the path chain via cached tree objects."""
         normalized = logical_path.strip("/")
         if not normalized:
@@ -209,7 +197,7 @@ class TreeWalker:
 
     def iter_entries_for_prefix(
         self, tree_hash: str, logical_prefix: str
-    ) -> Iterator[ManifestEntry]:
+    ) -> Iterator[Entry]:
         """Stream leaf entries whose path starts with *logical_prefix*.
 
         Subtrees whose path prefix cannot overlap the target prefix are
@@ -225,7 +213,7 @@ class TreeWalker:
             index = resume_index
             while index < len(entries) and not entries[index].is_subtree:
                 entry = entries[index]
-                path = prefix + entry.name
+                path = prefix + entry.path
                 if not normalized or path.startswith(normalized):
                     yield _leaf_to_manifest(entry, path)
                 index += 1
@@ -234,7 +222,7 @@ class TreeWalker:
                 child_prefix = (
                     prefix
                     if subtree.kind == KIND_SHARD
-                    else f"{prefix}{subtree.name}/"
+                    else f"{prefix}{subtree.path}/"
                 )
                 if normalized and not (
                     child_prefix.startswith(normalized)

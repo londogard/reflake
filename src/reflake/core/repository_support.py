@@ -2,21 +2,21 @@ from __future__ import annotations
 
 import heapq
 from collections import deque
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import replace
 from pathlib import PurePosixPath
-from typing import Callable, Iterable, Iterator
 
 from blake3 import blake3
 
 from .domain import CommitObject
-from .manifest import ManifestEntry
+from .entry_codec import Entry
 
 CommitReader = Callable[[str], CommitObject]
 
 
 def merge_sorted_streams(
-    *streams: Iterable[ManifestEntry],
-) -> Iterator[ManifestEntry]:
+    *streams: Iterable[Entry],
+) -> Iterator[Entry]:
     """Stable k-way merge of path-sorted manifest-entry streams.
 
     Tree entries and manifests are ordered by logical path; every operation
@@ -28,7 +28,7 @@ def merge_sorted_streams(
 
 
 def metadata_identity(relative_path: str, size: int) -> str:
-    payload = f"{relative_path}\n{size}".encode("utf-8")
+    payload = f"{relative_path}\n{size}".encode()
     return blake3(payload).hexdigest()
 
 
@@ -174,10 +174,10 @@ def move_logical_path(
 
 
 def relocate_manifest_entry(
-    entry: ManifestEntry,
+    entry: Entry,
     destination_path: str,
-) -> ManifestEntry:
-    if entry.identity_mode == "meta":
+) -> Entry:
+    if entry.identity_mode == "pointer":
         identity_value = metadata_identity(destination_path, entry.size)
         return replace(entry, path=destination_path, hash=identity_value)
     return replace(entry, path=destination_path)

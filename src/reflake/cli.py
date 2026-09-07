@@ -1,20 +1,29 @@
 from __future__ import annotations
 
-from importlib import metadata
 import json
 import shlex
 import sys
 from dataclasses import asdict, dataclass
-from typing import Literal, Any
+from importlib import metadata
+from typing import Any, Literal
 
 import msgspec
 from simple_parsing import ArgumentParser
 from simple_parsing.helpers import field, flag, subparsers
 
 from .core import (
-    ReflakeError,
+    EmptyBranchError,
+    MergeConflictError,
+    NonFastForwardError,
     NotARepositoryError,
+    OptimisticLockError,
+    PreconditionFailedError,
+    RefConflictError,
+    ReflakeError,
+    ReflakeRepository,
     StageStatus,
+    UnknownCommitError,
+    UnknownRefError,
     build_analytical_index,
     open_repository,
     parse_where_clause,
@@ -22,19 +31,45 @@ from .core import (
 )
 from .core.config import (
     BaseConfig,
-    ReflakeConfig,
     LocalConfig,
+    ReflakeConfig,
     S3Config,
     init_config,
 )
 
-IdentityMode = Literal["blake3", "meta"]
+IdentityMode = Literal["content", "pointer"]
 HANDLED_CLI_ERRORS = (
     ReflakeError,
     FileNotFoundError,
     PermissionError,
     ValueError,
 )
+
+#: Retryable concurrency conflicts (safe to retry after pull/merge).
+_RETRYABLE_ERRORS = (
+    RefConflictError,
+    NonFastForwardError,
+    MergeConflictError,
+    OptimisticLockError,
+    PreconditionFailedError,
+)
+
+#: Missing objects or refs.
+_MISSING_ERRORS = (
+    UnknownRefError,
+    UnknownCommitError,
+    EmptyBranchError,
+    FileNotFoundError,
+)
+
+
+def _error_exit_code(error: BaseException) -> int:
+    """Exit-code contract: 0 ok · 1 usage/validation · 2 conflict · 3 missing."""
+    if isinstance(error, _RETRYABLE_ERRORS):
+        return 2
+    if isinstance(error, _MISSING_ERRORS):
+        return 3
+    return 1
 
 
 @dataclass
@@ -45,16 +80,6 @@ class CommitArgs:
         alias=["--staged", "--staged-only"],
         help="Commit only staged changes, ignoring the working tree",
     )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
-    )
 
 
 @dataclass
@@ -62,37 +87,17 @@ class AddArgs:
     paths: list[str] = field(
         positional=True, nargs="+", help="Files, directories, or S3 paths to stage"
     )
-    identity: IdentityMode = "blake3"  # Identity strategy for staged additions
+    identity: IdentityMode = "content"  # Identity strategy for staged additions
     destination_path: str | None = field(
         default=None,
         alias="--as",
         help="Logical destination path for a single staged source",
-    )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
-    )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
     )
 
 
 @dataclass
 class RmArgs:
     paths: list[str] = field(positional=True, nargs="+", help="Paths to remove")
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
-    )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
 
 
 @dataclass
@@ -102,39 +107,16 @@ class MoveArgs:
         positional=True,
         help="Destination path or prefix",
     )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
-    )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
 
 
 @dataclass
 class StatusArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
-    json: bool = flag(
-        False,
-        help="Print status as structured JSON",
-    )
+    pass
 
 
 @dataclass
 class BranchArgs:
     name: str = field(positional=True, help="Branch name")
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
 
 
 @dataclass
@@ -145,34 +127,15 @@ class LogArgs:
         nargs="?",
         help="Ref (branch or commit) to show log for (defaults to current branch)",
     )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
-    json: bool = flag(
-        False,
-        help="Print history as structured JSON",
-    )
 
 
 @dataclass
 class ListArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
     path: str = field(
         default="",
         positional=True,
         nargs="?",
         help="Logical path or prefix to list (default: root)",
-    )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print listing as structured JSON",
     )
 
 
@@ -186,45 +149,21 @@ class CatArgs:
         positional=True,
         help="Logical file path to print",
     )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
 
 
 @dataclass
 class ReflogArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
     branch: str | None = field(
         default=None,
         positional=True,
         nargs="?",
         help="Branch to inspect (default: current branch)",
     )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print as structured JSON",
-    )
 
 
 @dataclass
-class CatalogArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print as structured JSON",
-    )
+class BranchesArgs:
+    pass
 
 
 @dataclass
@@ -232,11 +171,6 @@ class CheckoutArgs:
     name: str = field(
         positional=True,
         help="Branch name to switch to",
-    )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
     )
 
 
@@ -257,20 +191,10 @@ class RestoreArgs:
         alias="--force",
         help="Allow overwriting existing files",
     )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
 
 
 @dataclass
 class ConfigInitArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path",
-    )
     backend: str = field(
         default="local",
         alias="--backend",
@@ -304,29 +228,15 @@ class ConfigSetArgs:
         positional=True, help="Config key (e.g. backend, dataset_root, s3.bucket)"
     )
     value: str = field(positional=True, help="Config value")
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path",
-    )
 
 
 @dataclass
 class ConfigListArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path",
-    )
+    pass
 
 
 @dataclass
 class InitArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path",
-    )
     backend: str = field(
         default="local",
         alias="--backend",
@@ -373,20 +283,10 @@ class PushArgs:
         alias="--ref",
         help="Branch to push (default: current branch)",
     )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
     transfer_backend: str = field(
         default="boto3",
         alias="--transfer-backend",
         help="Blob transfer backend: boto3 (default) or s5cmd",
-    )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
     )
 
 
@@ -398,20 +298,10 @@ class PullArgs:
         alias="--ref",
         help="Branch to pull (default: current branch)",
     )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
     transfer_backend: str = field(
         default="boto3",
         alias="--transfer-backend",
         help="Blob transfer backend: boto3 (default) or s5cmd",
-    )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
     )
 
 
@@ -423,20 +313,10 @@ class FetchArgs:
         alias="--ref",
         help="Branch to fetch (default: current branch)",
     )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
     transfer_backend: str = field(
         default="boto3",
         alias="--transfer-backend",
         help="Blob transfer backend: boto3 (default) or s5cmd",
-    )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
     )
 
 
@@ -450,92 +330,54 @@ class TransferArgs:
     execute: bool = flag(
         False, alias="--execute", help="Execute generated s5cmd/aws commands"
     )
-    root: str = field(default=".", alias="--repo", help="Repository path or URI")
     ref: str | None = field(
         default=None, alias="--ref", help="Ref to transfer (default: current branch)"
     )
-    json: bool = flag(False, alias="--json", help="Print commands as JSON array")
 
 
 @dataclass
 class DiffArgs:
     from_ref: str = field(positional=True, help="Source ref (branch or commit)")
     to_ref: str = field(positional=True, help="Target ref (branch or commit)")
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
-    json: bool = flag(False, alias="--json", help="Print diff as structured JSON")
 
 
 @dataclass
 class MergeArgs:
     source_ref: str = field(positional=True, help="Ref to merge from")
     target_ref: str = field(positional=True, help="Branch ref to fast-forward")
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
-    )
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
 
 
 @dataclass
 class VerifyArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
     path: list[str] = field(
         default_factory=list,
         alias="--path",
         action="append",
         help="Optional path/prefix filter (repeatable)",
     )
-    dry_run: bool = flag(
-        False,
-        alias="--dry-run",
-        help="Report entries that would be verified without writing blobs or commits",
-    )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
+
+
+@dataclass
+class PromoteArgs:
+    path: list[str] = field(
+        default_factory=list,
+        alias="--path",
+        action="append",
+        help="Optional path/prefix filter (repeatable)",
     )
 
 
 @dataclass
 class GcArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
     prune: bool = flag(
         False,
         alias="--prune",
         help="Delete orphaned objects (default: audit-only dry run)",
     )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
-    )
 
 
 @dataclass
 class QueryBuildArgs:
-    root: str = field(
-        default=".",
-        alias="--repo",
-        help="Repository path or URI",
-    )
     output_dir: str | None = field(
         default=None,
         alias="--output-dir",
@@ -544,11 +386,6 @@ class QueryBuildArgs:
     parquet: bool = flag(
         False,
         help="Also export Parquet from the index table",
-    )
-    json: bool = flag(
-        False,
-        alias="--json",
-        help="Print result as structured JSON",
     )
 
 
@@ -560,8 +397,6 @@ class QueryPruneArgs:
         alias="--where",
         help='Pruning predicate, e.g. "id >= 100 AND active = true"',
     )
-    root: str = field(default=".", alias="--repo", help="Repository root")
-    json: bool = flag(False, alias="--json", help="Print result as structured JSON")
 
 
 @dataclass
@@ -586,13 +421,14 @@ class ReflakeCLI:
         | DiffArgs
         | MergeArgs
         | VerifyArgs
+        | PromoteArgs
         | GcArgs
         | QueryArgs
         | LogArgs
         | ListArgs
         | CatArgs
         | ReflogArgs
-        | CatalogArgs
+        | BranchesArgs
         | CheckoutArgs
         | RestoreArgs
         | InitArgs
@@ -612,13 +448,15 @@ class ReflakeCLI:
             "diff": DiffArgs,
             "merge": MergeArgs,
             "verify": VerifyArgs,
+            "promote": PromoteArgs,
             "gc": GcArgs,
             "query": QueryArgs,
             "log": LogArgs,
             "list": ListArgs,
+            "ls": ListArgs,
             "cat": CatArgs,
             "reflog": ReflogArgs,
-            "catalog": CatalogArgs,
+            "branches": BranchesArgs,
             "checkout": CheckoutArgs,
             "restore": RestoreArgs,
             "init": InitArgs,
@@ -628,6 +466,19 @@ class ReflakeCLI:
             "fetch": FetchArgs,
             "transfer": TransferArgs,
         }
+    )
+    root: str = field(
+        default=".",
+        alias="--repo",
+        help="Repository path or URI (global, before the command)",
+    )
+    json: bool = flag(  # type: ignore[no-matching-overload]
+        False,
+        alias="--json",
+        # store_true (not simple-parsing's bool-action): a global flag must
+        # never consume the following command word as a value.
+        action="store_true",
+        help="Print result as structured JSON (global, before the command)",
     )
 
 
@@ -727,10 +578,10 @@ def _config_set_value(config: ReflakeConfig, key: str, value: str) -> ReflakeCon
                     default_branch=config.default_branch,
                     bucket=bucket,
                 )
-            except ValueError:
+            except ValueError as error:
                 raise ValueError(
                     "Cannot switch to S3 backend without a bucket. Set s3.bucket first."
-                )
+                ) from error
         return LocalConfig(
             dataset_root=config.dataset_root,
             default_branch=config.default_branch,
@@ -740,8 +591,8 @@ def _config_set_value(config: ReflakeConfig, key: str, value: str) -> ReflakeCon
     elif key == "default_branch":
         config.default_branch = value
     elif key == "identity":
-        if value not in ("blake3", "meta"):
-            raise ValueError(f"identity must be 'blake3' or 'meta', got: {value}")
+        if value not in ("content", "pointer"):
+            raise ValueError(f"identity must be 'content' or 'pointer', got: {value}")
         config.identity = value
     elif key == "transfer_backend":
         config.transfer_backend = value if value else None
@@ -792,6 +643,8 @@ def _command_name(command: object) -> str:
         return "merge"
     if isinstance(command, VerifyArgs):
         return "verify"
+    if isinstance(command, PromoteArgs):
+        return "promote"
     if isinstance(command, LogArgs):
         return "log"
     if isinstance(command, ListArgs):
@@ -800,8 +653,8 @@ def _command_name(command: object) -> str:
         return "cat"
     if isinstance(command, ReflogArgs):
         return "reflog"
-    if isinstance(command, CatalogArgs):
-        return "catalog"
+    if isinstance(command, BranchesArgs):
+        return "branches"
     if isinstance(command, CheckoutArgs):
         return "checkout"
     if isinstance(command, RestoreArgs):
@@ -831,6 +684,17 @@ def _command_name(command: object) -> str:
     return "reflake"
 
 
+def _open_or_init(root: str, **kwargs: Any) -> ReflakeRepository:
+    """Open a local repo, initializing it first when missing (clone flow)."""
+    from .core.repository import init_repository
+
+    try:
+        return open_repository(root, **kwargs)
+    except NotARepositoryError:
+        init_repository(root)
+        return open_repository(root, **kwargs)
+
+
 def run_cli(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     parser = build_parser()
@@ -840,60 +704,62 @@ def run_cli(argv: list[str] | None = None) -> int:
         return exc.code if isinstance(exc.code, int) else 2
     command = args.command
     command_name = _command_name(command)
+    repo_root = args.root
+    as_json = args.json
 
     try:
         if isinstance(command, CommitArgs):
-            commit_id = open_repository(command.root).commit(
+            commit_id = open_repository(repo_root).commit(
                 command.message,
                 staged_only=command.staged_only,
             )
-            if command.json:
+            if as_json:
                 print(json.dumps({"commit_id": commit_id}, indent=2))
             else:
                 print(commit_id)
-            config = BaseConfig.load(command.root)
-            if config is not None and config.identity == "meta":
+            config = BaseConfig.load(repo_root)
+            if config is not None and config.identity == "pointer":
                 print(
                     "⚠  Metadata-only identity: this revision is unverifiable "
-                    "until `reflake verify` is run. "
+                    "until `reflake promote` is run. "
                     "You must retain source objects for future verification.",
                     file=sys.stderr,
                 )
             return 0
 
         if isinstance(command, AddArgs):
-            stage = open_repository(command.root).add(
+            stage = open_repository(repo_root).add(
                 paths=command.paths,
                 identity_mode=command.identity,
                 destination_path=command.destination_path,
             )
-            if command.json:
+            if as_json:
                 print(json.dumps(_stage_payload(stage), indent=2))
             else:
                 _print_status(stage)
-            if command.identity == "meta":
+            if command.identity == "pointer":
                 print(
                     "⚠  Metadata-only identity: revisions are unverifiable "
-                    "until `reflake verify` is run. "
+                    "until `reflake promote` is run. "
                     "You must retain source objects for future verification.",
                     file=sys.stderr,
                 )
             return 0
 
         if isinstance(command, RmArgs):
-            stage = open_repository(command.root).rm(paths=command.paths)
-            if command.json:
+            stage = open_repository(repo_root).rm(paths=command.paths)
+            if as_json:
                 print(json.dumps(_stage_payload(stage), indent=2))
             else:
                 _print_status(stage)
             return 0
 
         if isinstance(command, MoveArgs):
-            stage = open_repository(command.root).move_staged(
+            stage = open_repository(repo_root).move_staged(
                 source_path=command.source_path,
                 destination_path=command.destination_path,
             )
-            if command.json:
+            if as_json:
                 print(json.dumps(_stage_payload(stage), indent=2))
             else:
                 _print_status(stage)
@@ -901,25 +767,25 @@ def run_cli(argv: list[str] | None = None) -> int:
 
         if isinstance(command, StatusArgs):
             stage = open_repository(
-                command.root, must_exist=True
+                repo_root, must_exist=True
             ).status(working_tree=True)
-            if command.json:
+            if as_json:
                 print(json.dumps(_stage_payload(stage), indent=2))
             else:
                 _print_status(stage)
             return 0
 
         if isinstance(command, BranchArgs):
-            open_repository(command.root).branch(command.name)
+            open_repository(repo_root).branch(command.name)
             print(f"Created branch '{command.name}'")
             return 0
 
         if isinstance(command, DiffArgs):
-            changes = open_repository(command.root).diff(
+            changes = open_repository(repo_root).diff(
                 command.from_ref,
                 command.to_ref,
             )
-            if command.json:
+            if as_json:
                 payload = [
                     {
                         "path": change.path,
@@ -938,11 +804,11 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, MergeArgs):
-            result = open_repository(command.root).merge(
+            result = open_repository(repo_root).merge(
                 command.source_ref,
                 command.target_ref,
             )
-            if command.json:
+            if as_json:
                 print(
                     json.dumps(
                         {
@@ -957,49 +823,87 @@ def run_cli(argv: list[str] | None = None) -> int:
             else:
                 if result.updated:
                     print(
-                        f"Merged '{result.source_ref}' into '{result.target_ref}' ({result.commit_id})"
+                        f"Merged '{result.source_ref}' into "
+                        f"'{result.target_ref}' ({result.commit_id})"
                     )
                 else:
                     print(
-                        f"'{result.target_ref}' is already up to date with '{result.source_ref}'"
+                        f"'{result.target_ref}' is already up to date "
+                        f"with '{result.source_ref}'"
                     )
             return 0
 
         if isinstance(command, VerifyArgs):
-            result = open_repository(command.root).verify(
+            result = open_repository(repo_root).verify(
                 path_prefixes=_flatten_option_values(command.path),
-                dry_run=command.dry_run,
             )
-            if command.json:
-                payload = {
-                    "commit_id": result.commit_id,
-                    "verified_entries": result.verified_entries,
-                    "candidate_entries": result.candidate_entries,
-                    "total_entries": result.total_entries,
-                    "created_commit": result.created_commit,
-                    "dry_run": result.dry_run,
-                }
-                print(json.dumps(payload, indent=2))
-            else:
-                verb = "Would verify" if result.dry_run else "Verified"
+            remaining = result.candidate_entries - result.verified_entries
+            if as_json:
                 print(
-                    f"{verb} {result.verified_entries}/{result.candidate_entries} entries "
+                    json.dumps(
+                        {
+                            "commit_id": result.commit_id,
+                            "verified_entries": result.verified_entries,
+                            "candidate_entries": result.candidate_entries,
+                            "total_entries": result.total_entries,
+                            "unverifiable_entries": remaining,
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(
+                    f"Verified {result.verified_entries}/"
+                    f"{result.candidate_entries} entries "
+                    f"(total: {result.total_entries})"
+                )
+                if remaining > 0:
+                    print(
+                        f"⚠  {remaining} unverifiable entries remain "
+                        f"(source objects must be retained; "
+                        f"run `reflake promote` to materialize them).",
+                        file=sys.stderr,
+                    )
+            # Read-only audit: non-zero while pointer entries remain.
+            return 1 if remaining > 0 else 0
+
+        if isinstance(command, PromoteArgs):
+            result = open_repository(repo_root).promote(
+                path_prefixes=_flatten_option_values(command.path),
+            )
+            if as_json:
+                print(
+                    json.dumps(
+                        {
+                            "commit_id": result.commit_id,
+                            "verified_entries": result.verified_entries,
+                            "candidate_entries": result.candidate_entries,
+                            "total_entries": result.total_entries,
+                            "created_commit": result.created_commit,
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(
+                    f"Promoted {result.verified_entries}/"
+                    f"{result.candidate_entries} entries "
                     f"(total: {result.total_entries})"
                 )
                 if result.created_commit:
                     print(f"Created commit: {result.commit_id}")
                 remaining = result.candidate_entries - result.verified_entries
-                if remaining > 0 and not result.dry_run:
+                if remaining > 0:
                     print(
                         f"⚠  {remaining} unverifiable entries remain "
-                        f"(source objects must be retained for future verification).",
+                        f"(source objects must be retained for future promotion).",
                         file=sys.stderr,
                     )
             return 0
 
         if isinstance(command, GcArgs):
-            result = open_repository(command.root).gc(dry_run=not command.prune)
-            if command.json:
+            result = open_repository(repo_root).gc(dry_run=not command.prune)
+            if as_json:
                 print(
                     json.dumps(
                         {
@@ -1036,14 +940,14 @@ def run_cli(argv: list[str] | None = None) -> int:
         if isinstance(command, QueryArgs):
             cmd = command.command
             if isinstance(cmd, QueryPruneArgs):
-                repo = open_repository(cmd.root)
+                repo = open_repository(repo_root)
                 commit_id = repo.resolve_ref(cmd.ref)
                 commit_obj = repo.read_commit(commit_id)
                 predicates = parse_where_clause(cmd.where)
                 scans = list(
                     plan_pruned_scan(repo.store, commit_obj.tree, cmd.path, predicates)
                 )
-                if cmd.json:
+                if as_json:
                     print(
                         json.dumps(
                             [
@@ -1068,7 +972,8 @@ def run_cli(argv: list[str] | None = None) -> int:
                         )
                     if not scans:
                         print(
-                            "No parquet files with captured footer stats under this path."
+                            "No parquet files with captured footer stats "
+                            "under this path."
                         )
                     else:
                         total_kept = sum(len(s.kept_row_groups) for s in scans)
@@ -1079,11 +984,11 @@ def run_cli(argv: list[str] | None = None) -> int:
                         )
                 return 0
             paths = build_analytical_index(
-                root=cmd.root,
+                root=repo_root,
                 output_dir=cmd.output_dir,
                 export_parquet=cmd.parquet,
             )
-            if cmd.json:
+            if as_json:
                 print(
                     json.dumps(
                         {
@@ -1104,10 +1009,10 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, LogArgs):
-            repo = open_repository(command.root)
+            repo = open_repository(repo_root)
             ref = command.ref or repo.current_branch()
             commits = list(repo.log(ref))
-            if command.json:
+            if as_json:
                 payload = [
                     {
                         "id": c.id,
@@ -1137,12 +1042,12 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, ListArgs):
-            repo = open_repository(command.root)
+            repo = open_repository(repo_root)
             entries = repo.resolve_entries_for_prefix(
                 repo.current_branch(),
                 command.path,
             )
-            if command.json:
+            if as_json:
                 payload = [
                     {
                         "path": entry.path,
@@ -1161,15 +1066,15 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, CatArgs):
-            repo = open_repository(command.root)
+            repo = open_repository(repo_root)
             sys.stdout.buffer.write(repo.cat(command.ref, command.path))
             return 0
 
         if isinstance(command, ReflogArgs):
-            repo = open_repository(command.root)
+            repo = open_repository(repo_root)
             branch_name = command.branch or repo.current_branch()
             entries = list(repo.reflog(branch_name))
-            if command.json:
+            if as_json:
                 payload = []
                 for line in entries:
                     old_id, new_id, operation, timestamp = line.split(" ", 3)
@@ -1187,16 +1092,19 @@ def run_cli(argv: list[str] | None = None) -> int:
                     print(line)
             return 0
 
-        if isinstance(command, CatalogArgs):
-            repo = open_repository(command.root)
-            datasets = repo.catalog()
-            if command.json:
+        if isinstance(command, BranchesArgs):
+            repo = open_repository(repo_root)
+            datasets = repo.branches()
+            if as_json:
                 print(json.dumps(datasets, indent=2))
             else:
                 for dataset in datasets:
                     head = dataset["commit_id"] or "<empty>"
                     print(
-                        f"{dataset['branch']}: {head} {dataset['message'] or ''}".rstrip()
+                        (
+                            f"{dataset['branch']}: {head} "
+                            f"{dataset['message'] or ''}"
+                        ).rstrip()
                     )
             return 0
 
@@ -1204,18 +1112,18 @@ def run_cli(argv: list[str] | None = None) -> int:
             config_command = command.command
             if isinstance(config_command, ConfigInitArgs):
                 config = init_config(
-                    config_command.root,
+                    repo_root,
                     backend=config_command.backend,  # type: ignore[arg-type]
                     default_branch=config_command.default_branch,
                     s3_bucket=config_command.s3_bucket,
                     s3_prefix=config_command.s3_prefix,
                     s3_endpoint_url=config_command.s3_endpoint,
                 )
-                path = config.save(config_command.root)
+                path = config.save(repo_root)
                 print(f"Config initialized: {path}")
                 return 0
             if isinstance(config_command, ConfigSetArgs):
-                config = BaseConfig.load(config_command.root)
+                config = BaseConfig.load(repo_root)
                 if config is None:
                     print(
                         "No config found. Run 'reflake config init' first.",
@@ -1225,11 +1133,11 @@ def run_cli(argv: list[str] | None = None) -> int:
                 config = _config_set_value(
                     config, config_command.key, config_command.value
                 )
-                path = config.save(config_command.root)
+                path = config.save(repo_root)
                 print(f"Updated: {config_command.key}={config_command.value}")
                 return 0
             if isinstance(config_command, ConfigListArgs):
-                config = BaseConfig.load(config_command.root)
+                config = BaseConfig.load(repo_root)
                 if config is None:
                     print(
                         "No config found. Run 'reflake config init' first.",
@@ -1241,12 +1149,12 @@ def run_cli(argv: list[str] | None = None) -> int:
                 return 0
 
         if isinstance(command, CheckoutArgs):
-            open_repository(command.root).set_current_branch(command.name)
+            open_repository(repo_root).set_current_branch(command.name)
             print(f"Switched to branch '{command.name}'")
             return 0
 
         if isinstance(command, RestoreArgs):
-            restored = open_repository(command.root).restore_files(
+            restored = open_repository(repo_root).restore_files(
                 command.ref,
                 paths=_flatten_option_values(command.path) or None,
                 force=command.force,
@@ -1256,34 +1164,43 @@ def run_cli(argv: list[str] | None = None) -> int:
             else:
                 rel_paths = "\n".join(f"  restored: {p}" for p in restored)
                 print(
-                    f"Restored {len(restored)} file(s) from '{command.ref}':\n{rel_paths}"
+                    f"Restored {len(restored)} file(s) "
+                    f"from '{command.ref}':\n{rel_paths}"
                 )
             return 0
 
         if isinstance(command, InitArgs):
+            if command.backend == "local":
+                from .core.repository import init_repository
+
+                repo_root = init_repository(
+                    repo_root, default_branch=command.default_branch
+                )
+                print(f"Repository initialized: {repo_root / '.reflake'}")
+                return 0
             config = init_config(
-                command.root,
+                repo_root,
                 backend=command.backend,  # type: ignore[arg-type]
                 default_branch=command.default_branch,
                 s3_bucket=command.s3_bucket,
                 s3_prefix=command.s3_prefix,
                 s3_endpoint_url=command.s3_endpoint,
             )
-            path = config.save(command.root)
+            path = config.save(repo_root)
             print(f"Repository initialized: {path}")
             return 0
 
         if isinstance(command, PushArgs):
             from .core.repository_sync import push
 
-            repo = open_repository(command.root, blob_transfer=command.transfer_backend)
+            repo = open_repository(repo_root, blob_transfer=command.transfer_backend)
             result = push(
                 repo,
                 command.remote,
                 ref=command.ref,
                 blob_transfer=command.transfer_backend,
             )
-            if command.json:
+            if as_json:
                 print(json.dumps(asdict(result), indent=2))
             else:
                 if result.updated:
@@ -1298,14 +1215,15 @@ def run_cli(argv: list[str] | None = None) -> int:
         if isinstance(command, PullArgs):
             from .core.repository_sync import pull
 
-            repo = open_repository(command.root, blob_transfer=command.transfer_backend)
+            # Pull bootstraps the local repo (clone workflow).
+            repo = _open_or_init(repo_root, blob_transfer=command.transfer_backend)
             result = pull(
                 repo,
                 command.remote,
                 ref=command.ref,
                 blob_transfer=command.transfer_backend,
             )
-            if command.json:
+            if as_json:
                 print(json.dumps(asdict(result), indent=2))
             else:
                 if result.updated:
@@ -1320,14 +1238,15 @@ def run_cli(argv: list[str] | None = None) -> int:
         if isinstance(command, FetchArgs):
             from .core.repository_sync import fetch
 
-            repo = open_repository(command.root, blob_transfer=command.transfer_backend)
+            # Fetch bootstraps the local repo (clone workflow).
+            repo = _open_or_init(repo_root, blob_transfer=command.transfer_backend)
             result = fetch(
                 repo,
                 command.remote,
                 ref=command.ref,
                 blob_transfer=command.transfer_backend,
             )
-            if command.json:
+            if as_json:
                 print(json.dumps(asdict(result), indent=2))
             else:
                 print(
@@ -1337,13 +1256,13 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, TransferArgs):
-            repo = open_repository(command.root)
+            repo = open_repository(repo_root)
             cmds = repo.generate_transfer_commands(
                 ref=command.ref,
                 mode=command.direction,
                 include_metadata=True,
             )
-            if command.json:
+            if as_json:
                 print(json.dumps(cmds, indent=2))
             elif command.execute:
                 import subprocess
@@ -1357,11 +1276,25 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
     except HANDLED_CLI_ERRORS as error:
-        if isinstance(error, NotARepositoryError):
+        code = _error_exit_code(error)
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "error": str(error),
+                        "code": type(error).__name__,
+                        "command": command_name,
+                        "exit_code": code,
+                    },
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+        elif isinstance(error, NotARepositoryError):
             print(f"fatal: {error}", file=sys.stderr)
         else:
             print(f"{command_name} error: {error}", file=sys.stderr)
-        return 1
+        return code
 
     raise AssertionError(f"Unsupported command type: {type(command).__name__}")
 

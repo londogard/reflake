@@ -30,13 +30,13 @@ Keep both backends.
 
 ### Keep Both Identity Modes
 
-Keep both `blake3` and `meta`.
+Keep both `content` and `pointer`.
 
-- `blake3` stays the default and durable canonical mode.
-- `meta` stays the cheap bootstrap/import mode.
-- `verify` remains the promotion path from metadata-only entries to canonical blob-backed entries.
+- `content` stays the default and durable canonical mode.
+- `pointer` stays the cheap bootstrap/import mode.
+- `promote` remains the promotion path from pointer entries to canonical blob-backed entries (`verify` is the read-only audit).
 
-To reduce complexity, `meta` should primarily be used for import/bootstrap flows rather than expanded into every workflow.
+To reduce complexity, `pointer` should primarily be used for import/bootstrap flows rather than expanded into every workflow.
 
 ## Architectural Goal
 
@@ -74,7 +74,7 @@ Operations needed:
 - read blob bytes
 - write blob if missing
 - check object existence
-- retrieve backend version token or etag where available
+- compare-and-set branch refs on the commit id (local lock, S3 conditional write)
 
 Deliverables:
 
@@ -120,8 +120,8 @@ Goal: make commits and merges safe for concurrent clients.
 
 Implement optimistic concurrency for branch refs:
 
-- read current ref value plus version token or etag
-- update ref only if the token still matches
+- read the current commit id
+- update the ref only if it still matches the expected commit id
 - fail clearly on write conflicts
 
 Deliverables:
@@ -129,9 +129,8 @@ Deliverables:
 - compare-and-set branch updates in the repository store
 - conflict errors surfaced clearly from commit and merge flows
 
-Unimplemented note:
-
-- stale-lock recovery is still missing if a client dies mid-update and leaves behind a branch lock object
+Concurrency is CAS-only with no lock objects: a client that dies mid-update
+leaves no state behind, so no stale-lock recovery exists (or is needed).
 
 Acceptance criteria:
 
@@ -201,7 +200,7 @@ Supported ingress modes:
 
 - local file add
 - S3 import
-- verify selected metadata-only entries into canonical blobs
+- promote selected pointer entries into canonical blobs
 
 Rules:
 
@@ -226,7 +225,7 @@ Coverage:
 - commit updates
 - fast-forward merge
 - metadata import
-- selective verify
+- selective promote
 - metadata-only remove and rename
 - optimistic concurrency conflicts
 
@@ -247,7 +246,7 @@ Goal: improve URI and path handling without weakening backend correctness.
 
 Reason:
 
-- Reflake still needs explicit backend semantics for optimistic locking, conditional writes, etags, and streaming control.
+- Reflake still needs explicit backend semantics for optimistic locking, conditional writes, and streaming control.
 
 Recommendation:
 

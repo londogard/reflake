@@ -9,17 +9,19 @@ from reflake import run_cli
 from reflake.core.config import (
     CURRENT_FORMAT_VERSION,
     BaseConfig,
-    ReflakeConfig,
     LocalConfig,
+    ReflakeConfig,
     S3Config,
     init_config,
 )
-from reflake.core.repository import ReflakeRepository
+from reflake.core.repository import ReflakeRepository, init_repository
 
 
 def test_config_init_via_cli_creates_config_file(tmp_path: Path, capsys) -> None:
     (tmp_path / "test.txt").write_text("data")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "init"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "init"]) == 0
     capsys.readouterr()
 
     config = BaseConfig.load(tmp_path)
@@ -33,13 +35,15 @@ def test_config_init_s3_via_cli(tmp_path: Path, capsys) -> None:
     repo.mkdir()
     (repo / "test.txt").write_text("data")
 
+    assert run_cli(["--repo", str(repo), "init"]) == 0
+    capsys.readouterr()
     assert (
         run_cli(
             [
-                "config",
-                "init",
                 "--repo",
                 str(repo),
+                "config",
+                "init",
                 "--backend",
                 "s3",
                 "--s3-bucket",
@@ -61,10 +65,12 @@ def test_config_init_s3_via_cli(tmp_path: Path, capsys) -> None:
 
 def test_config_list_via_cli(tmp_path: Path, capsys) -> None:
     (tmp_path / "f.txt").write_text("x")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "init"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "init"]) == 0
     capsys.readouterr()
 
-    assert run_cli(["config", "list", "--repo", str(tmp_path)]) == 0
+    assert run_cli(["--repo", str(tmp_path), "config", "list"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["backend"] == "local"
     assert payload["dataset_root"] == str(tmp_path)
@@ -74,18 +80,21 @@ def test_config_list_via_cli(tmp_path: Path, capsys) -> None:
 
 def test_config_get_subcommand_is_removed(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("x")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "init"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "init"]) == 0
 
-    assert run_cli(["config", "get", "--repo", str(tmp_path), "backend"]) == 2
+    assert run_cli(["--repo", str(tmp_path), "config", "get", "backend"]) == 2
 
 
 def test_config_set_via_cli(tmp_path: Path, capsys) -> None:
     (tmp_path / "f.txt").write_text("x")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "init"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "init"]) == 0
     capsys.readouterr()
 
     assert (
-        run_cli(["config", "set", "--repo", str(tmp_path), "default_branch", "develop"])
+        run_cli(["--repo", str(tmp_path), "config", "set", "default_branch", "develop"])
         == 0
     )
     out = capsys.readouterr().out.strip()
@@ -100,7 +109,7 @@ def test_config_no_config_error(tmp_path: Path, capsys) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
 
-    assert run_cli(["config", "list", "--repo", str(empty)]) == 1
+    assert run_cli(["--repo", str(empty), "config", "list"]) == 1
     stderr = capsys.readouterr().err
     assert "No config found" in stderr
 
@@ -108,7 +117,7 @@ def test_config_no_config_error(tmp_path: Path, capsys) -> None:
 def test_validate_config_rejects_missing_dataset_root(tmp_path: Path) -> None:
     try:
         LocalConfig(dataset_root="", default_branch="main")
-        assert False, "Should have raised"
+        pytest.fail("Should have raised")
     except ValueError as e:
         assert "dataset_root" in str(e)
 
@@ -121,14 +130,16 @@ def test_validate_config_rejects_empty_bucket_for_s3(tmp_path: Path) -> None:
             bucket="",
             prefix="",
         )
-        assert False, "Should have raised"
+        pytest.fail("Should have raised")
     except ValueError as e:
         assert "bucket" in str(e)
 
 
 def test_config_init_idempotent(tmp_path: Path, capsys) -> None:
     (tmp_path / "f.txt").write_text("x")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "init"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "init"]) == 0
     capsys.readouterr()
 
     config_path = tmp_path / ".reflake" / "config.json"
@@ -142,25 +153,20 @@ def test_config_init_idempotent(tmp_path: Path, capsys) -> None:
 
 def test_config_set_s3_bucket_and_list(tmp_path: Path, capsys) -> None:
     (tmp_path / "f.txt").write_text("x")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "init"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "init"]) == 0
     capsys.readouterr()
 
     assert (
         run_cli(
-            [
-                "config",
-                "set",
-                "--repo",
-                str(tmp_path),
-                "s3.bucket",
-                "my-bucket",
-            ]
+            ["--repo", str(tmp_path), "config", "set", "s3.bucket", "my-bucket"]
         )
         == 0
     )
     capsys.readouterr()
 
-    assert run_cli(["config", "list", "--repo", str(tmp_path)]) == 0
+    assert run_cli(["--repo", str(tmp_path), "config", "list"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["bucket"] == "my-bucket"
 
@@ -178,14 +184,14 @@ def test_config_serialize_includes_format_version(tmp_path: Path) -> None:
 
 
 def test_repo_rejects_unsupported_format_version(tmp_path: Path) -> None:
-    ReflakeRepository(tmp_path)
+    init_repository(tmp_path)
     config_path = tmp_path / ".reflake" / "config.json"
     config = json.loads(config_path.read_text("utf-8"))
     config["format_version"] = CURRENT_FORMAT_VERSION + 1
     config_path.write_text(json.dumps(config, indent=2) + "\n", "utf-8")
     try:
         ReflakeRepository(tmp_path)
-        assert False, "Should have raised"
+        pytest.fail("Should have raised")
     except ValueError as e:
         assert "newer" in str(e)
 
@@ -209,7 +215,7 @@ def test_config_missing_format_version_defaults_to_current(tmp_path: Path) -> No
 def test_validate_config_rejects_future_format() -> None:
     try:
         LocalConfig(format_version=2, dataset_root="/tmp")
-        assert False, "Should have raised"
+        pytest.fail("Should have raised")
     except ValueError as e:
         msg = str(e)
         assert "newer" in msg and "upgrade reflake" in msg
@@ -218,7 +224,7 @@ def test_validate_config_rejects_future_format() -> None:
 def test_validate_config_rejects_unsupported_old_format() -> None:
     try:
         LocalConfig(format_version=0, dataset_root="/tmp")
-        assert False, "Should have raised"
+        pytest.fail("Should have raised")
     except ValueError as e:
         msg = str(e)
         assert "no longer supported" in msg and "reflake migrate" in msg

@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import pytest
 
-from reflake.core import ReflakeRepository, RefConflictError, open_repository
+from reflake.core import RefConflictError, ReflakeRepository, create_repository
 
 pytestmark = pytest.mark.integration
 
@@ -18,7 +18,7 @@ def _open_remote_repo(
     client_root: Path,
     s3_client: object,
 ) -> ReflakeRepository:
-    return open_repository(
+    return create_repository(
         repo_uri,
         worktree=worktree,
         client_root=client_root,
@@ -115,7 +115,7 @@ def test_s3_integration_metadata_import_verify_remove_and_move(
     imported_commit = repo.import_s3(
         source_uri,
         "metadata import",
-        identity_mode="meta",
+        identity_mode="pointer",
         path_patterns=["root.txt", "**/*.jpg"],
     )
     assert imported_commit
@@ -124,7 +124,14 @@ def test_s3_integration_metadata_import_verify_remove_and_move(
     assert sorted(imported_entries) == ["images/cat.jpg", "images/dog.jpg", "root.txt"]
     assert all(entry.blob_hash is None for entry in imported_entries.values())
 
-    verify_result = repo.verify(
+    audit = repo.verify(
+        ref="main",
+        path_prefixes=["root.txt", "images/cat.jpg"],
+    )
+    assert audit.created_commit is False
+    assert audit.candidate_entries == 2
+
+    verify_result = repo.promote(
         ref="main",
         path_prefixes=["root.txt", "images/cat.jpg"],
     )
@@ -224,9 +231,9 @@ def test_s3_integration_million_file_scale(
     (worktree / "images" / "dogs").mkdir(parents=True, exist_ok=True)
     (worktree / "logs").mkdir(parents=True, exist_ok=True)
     (worktree / "other").mkdir(parents=True, exist_ok=True)
-    cat_content = f"cat".encode()
-    dog_content = f"dog".encode()
-    data_content = f"data".encode()
+    _cat_content = b"cat"
+    _dog_content = b"dog"
+    _data_content = b"data"
 
     for i in range(1_000_000):
         # Distribute: images/cats/* (200), images/dogs/* (300), other/* (999_500)
@@ -246,7 +253,8 @@ def test_s3_integration_million_file_scale(
 
     gen_time = time.perf_counter() - gen_start
     print(
-        f"[SCALE TEST] Generated 1M files in {gen_time:.2f}s ({1_000_000/gen_time:.0f} files/sec)"
+        f"[SCALE TEST] Generated 1M files in {gen_time:.2f}s"
+        f" ({1_000_000/gen_time:.0f} files/sec)"
     )
 
     # 2. Commit to Reflake (creates manifest + index from local files)
@@ -263,7 +271,7 @@ def test_s3_integration_million_file_scale(
 
     bucket, prefix = parse_s3_uri(s3_repo_root)
     cfg = S3Config(
-        dataset_root=str(worktree), bucket=bucket, prefix=prefix, identity="meta"
+        dataset_root=str(worktree), bucket=bucket, prefix=prefix, identity="pointer"
     )
     cfg.save(worktree)
     commit_start = time.perf_counter()
@@ -271,7 +279,8 @@ def test_s3_integration_million_file_scale(
     commit_time = time.perf_counter() - commit_start
     assert commit_id
     print(
-        f"[SCALE TEST] Commit + tree build in {commit_time:.2f}s ({1_000_000/commit_time:.0f} files/sec)"
+        f"[SCALE TEST] Commit + tree build in {commit_time:.2f}s"
+        f" ({1_000_000/commit_time:.0f} files/sec)"
     )
 
     # 3. Test: Specific file lookup (should be O(log B + 1))
@@ -314,10 +323,12 @@ def test_s3_integration_million_file_scale(
     # 7. Summary and assertions
     print("\n[SCALE TEST] Performance Summary:")
     print(
-        f"  Generate 1M files:       {gen_time:.2f}s ({1_000_000/gen_time:.0f} files/sec)"
+        f"  Generate 1M files:       {gen_time:.2f}s"
+        f" ({1_000_000/gen_time:.0f} files/sec)"
     )
     print(
-        f"  Commit + tree build:     {commit_time:.2f}s ({1_000_000/commit_time:.0f} files/sec)"
+        f"  Commit + tree build:     {commit_time:.2f}s"
+        f" ({1_000_000/commit_time:.0f} files/sec)"
     )
     print(f"  Single lookup:           {lookup_time*1000:.3f}ms")
     print(f"  Prefix list (200):       {listing_time*1000:.3f}ms")

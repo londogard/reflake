@@ -15,7 +15,6 @@ from reflake.core.objects.footer import (
     FooterStats,
     RowGroupStats,
     parse_footer_stats,
-    parse_parquet_footer,
     serialize_footer_stats,
 )
 from reflake.core.query.pruning import (
@@ -31,7 +30,9 @@ def _make_stats(row_groups: tuple[RowGroupStats, ...]) -> FooterStats:
     return FooterStats(schema_hash="0" * 64, row_groups=row_groups)
 
 
-def _id_group(rows: int, min_value: int, max_value: int, nulls: int = 0) -> RowGroupStats:
+def _id_group(
+    rows: int, min_value: int, max_value: int, nulls: int = 0
+) -> RowGroupStats:
     return RowGroupStats(
         rows=rows,
         columns=(ColumnStats("id", min=min_value, max=max_value, nulls=nulls),),
@@ -193,7 +194,7 @@ def _write_parquet_groups(path: Path, groups: int) -> None:
 
 def test_plan_pruned_scan_on_repo(tmp_path: Path) -> None:
     _write_parquet_groups(tmp_path / "data.parquet", groups=5)
-    LocalConfig(identity="blake3", parquet_footer=True).save(tmp_path)
+    LocalConfig(identity="content", parquet_footer=True).save(tmp_path)
     repo = ReflakeRepository(tmp_path)
     repo.commit("captured")
 
@@ -215,7 +216,7 @@ def test_plan_pruned_scan_prefix_filters_files(tmp_path: Path) -> None:
     _write_parquet_groups(tmp_path / "a.parquet", groups=3)
     _write_parquet_groups(tmp_path / "b.parquet", groups=3)
     (tmp_path / "note.txt").write_text("not parquet")
-    LocalConfig(identity="blake3", parquet_footer=True).save(tmp_path)
+    LocalConfig(identity="content", parquet_footer=True).save(tmp_path)
     repo = ReflakeRepository(tmp_path)
     repo.commit("captured")
 
@@ -231,43 +232,52 @@ def test_plan_pruned_scan_prefix_filters_files(tmp_path: Path) -> None:
 
 def test_cli_query_prune(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _write_parquet_groups(tmp_path / "data.parquet", groups=3)
-    LocalConfig(identity="blake3", parquet_footer=True).save(tmp_path)
+    LocalConfig(identity="content", parquet_footer=True).save(tmp_path)
     ReflakeRepository(tmp_path).commit("captured")
 
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
     exit_code = run_cli(
         [
+            "--repo",
+            str(tmp_path),
             "query",
             "prune",
             "main",
             "data.parquet",
             "--where",
             "id >= 4096",
-            "--repo",
-            str(tmp_path),
         ]
     )
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "kept 1/3 row groups (2 pruned)" in captured.out
-    assert "Summary: 1 files, 1 kept / 2 pruned row groups (metadata-only)." in captured.out
+    assert (
+        "Summary: 1 files, 1 kept / 2 pruned row groups (metadata-only)."
+        in captured.out
+    )
 
 
-def test_cli_query_prune_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_query_prune_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     _write_parquet_groups(tmp_path / "data.parquet", groups=3)
-    LocalConfig(identity="blake3", parquet_footer=True).save(tmp_path)
+    LocalConfig(identity="content", parquet_footer=True).save(tmp_path)
     ReflakeRepository(tmp_path).commit("captured")
 
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
     exit_code = run_cli(
         [
+            "--repo",
+            str(tmp_path),
+            "--json",
             "query",
             "prune",
             "main",
             "data.parquet",
             "--where",
             "id < 0",
-            "--json",
-            "--repo",
-            str(tmp_path),
         ]
     )
     captured = capsys.readouterr()

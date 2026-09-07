@@ -8,27 +8,27 @@ streams serialized tree lines without constructing entry objects.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Iterator
 
 from blake3 import blake3
 
 from ..domain import StageChange
+from ..entry_codec import Entry
 from ..hashing import DEFAULT_CHUNK_SIZE, blake3_digest_file
-from ..manifest import ManifestEntry
+from ..objects import (
+    ObjectIO,
+    describe_source_uri,
+    iter_s3_objects,
+    open_source_uri,
+    parse_s3_uri,
+)
 from ..repository_support import (
     matches_import_patterns,
     metadata_identity,
     normalize_import_patterns,
     normalize_s3_import_path,
-)
-from ..objects import (
-    ObjectStore,
-    describe_source_uri,
-    iter_s3_objects,
-    open_source_uri,
-    parse_s3_uri,
 )
 
 
@@ -37,7 +37,7 @@ class EntryFactory:
         self,
         *,
         root: Path,
-        store: ObjectStore,
+        store: ObjectIO,
         capture_footers: bool = False,
     ) -> None:
         self.root = root
@@ -47,8 +47,8 @@ class EntryFactory:
     def _capture_footer(self, source_uri: str) -> str | None:
         if not self.capture_footers or not source_uri.lower().endswith(".parquet"):
             return None
-        from ..objects.footer import capture_footer_stats
         from ..objects import open_source_uri
+        from ..objects.footer import capture_footer_stats
 
         try:
             with open_source_uri(source_uri) as handle:
@@ -62,7 +62,7 @@ class EntryFactory:
         source_uri: str,
         identity_mode: str,
         path_patterns: list[str] | None = None,
-    ) -> Iterator[ManifestEntry]:
+    ) -> Iterator[Entry]:
         _, prefix = parse_s3_uri(source_uri)
         normalized_prefix = prefix.strip("/")
         normalized_patterns = normalize_import_patterns(path_patterns)
@@ -76,18 +76,18 @@ class EntryFactory:
                 continue
             if not matches_import_patterns(relative_path, normalized_patterns):
                 continue
-            if identity_mode == "blake3":
+            if identity_mode == "content":
                 identity_value = self.store_blob_from_source_uri(obj.source_uri)
-            elif identity_mode == "meta":
+            elif identity_mode == "pointer":
                 identity_value = metadata_identity(relative_path, obj.size)
             else:
-                raise ValueError("identity_mode must be one of: blake3, meta")
-            yield ManifestEntry(
-                path=relative_path,
-                hash=identity_value,
-                size=obj.size,
-                mtime_ns=obj.mtime_ns,
-                identity_mode=identity_mode,
+                raise ValueError("identity_mode must be one of: content, pointer")
+            yield Entry.with_identity(
+                relative_path,
+                identity_value,
+                obj.size,
+                obj.mtime_ns,
+                identity_mode,
                 source_uri=obj.source_uri,
             )
 
@@ -97,28 +97,28 @@ class EntryFactory:
         identity_mode: str,
         *,
         store_blob: bool,
-    ) -> ManifestEntry:
+    ) -> Entry:
         source_path = self.root / relative_path
         if not source_path.exists() or not source_path.is_file():
             raise FileNotFoundError(f"Cannot stage missing file: {relative_path}")
         stat = source_path.stat()
         source_uri = source_path.as_uri()
         footer = self._capture_footer(source_uri)
-        if identity_mode == "blake3":
+        if identity_mode == "content":
             identity_value = blake3_digest_file(source_path)
             if store_blob:
                 self.store_blob(source_path, identity_value)
-        elif identity_mode == "meta":
+        elif identity_mode == "pointer":
             identity_value = metadata_identity(relative_path, stat.st_size)
         else:
-            raise ValueError("identity_mode must be one of: blake3, meta")
-        return ManifestEntry(
-            path=relative_path,
-            hash=identity_value,
-            size=stat.st_size,
-            mtime_ns=stat.st_mtime_ns,
-            identity_mode=identity_mode,
-            source_uri=source_uri if identity_mode == "meta" else None,
+            raise ValueError("identity_mode must be one of: content, pointer")
+        return Entry.with_identity(
+            relative_path,
+            identity_value,
+            stat.st_size,
+            stat.st_mtime_ns,
+            identity_mode,
+            source_uri=source_uri if identity_mode == "pointer" else None,
             footer=footer,
         )
 
@@ -128,7 +128,7 @@ class EntryFactory:
         identity_mode: str,
         *,
         store_blob: bool,
-    ) -> ManifestEntry:
+    ) -> Entry:
         if change.source_uri is not None:
             return self.entry_from_source_uri(
                 logical_path=change.path,
@@ -143,13 +143,13 @@ class EntryFactory:
                 identity_mode,
                 store_blob=store_blob,
             )
-        if change.blob_hash and identity_mode == "blake3":
-            return ManifestEntry(
-                path=change.path,
-                hash=change.blob_hash,
-                size=change.size or 0,
-                mtime_ns=0,
-                identity_mode="blake3",
+        if change.blob_hash and identity_mode == "content":
+            return Entry.with_identity(
+                change.path,
+                change.blob_hash,
+                change.size or 0,
+                0,
+                "content",
             )
         raise FileNotFoundError(f"Cannot stage missing file: {change.path}")
 
@@ -160,22 +160,22 @@ class EntryFactory:
         source_uri: str,
         identity_mode: str,
         store_blob: bool,
-    ) -> ManifestEntry:
+    ) -> Entry:
         metadata = describe_source_uri(source_uri)
         footer = self._capture_footer(source_uri)
-        if identity_mode == "blake3":
+        if identity_mode == "content":
             identity_value = self.store_blob_from_source_uri(source_uri)
-        elif identity_mode == "meta":
+        elif identity_mode == "pointer":
             identity_value = metadata_identity(logical_path, metadata.size)
         else:
-            raise ValueError("identity_mode must be one of: blake3, meta")
-        return ManifestEntry(
-            path=logical_path,
-            hash=identity_value,
-            size=metadata.size,
-            mtime_ns=metadata.mtime_ns,
-            identity_mode=identity_mode,
-            source_uri=metadata.source_uri if identity_mode == "meta" else None,
+            raise ValueError("identity_mode must be one of: content, pointer")
+        return Entry.with_identity(
+            logical_path,
+            identity_value,
+            metadata.size,
+            metadata.mtime_ns,
+            identity_mode,
+            source_uri=metadata.source_uri if identity_mode == "pointer" else None,
             footer=footer,
         )
 

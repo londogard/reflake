@@ -2,29 +2,46 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .repository import ReflakeRepository
 
 
 from .domain import FetchResult, PullResult, PushResult, RepositoryObjectKind
-from .objects.base import ObjectIO, ObjectStore
-from .objects.backends import BlobTransferBackend
+from .objects.backends import (
+    BlobTransferBackend,
+    TransferDirection,
+    TransferItem,
+    TransferPlan,
+)
+from .objects.base import HasLocalPath, HasRemoteURI, ObjectIO
 from .repository_support import is_ancestor_commit
 
 
-@dataclass(frozen=True)
-class TransferItem:
-    """One (src → dst) copy in a transfer plan (docs/architecture.md §7)."""
+def _require_local_path(store: object, *, role: str) -> HasLocalPath:
+    """Return *store* as a local-path endpoint or raise a clear error."""
+    if not hasattr(store, "object_path"):
+        raise TypeError(
+            f"Transfer plan needs a local filesystem path for the {role} "
+            f"store, but {type(store).__name__} has no object_path "
+            "(sync requires one local and one S3 repository)"
+        )
+    return store  # type: ignore[return-value]
 
-    kind: RepositoryObjectKind
-    object_id: str
-    local_path: str
-    remote_uri: str
+
+def _require_remote_uri(store: object, *, role: str) -> HasRemoteURI:
+    """Return *store* as a remote-URI endpoint or raise a clear error."""
+    if not hasattr(store, "object_uri"):
+        raise TypeError(
+            f"Transfer plan needs a remote URI for the {role} "
+            f"store, but {type(store).__name__} has no object_uri "
+            "(sync requires one local and one S3 repository)"
+        )
+    return store  # type: ignore[return-value]
 
 
 def _build_plan(
@@ -32,8 +49,8 @@ def _build_plan(
     dst_repo: ReflakeRepository,
     commit_ids: list[str],
     *,
-    direction: str,
-) -> list[TransferItem]:
+    direction: TransferDirection,
+) -> TransferPlan:
     """Compute the exact missing-object set for *commit_ids* on the destination."""
     items: list[TransferItem] = []
     seen: set[tuple[str, str]] = set()
@@ -44,12 +61,12 @@ def _build_plan(
             return
         seen.add(key)
         if direction == "upload":
-            local_path = src_repo.store.object_path(kind, object_id)
+            local_store = _require_local_path(src_repo.store, role="source")
+            remote_store = _require_remote_uri(dst_repo.store, role="target")
         else:
-            local_path = dst_repo.store.object_path(kind, object_id)
-        remote_store = (
-            dst_repo.store if direction == "upload" else src_repo.store
-        )
+            local_store = _require_local_path(dst_repo.store, role="target")
+            remote_store = _require_remote_uri(src_repo.store, role="source")
+        local_path = local_store.object_path(kind, object_id)
         items.append(
             TransferItem(
                 kind=kind,
@@ -71,7 +88,7 @@ def _build_plan(
             if footer_hash:
                 add("footer", footer_hash)
         add("commit", commit_id)
-    return items
+    return TransferPlan(direction=direction, items=tuple(items))
 
 
 def _copy_item(
@@ -128,11 +145,10 @@ def _copy_item(
 
 
 def execute_transfer_plan(
-    items: list[TransferItem],
+    plan: TransferPlan,
     *,
     local_store: ObjectIO,
     remote_store: ObjectIO,
-    direction: str,
     batch_backend: BlobTransferBackend | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> int:
@@ -140,13 +156,11 @@ def execute_transfer_plan(
 
     Returns the number of transferred items.
     """
+    items = list(plan.items)
     if not items:
         return 0
     if batch_backend is not None and batch_backend.supports_batch():
-        transferred = batch_backend.upload_batch(
-            [(item.local_path, item.remote_uri) for item in items],
-            if_not_exists=direction == "upload",
-        )
+        transferred = batch_backend.transfer(plan)
         if progress is not None:
             progress(transferred, len(items))
         return transferred
@@ -156,7 +170,7 @@ def execute_transfer_plan(
             item,
             local_store=local_store,
             remote_store=remote_store,
-            direction=direction,
+            direction=plan.direction,
         )
         if progress is not None:
             progress(index + 1, len(items))
@@ -350,11 +364,10 @@ def push(
         plan,
         local_store=repo.store,
         remote_store=remote_repo.store,
-        direction="upload",
         batch_backend=getattr(remote_repo.store, "transfer_backend", None),
         progress=progress,
     )
-    pushed_blobs = sum(1 for item in plan if item.kind == "blob")
+    pushed_blobs = sum(1 for item in plan.items if item.kind == "blob")
 
     updated = remote_repo.fast_forward_branch(branch, local_commit_id, operation="push")
 
@@ -440,11 +453,10 @@ def pull(
         plan,
         local_store=repo.store,
         remote_store=remote_repo.store,
-        direction="download",
         batch_backend=getattr(remote_repo.store, "transfer_backend", None),
         progress=progress,
     )
-    pulled_blobs = sum(1 for item in plan if item.kind == "blob")
+    pulled_blobs = sum(1 for item in plan.items if item.kind == "blob")
 
     # CAS the local branch ref (branch was ensured to exist during pre-check).
     updated = repo.fast_forward_branch(branch, remote_commit_id, operation="pull")
@@ -494,11 +506,10 @@ def fetch(
         plan,
         local_store=repo.store,
         remote_store=remote_repo.store,
-        direction="download",
         batch_backend=getattr(remote_repo.store, "transfer_backend", None),
         progress=progress,
     )
-    fetched_blobs = sum(1 for item in plan if item.kind == "blob")
+    fetched_blobs = sum(1 for item in plan.items if item.kind == "blob")
 
     return FetchResult(
         remote_uri=remote_uri,

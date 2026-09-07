@@ -19,7 +19,7 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
     format_version: int = CURRENT_FORMAT_VERSION
     dataset_root: str = "."
     default_branch: str = "main"
-    identity: str = "blake3"
+    identity: str = "content"
     transfer_backend: str | None = None
     parquet_footer: bool = False
 
@@ -32,7 +32,8 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
                     f"Please upgrade reflake to access this repository."
                 )
             raise ValueError(
-                f"Repository format version {self.format_version} is no longer supported. "
+                f"Repository format version {self.format_version} is no "
+                f"longer supported. "
                 f"Run 'reflake migrate' to upgrade the repository."
             )
         if not self.dataset_root:

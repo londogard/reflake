@@ -18,6 +18,8 @@ def blake3_digest_stream(stream: BinaryIO, chunk_size: int = DEFAULT_CHUNK_SIZE)
     return hasher.hexdigest()
 
 
-def blake3_digest_file(file_path: str | Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> str:
+def blake3_digest_file(
+    file_path: str | Path, chunk_size: int = DEFAULT_CHUNK_SIZE
+) -> str:
     with Path(file_path).open("rb") as handle:
         return blake3_digest_stream(handle, chunk_size=chunk_size)

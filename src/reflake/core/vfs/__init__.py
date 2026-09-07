@@ -3,15 +3,15 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, IO
+from typing import IO, Any, BinaryIO
 
 import fsspec
 from fsspec.spec import AbstractFileSystem
 
-from ..manifest import ManifestEntry
+from ..entry_codec import Entry
+from ..objects import open_source_uri
 from ..repository import ReflakeRepository, open_repository
 from ..repository_support import _validate_no_binary, normalize_repository_path
-from ..objects import open_source_uri
 
 
 @dataclass(frozen=True)
@@ -120,7 +120,7 @@ class ReflakeFileSystem(AbstractFileSystem):
                 results.append(as_uri)
         return results
 
-    def _resolve_entry(self, path: str) -> "ResolvedEntry":
+    def _resolve_entry(self, path: str) -> ResolvedEntry:
         uri = self._parse_uri(path)
         root = self._dataset_root(uri.dataset)
         repo = self._repository(root)
@@ -205,7 +205,7 @@ class ResolvedEntry:
     uri: ReflakeURI
     root: str | Path
     commit_id: str
-    entry: ManifestEntry
+    entry: Entry
 
 
 class _SourceURIFile(io.IOBase):

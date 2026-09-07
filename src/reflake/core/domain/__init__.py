@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 from .errors import (
-    ReflakeError,
+    EmptyBranchError,
     MergeConflictError,
     NonFastForwardError,
+    NotARepositoryError,
     ObjectMissingError,
     OptimisticLockError,
     PreconditionFailedError,
     RefConflictError,
+    ReflakeError,
     StorageUnavailableError,
-    NotARepositoryError,
-    UnknownRefError,
-    EmptyBranchError,
     UnknownCommitError,
+    UnknownRefError,
 )
 from .models import (
     BranchRefState,
@@ -43,6 +43,7 @@ __all__ = [
     "MergeResult",
     "MoveResult",
     "NonFastForwardError",
+    "NotARepositoryError",
     "ObjectMissingError",
     "OptimisticLockError",
     "PreconditionFailedError",

@@ -1,12 +1,11 @@
 from .client_state import LocalClientState
-from .config import BaseConfig, ReflakeConfig, LocalConfig, S3Config, init_config
+from .config import BaseConfig, LocalConfig, ReflakeConfig, S3Config, init_config
 from .domain import (
     BranchRefState,
     CommitObject,
     DiffEntry,
     EmptyBranchError,
     FetchResult,
-    ReflakeError,
     GcResult,
     MergeConflictError,
     MergeResult,
@@ -19,33 +18,21 @@ from .domain import (
     PullResult,
     PushResult,
     RefConflictError,
+    ReflakeError,
     RemoveResult,
     RepositoryObjectKind,
-    StorageUnavailableError,
     StageChange,
     StageStatus,
+    StorageUnavailableError,
     UnknownCommitError,
     UnknownRefError,
     VerifyResult,
 )
-from .vfs import ReflakeFileSystem, ReflakeURI
+from .entry_codec import CorruptEntryError, Entry
 from .hashing import DEFAULT_CHUNK_SIZE, blake3_digest_file, blake3_digest_stream
-from .query import (
-    AnalyticalIndexPaths,
-    Predicate,
-    PrunedFileScan,
-    PruneResult,
-    build_analytical_index,
-    drop_analytical_index,
-    parse_where_clause,
-    plan_pruned_scan,
-    prune_row_groups,
-    query_analytical_index,
-)
 from .layout import ReflakeLayout, blob_relpath, initialize_reflake_layout
 from .manifest import (
     FileEntry,
-    ManifestEntry,
     ManifestReader,
     ManifestWriter,
     build_manifest_entries,
@@ -59,10 +46,10 @@ from .objects import (
     ObjectStore,
     RefCas,
     S3BlobTransferBackend,
-    S5CmdBlobTransferBackend,
     S3ObjectMetadata,
     S3ObjectStore,
     S3StorageBackend,
+    S5CmdBlobTransferBackend,
     StorageBackend,
     StoreInventory,
     TreeQuery,
@@ -72,16 +59,26 @@ from .objects import (
     open_source_uri,
     parse_s3_uri,
 )
-from .repository import ReflakeRepository, open_repository
-from .repository_sync import (
-    FetchResult,
-    PullResult,
-    PushResult,
-    fetch,
-    pull,
-    push,
+from .query import (
+    AnalyticalIndexPaths,
+    Predicate,
+    PrunedFileScan,
+    PruneResult,
+    build_analytical_index,
+    drop_analytical_index,
+    parse_where_clause,
+    plan_pruned_scan,
+    prune_row_groups,
+    query_analytical_index,
 )
-
+from .repository import (
+    ReflakeRepository,
+    create_repository,
+    init_repository,
+    open_repository,
+)
+from .repository_sync import fetch, pull, push
+from .vfs import ReflakeFileSystem, ReflakeURI
 
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
@@ -103,6 +100,8 @@ __all__ = [
     "NonFastForwardError",
     "NotARepositoryError",
     "ObjectMissingError",
+    "create_repository",
+    "init_repository",
     "open_repository",
     "RefConflictError",
     "S3BlobTransferBackend",
@@ -115,7 +114,8 @@ __all__ = [
     "BranchRefState",
     "LocalObjectStore",
     "LocalStorageBackend",
-    "ManifestEntry",
+    "CorruptEntryError",
+    "Entry",
     "ManifestReader",
     "ManifestWriter",
     "ObjectIO",
@@ -146,11 +146,19 @@ __all__ = [
     "build_manifest_entries",
     "initialize_reflake_layout",
     "FetchResult",
+    "GcResult",
+    "MoveResult",
     "PullResult",
     "PushResult",
+    "RemoveResult",
+    "RepositoryObjectKind",
+    "VerifyResult",
+    "build_s3_client",
+    "drop_analytical_index",
     "fetch",
     "pull",
     "push",
+    "query_analytical_index",
     "S3ObjectMetadata",
     "walk_files",
     "iter_s3_objects",

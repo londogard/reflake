@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any
 
-from .backends import S3ObjectMetadata
+from .backends import S3ObjectMetadata, TransferPlan
 from .source import S3StorageBackend, _mtime_ns, build_s3_client, parse_s3_uri
+
+
+def _require_batch_safe(*values: str) -> None:
+    """Reject control characters that would break line-delimited batch manifests.
+
+    ``s5cmd run`` reads one command per line, so a newline (or carriage
+    return) inside a path would inject extra commands. Fail loudly instead.
+    """
+    for value in values:
+        if "\n" in value or "\r" in value:
+            raise ValueError(
+                "Batch transfer paths must not contain newline characters: "
+                f"{value!r}"
+            )
 
 
 class S3BlobTransferBackend:
@@ -23,15 +38,14 @@ class S3BlobTransferBackend:
     def supports_batch(self) -> bool:
         return False
 
-    def upload_batch(
-        self,
-        pairs: Sequence[tuple[str, str]],
-        *,
-        if_not_exists: bool = False,
-    ) -> int:
-        for local_path, remote_uri in pairs:
-            self.upload(local_path, remote_uri, if_not_exists=if_not_exists)
-        return len(pairs)
+    def transfer(self, plan: TransferPlan) -> int:
+        if plan.direction == "upload":
+            for item in plan.items:
+                self.upload(item.local_path, item.remote_uri, if_not_exists=True)
+        else:
+            for item in plan.items:
+                self.download(item.remote_uri, item.local_path)
+        return len(plan.items)
 
     def _backend(self, remote_uri: str) -> tuple[S3StorageBackend, str]:
         bucket, key = parse_s3_uri(remote_uri)
@@ -100,20 +114,21 @@ class S5CmdBlobTransferBackend:
     def supports_batch(self) -> bool:
         return True
 
-    def upload_batch(
-        self,
-        pairs: Sequence[tuple[str, str]],
-        *,
-        if_not_exists: bool = False,
-    ) -> int:
+    def transfer(self, plan: TransferPlan) -> int:
         lines: list[str] = []
-        for local_path, remote_uri in pairs:
-            if if_not_exists:
-                lines.append(f"cp --if-not-exists {local_path} {remote_uri}")
-            else:
-                lines.append(f"cp {local_path} {remote_uri}")
+        if plan.direction == "upload":
+            for item in plan.items:
+                _require_batch_safe(item.local_path, item.remote_uri)
+                lines.append(
+                    f"cp --if-not-exists {item.local_path} {item.remote_uri}"
+                )
+        else:
+            for item in plan.items:
+                _require_batch_safe(item.remote_uri, item.local_path)
+                Path(item.local_path).parent.mkdir(parents=True, exist_ok=True)
+                lines.append(f"cp {item.remote_uri} {item.local_path}")
         self._run(["run"], input_data="\n".join(lines) + "\n")
-        return len(pairs)
+        return len(plan.items)
 
     def _run(
         self,
@@ -191,7 +206,7 @@ class S5CmdBlobTransferBackend:
 def build_blob_transfer_backend(
     backend_type: str = "boto3",
     **kwargs: Any,
-) -> "S3BlobTransferBackend | S5CmdBlobTransferBackend":
+) -> S3BlobTransferBackend | S5CmdBlobTransferBackend:
     """Factory to create a BlobTransferBackend by name.
 
     Args:

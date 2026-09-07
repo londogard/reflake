@@ -20,18 +20,19 @@ commits now produce a Merkle tree DAG instead of a full JSONL manifest.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from collections.abc import Iterator
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Iterator
 
 from blake3 import blake3
 
 from ..client_state import LocalClientState
 from ..domain import CommitObject
-from ..entry_codec import LeafRecord, encode_leaf, leaf_kind_for
+from ..entry_codec import Entry, encode_leaf_parts
 from ..hashing import blake3_digest_file
-from ..manifest import FileEntry, ManifestEntry, ManifestWriter, walk_files
+from ..manifest import FileEntry, walk_files
+from ..objects import ObjectIO
 from ..objects.query import TreeWalker
 from ..objects.tree import (
     KIND_BLOB,
@@ -41,32 +42,15 @@ from ..objects.tree import (
     KIND_SHARD,
     KIND_TREE,
     MAX_TREE_ENTRIES,
-    TreeEntry,
     leaf_to_tree_entry,
 )
-from ..objects import ObjectStore
-from ..repository_support import merge_sorted_streams, metadata_identity
+from ..repository_support import metadata_identity
 from .refs import RefManager
-
-#: Derived-manifest block size for the optional client-side point-lookup cache.
-DERIVED_BLOCK_ENTRY_COUNT = 4096
+from .tree_inspect import DERIVED_BLOCK_ENTRY_COUNT as DERIVED_BLOCK_ENTRY_COUNT
+from .tree_inspect import TreeInspector
 
 _Child = tuple[str, str]  # (name, serialized tree line)
-_Frame = tuple[str, list[_Child], dict[str, TreeEntry] | None]
-
-
-def _lookup_block_index(paths: list[str], logical_path: str) -> int | None:
-    """Binary search for the block that may contain *logical_path*."""
-    low, high = 0, len(paths)
-    while low < high:
-        mid = (low + high) // 2
-        if paths[mid] <= logical_path:
-            low = mid + 1
-        else:
-            high = mid
-    if low == 0:
-        return None
-    return low - 1
+_Frame = tuple[str, list[_Child], dict[str, Entry] | None]
 
 
 def _parent_dir(path: str) -> str:
@@ -92,16 +76,11 @@ def _leaf_line(
     source_uri: str | None,
     footer: str | None,
 ) -> str:
-    return encode_leaf(
-        LeafRecord(
-            kind=kind,
-            name=name,
-            hash=hash_value,
-            size=size,
-            mtime_ns=mtime_ns,
-            source_uri=source_uri,
-            footer=footer,
-        )
+    # Hot path (once per committed file): inputs are producer-guaranteed
+    # (digest output, stat values, walk names, closed kind branch), so
+    # serialize directly without building a validated Entry.
+    return encode_leaf_parts(
+        kind, name, hash_value, size, mtime_ns, source_uri, footer
     )
 
 
@@ -109,25 +88,15 @@ def _subtree_line(kind: str, name: str, hash_value: str) -> str:
     return json.dumps([kind, name, hash_value], separators=(",", ":"))
 
 
-def _entry_to_leaf_line(entry: ManifestEntry) -> str:
-    return encode_leaf(
-        LeafRecord(
-            kind=leaf_kind_for(entry.identity_mode, has_footer=entry.footer is not None),
-            name=entry.path.rsplit("/", 1)[-1],
-            hash=entry.hash,
-            size=entry.size,
-            mtime_ns=entry.mtime_ns,
-            source_uri=entry.source_uri if entry.identity_mode == "meta" else None,
-            footer=entry.footer,
-        )
-    )
+def _entry_to_leaf_line(entry: Entry) -> str:
+    return replace(entry, path=entry.path.rsplit("/", 1)[-1]).serialize()
 
 
 class TreeWriter:
     def __init__(
         self,
         *,
-        store: ObjectStore,
+        store: ObjectIO,
         refs: RefManager,
         client_state: LocalClientState | None = None,
     ) -> None:
@@ -135,6 +104,10 @@ class TreeWriter:
         self.refs = refs
         self.client_state = client_state
         self._walker = TreeWalker(read_tree=store.read_tree_bytes)
+        self.inspector = TreeInspector(
+            read_tree=store.read_tree_bytes,
+            client_state=client_state,
+        )
 
     # ── Low-level tree object writing ────────────────────────────────────
 
@@ -146,7 +119,9 @@ class TreeWriter:
         self.store.write_tree_bytes(tree_hash, payload, if_missing=True)
         return tree_hash
 
-    def _build_children(self, children: list[_Child], *, already_sorted: bool = False) -> str:
+    def _build_children(
+        self, children: list[_Child], *, already_sorted: bool = False
+    ) -> str:
         """Build (and shard) a tree object from children; returns its hash.
 
         Children are sorted by name here — directory frames close lazily
@@ -179,7 +154,7 @@ class TreeWriter:
         parent_tree: str | None,
         identity_mode: str,
         removed_paths: set[str],
-        staged_additions: list[ManifestEntry] | None = None,
+        staged_additions: list[Entry] | None = None,
         capture_footers: bool = False,
     ) -> str:
         """Build the root tree from a worktree walk.
@@ -228,7 +203,7 @@ class TreeWriter:
         parent_tree: str | None,
         identity_mode: str,
         removed_paths: set[str],
-        staged_additions: list[ManifestEntry] | None,
+        staged_additions: list[Entry] | None,
         capture_footers: bool,
     ) -> tuple[str, set[str]]:
         """Build the tree; also report staged-addition dirs that never opened.
@@ -240,7 +215,7 @@ class TreeWriter:
         root_children: list[_Child] = []
         stack: list[_Frame] = []
 
-        additions_by_dir: dict[str, dict[str, TreeEntry]] = {}
+        additions_by_dir: dict[str, dict[str, Entry]] = {}
         if staged_additions:
             for entry in staged_additions:
                 parts = entry.path.split("/")
@@ -249,13 +224,13 @@ class TreeWriter:
                     leaf_to_tree_entry(entry)
                 )
 
-        def parent_children(dir_path: str) -> dict[str, TreeEntry] | None:
-            merged: dict[str, TreeEntry] = {}
+        def parent_children(dir_path: str) -> dict[str, Entry] | None:
+            merged: dict[str, Entry] = {}
             if parent_tree:
                 entries = self._walker.resolve_subtree(parent_tree, dir_path)
                 if entries:
                     for entry in entries:
-                        merged[entry.name] = entry
+                        merged[entry.path] = entry
             additions = additions_by_dir.pop(dir_path, None)
             if additions:
                 merged.update(additions)
@@ -321,13 +296,13 @@ class TreeWriter:
         file_entry: FileEntry,
         name: str,
         full_path: str,
-        parent_by_name: dict[str, TreeEntry] | None,
+        parent_by_name: dict[str, Entry] | None,
         identity_mode: str,
         capture_footers: bool,
     ) -> _Child:
         parent_entry = parent_by_name.get(name) if parent_by_name else None
         if parent_entry is not None and not parent_entry.is_subtree:
-            if identity_mode == "blake3":
+            if identity_mode == "content":
                 if (
                     parent_entry.kind in {KIND_BLOB, KIND_BP}
                     and parent_entry.size == file_entry.size
@@ -352,28 +327,37 @@ class TreeWriter:
                     capture_footers=capture_footers,
                 )
 
-        if identity_mode == "blake3":
+        if identity_mode == "content":
             identity_value = blake3_digest_file(file_entry.path)
             self.store.write_blob_file(identity_value, file_entry.path, if_missing=True)
             footer = self._capture_footer(file_entry.path, capture_footers)
             line = _leaf_line(
                 KIND_BP if footer else KIND_BLOB,
-                name, identity_value, file_entry.size, file_entry.mtime_ns, None, footer,
+                name,
+                identity_value,
+                file_entry.size,
+                file_entry.mtime_ns,
+                None,
+                footer,
             )
         else:
             identity_value = metadata_identity(full_path, file_entry.size)
             footer = self._capture_footer(file_entry.path, capture_footers)
             line = _leaf_line(
                 KIND_MP if footer else KIND_META,
-                name, identity_value, file_entry.size, file_entry.mtime_ns,
-                file_entry.path.as_uri(), footer,
+                name,
+                identity_value,
+                file_entry.size,
+                file_entry.mtime_ns,
+                file_entry.path.as_uri(),
+                footer,
             )
         return name, line
 
     def _reuse_or_backfill_footer(
         self,
         *,
-        parent_entry: TreeEntry,
+        parent_entry: Entry,
         name: str,
         source_path: Path,
         source_uri: str | None,
@@ -387,8 +371,13 @@ class TreeWriter:
             return name, parent_entry.serialize()
         kind = KIND_BP if parent_entry.kind == KIND_BLOB else KIND_MP
         return name, _leaf_line(
-            kind, name, parent_entry.hash, parent_entry.size,
-            parent_entry.mtime_ns, source_uri, footer,
+            kind,
+            name,
+            parent_entry.hash,
+            parent_entry.size,
+            parent_entry.mtime_ns,
+            source_uri,
+            footer,
         )
 
     def _capture_footer(self, source_path: Path, capture_footers: bool) -> str | None:
@@ -415,7 +404,7 @@ class TreeWriter:
             kept: list[_Child] = []
             changed = False
             for entry in entries:
-                full = f"{dir_path}/{entry.name}" if dir_path else entry.name
+                full = f"{dir_path}/{entry.path}" if dir_path else entry.path
                 if _path_is_removed(full, removed):
                     changed = True
                     continue
@@ -427,7 +416,14 @@ class TreeWriter:
                         for prefix in removed
                     )
                     if not needs_rebuild:
-                        kept.append((entry.name, _subtree_line(entry.kind, entry.name, entry.hash)))
+                        kept.append(
+                            (
+                                entry.path,
+                                _subtree_line(
+                                    entry.kind, entry.path, entry.hash
+                                ),
+                            )
+                        )
                         continue
                     new_hash = prune(child_dir, entry.hash)
                     if new_hash is None:
@@ -435,9 +431,14 @@ class TreeWriter:
                         continue
                     if new_hash != entry.hash:
                         changed = True
-                    kept.append((entry.name, _subtree_line(entry.kind, entry.name, new_hash)))
+                    kept.append(
+                        (
+                            entry.path,
+                            _subtree_line(entry.kind, entry.path, new_hash),
+                        )
+                    )
                 else:
-                    kept.append((entry.name, entry.serialize()))
+                    kept.append((entry.path, entry.serialize()))
             if not kept:
                 return None
             if not changed:
@@ -448,8 +449,8 @@ class TreeWriter:
 
     # ── Rebuild from a sorted leaf stream (verify/rm/mv/import/overlay) ──
 
-    def build_from_entries(self, entries: Iterator[ManifestEntry]) -> str:
-        """Build a root tree from a *sorted* stream of ``ManifestEntry``."""
+    def build_from_entries(self, entries: Iterator[Entry]) -> str:
+        """Build a root tree from a *sorted* stream of ``Entry``."""
         root_children: list[_Child] = []
         stack: list[_Frame] = []
         previous_path: str | None = None
@@ -510,7 +511,7 @@ class TreeWriter:
 
         conflicts: list[str] = []
 
-        def same(left: ManifestEntry | None, right: ManifestEntry | None) -> bool:
+        def same(left: Entry | None, right: Entry | None) -> bool:
             if left is None or right is None:
                 return left is right
             return left.hash == right.hash and left.size == right.size
@@ -519,7 +520,7 @@ class TreeWriter:
         ours = next(ours_iter, None)
         theirs = next(theirs_iter, None)
 
-        def merged_stream() -> Iterator[ManifestEntry]:
+        def merged_stream() -> Iterator[Entry]:
             nonlocal base, ours, theirs
 
             def advance() -> None:
@@ -588,13 +589,15 @@ class TreeWriter:
     def splice_tree(
         self,
         parent_tree: str | None,
-        additions: list[ManifestEntry],
+        additions: list[Entry],
         removed_prefixes: set[str],
     ) -> str:
-        """Merge additions and removals into the parent tree via recursive path-splicing.
+        """Merge additions and removals into the parent tree via recursive
+        path-splicing.
 
-        Unlike full-manifest flattening, this only visits directories along the path
-        of modified leaves. Untouched subtrees are reused purely by content hash in O(1).
+        Unlike full-manifest flattening, this only visits directories
+        along the path of modified leaves. Untouched subtrees are reused
+        purely by content hash in O(1).
         """
         if not parent_tree:
             if not additions:
@@ -616,11 +619,11 @@ class TreeWriter:
         self,
         dir_path: str,
         tree_hash: str | None,
-        additions: list[ManifestEntry],
+        additions: list[Entry],
         removed_prefixes: set[str],
     ) -> str | None:
-        local_leaf_additions: dict[str, ManifestEntry] = {}
-        child_additions: dict[str, list[ManifestEntry]] = {}
+        local_leaf_additions: dict[str, Entry] = {}
+        child_additions: dict[str, list[Entry]] = {}
 
         prefix_len = len(dir_path) + 1 if dir_path else 0
         for entry in additions:
@@ -640,7 +643,7 @@ class TreeWriter:
                 raise ValueError(f"Unknown tree object: {tree_hash}")
 
             if any(e.kind == KIND_SHARD for e in entries):
-                unpacked: list[TreeEntry] = []
+                unpacked: list[Entry] = []
                 for e in entries:
                     shard_entries = self._walker.load_entries(e.hash)
                     if shard_entries:
@@ -651,7 +654,7 @@ class TreeWriter:
             handled_child_dirs: set[str] = set()
 
             for entry in entries:
-                name = entry.name
+                name = entry.path
                 full = f"{dir_path}/{name}" if dir_path else name
 
                 if entry.is_leaf:
@@ -683,8 +686,19 @@ class TreeWriter:
                         for prefix in removed_prefixes
                     )
 
-                    if not is_completely_removed and not has_removals_inside and not has_additions:
-                        kept.append((name, _subtree_line(entry.kind, name, entry.hash)))
+                    if (
+                        not is_completely_removed
+                        and not has_removals_inside
+                        and not has_additions
+                    ):
+                        kept.append(
+                            (
+                                entry.path,
+                                _subtree_line(
+                                    entry.kind, entry.path, entry.hash
+                                ),
+                            )
+                        )
                         continue
 
                     sub_adds = child_additions.get(name, [])
@@ -700,7 +714,14 @@ class TreeWriter:
                     else:
                         if new_sub_hash != entry.hash:
                             changed = True
-                        kept.append((name, _subtree_line(KIND_TREE, name, new_sub_hash)))
+                        kept.append(
+                            (
+                                name,
+                                _subtree_line(
+                                    KIND_TREE, name, new_sub_hash
+                                ),
+                            )
+                        )
 
             for name, new_leaf in local_leaf_additions.items():
                 if name not in handled_leaf_additions:
@@ -717,7 +738,14 @@ class TreeWriter:
                         removed_prefixes=removed_prefixes,
                     )
                     if new_sub_hash is not None:
-                        kept.append((child_name, _subtree_line(KIND_TREE, child_name, new_sub_hash)))
+                        kept.append(
+                            (
+                                child_name,
+                                _subtree_line(
+                                    KIND_TREE, child_name, new_sub_hash
+                                ),
+                            )
+                        )
                         changed = True
 
         else:
@@ -734,7 +762,14 @@ class TreeWriter:
                     removed_prefixes=removed_prefixes,
                 )
                 if new_sub_hash is not None:
-                    kept.append((child_name, _subtree_line(KIND_TREE, child_name, new_sub_hash)))
+                    kept.append(
+                        (
+                            child_name,
+                            _subtree_line(
+                                KIND_TREE, child_name, new_sub_hash
+                            ),
+                        )
+                    )
                     changed = True
 
         if not kept:
@@ -747,10 +782,11 @@ class TreeWriter:
         self,
         *,
         parent_tree: str,
-        additions: list[ManifestEntry],
+        additions: list[Entry],
         removed_prefixes: set[str],
     ) -> str:
-        """Merge materialized staged additions/removals into the parent tree via path-splicing."""
+        """Merge materialized staged additions/removals into the parent tree
+        via path-splicing."""
         return self.splice_tree(
             parent_tree=parent_tree,
             additions=additions,
@@ -765,7 +801,7 @@ class TreeWriter:
         parent_commit: str | None = None,
         parents: list[str] | None = None,
         tree_hash: str,
-        expected_version_token: str | None,
+        expected_commit_id: str | None,
         operation: str,
     ) -> str:
         """Create a commit object, persist it, and advance the branch ref via CAS.
@@ -779,20 +815,25 @@ class TreeWriter:
         generation = 0
         if parents:
             generation = (
-                max(self.refs.read_commit(parent_id).generation for parent_id in parents)
+                max(
+                    self.refs.read_commit(parent_id).generation
+                    for parent_id in parents
+                )
                 + 1
             )
-        created_at = datetime.now(timezone.utc).isoformat()
-        commit_body: dict[str, object] = {
+        created_at = datetime.now(UTC).isoformat()
+        # The commit id hashes only content (not timestamp, branch, or
+        # generation), so the same content always yields the same id across
+        # branches and retries are idempotent. ``created_at``/``branch`` are
+        # recorded in the stored payload for humans, not in the hash;
+        # ``generation`` is DAG-derivable and kept as a stored perf hint.
+        identity_body: dict[str, object] = {
             "message": message,
             "tree": tree_hash,
             "parents": parents,
-            "created_at": created_at,
-            "branch": branch,
-            "generation": generation,
         }
         canonical = json.dumps(
-            commit_body, sort_keys=True, separators=(",", ":")
+            identity_body, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         commit_id = blake3(canonical).hexdigest()
         commit_object = CommitObject(
@@ -805,147 +846,63 @@ class TreeWriter:
             generation=generation,
         )
         self.refs.cache_commit(commit_object)
+        stored = json.dumps(
+            {
+                "id": commit_id,
+                "message": message,
+                "tree": tree_hash,
+                "parents": parents,
+                "created_at": created_at,
+                "branch": branch,
+                "generation": generation,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
         self.store.write_commit_bytes(
             commit_id,
-            (
-                json.dumps(
-                    {
-                        "id": commit_id,
-                        "message": message,
-                        "tree": tree_hash,
-                        "parents": parents,
-                        "created_at": created_at,
-                        "branch": branch,
-                        "generation": generation,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n"
-            ).encode("utf-8"),
+            stored,
         )
         self.refs.update_branch_ref(
             branch=branch,
             commit_id=commit_id,
-            expected_version_token=expected_version_token,
-            expected_commit_id=parents[0] if parents else None,
+            expected_commit_id=expected_commit_id,
             operation=operation,
         )
         return commit_id
 
     # ── Derived manifest (optional per-client materialization) ───────────
 
-    def iter_tree_hashes(self, root_tree: str) -> Iterator[str]:
+    # ── Read-only inspection (delegated to TreeInspector) ────────────
+    # ``TreeWriter`` keeps these thin forwarders so existing callers
+    # (``repository.gc``, sync planning, VFS) are unaffected. New code
+    # should use ``writer.inspector`` (or ``TreeInspector``) directly.
+
+    def iter_tree_hashes(
+        self, root_tree: str, _seen: set[str] | None = None
+    ) -> Iterator[str]:
         """Yield every tree object hash reachable from *root_tree*."""
-        seen: set[str] = set()
-        stack = [root_tree]
-        while stack:
-            tree_hash = stack.pop()
-            if tree_hash in seen:
-                continue
-            seen.add(tree_hash)
-            yield tree_hash
-            entries = self._walker.load_entries(tree_hash)
-            if entries is None:
-                continue
-            for entry in reversed(entries):
-                if entry.is_subtree:
-                    stack.append(entry.hash)
+        yield from self.inspector.iter_tree_hashes(root_tree, _seen=_seen)
 
-    def iter_leaf_refs(self, root_tree: str) -> Iterator[tuple[str | None, str | None]]:
-        """Yield ``(blob_hash, footer_hash)`` for every leaf in the tree DAG.
-
-        Metadata-only leaves yield ``(None, None)`` — they reference no
-        canonical object.  Used by GC to compute the reachable set.
-        """
-        from ..objects.tree import KIND_BLOB, KIND_BP
-
-        seen_trees: set[str] = set()
-        stack = [root_tree]
-        while stack:
-            tree_hash = stack.pop()
-            if tree_hash in seen_trees:
-                continue
-            seen_trees.add(tree_hash)
-            entries = self._walker.load_entries(tree_hash)
-            if entries is None:
-                continue
-            for entry in entries:
-                if entry.is_subtree:
-                    stack.append(entry.hash)
-                elif entry.kind in (KIND_BLOB, KIND_BP):
-                    yield entry.hash, entry.footer
-                elif entry.footer is not None:
-                    yield None, entry.footer
+    def iter_leaf_refs(
+        self,
+        root_tree: str,
+        _seen_trees: set[str] | None = None,
+    ) -> Iterator[tuple[str | None, str | None]]:
+        """Yield ``(blob_hash, footer_hash)`` for every leaf in the tree DAG."""
+        yield from self.inspector.iter_leaf_refs(
+            root_tree, _seen_trees=_seen_trees
+        )
 
     def export_derived_manifest(self, tree_hash: str) -> Path:
-        """Flatten *tree_hash* into a JSONL manifest with block offsets.
-
-        The artifact (and its block index sidecar) is cached in local client
-        state keyed by the root-tree hash (content-addressed ⇒ cache-safe) and
-        is never written to the shared store.
-        """
-        if self.client_state is None:
-            raise RuntimeError("TreeWriter has no client_state for derived exports")
-        cache_path = self.client_state.derived_manifest_path(tree_hash)
-        if cache_path.exists():
-            return cache_path
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(mode="wb", suffix=".jsonl", delete=False) as temp:
-            temp_path = Path(temp.name)
-        writer = ManifestWriter(temp_path, block_entry_count=DERIVED_BLOCK_ENTRY_COUNT)
-        writer.write_entries(
-            (entry.path, entry.serialize())
-            for entry in self._walker.iter_all_entries(tree_hash)
-        )
-        index = writer.build_index()
-        if index is not None:
-            self.client_state.write_derived_index(tree_hash, index)
-        temp_path.replace(cache_path)
-        return cache_path
+        """Flatten *tree_hash* into a JSONL manifest with block offsets."""
+        return self.inspector.export_derived_manifest(tree_hash)
 
     def lookup_derived_entry(
         self, tree_hash: str, logical_path: str
-    ) -> ManifestEntry | None:
-        """Point lookup through the cached derived manifest (optional path).
-
-        Binary-searches the block index and range-reads one slice of the
-        JSONL manifest.  Falls back to a tree-walk lookup when the derived
-        manifest has not been materialized.
-        """
-        if self.client_state is None:
-            return None
-        cache_path = self.client_state.derived_manifest_path(tree_hash)
-        if not cache_path.exists():
-            return None
-        from ..objects.derived import load_derived_index
-
-        index = self.client_state.read_derived_index(tree_hash)
-        if index is None or index.is_empty:
-            return None
-        paths = [block.first_path for block in index.blocks]
-        block_index = _lookup_block_index(paths, logical_path)
-        if block_index is None:
-            return None
-        block = index.blocks[block_index]
-        end = (
-            index.blocks[block_index + 1].offset
-            if block_index + 1 < len(index.blocks)
-            else index.manifest_size
-        )
-        with cache_path.open("rb") as handle:
-            handle.seek(block.offset)
-            slice_bytes = handle.read(end - block.offset)
-        for raw_line in slice_bytes.decode("utf-8").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            entry = ManifestEntry.deserialize(line)
-            if entry.path == logical_path:
-                return entry
-            if entry.path > logical_path:
-                break
-        return None
+    ) -> Entry | None:
+        """Point lookup through the cached derived manifest (optional path)."""
+        return self.inspector.lookup_derived_entry(tree_hash, logical_path)
 
 
 def _close_frame(
@@ -966,7 +923,7 @@ def _close_frame(
 
 
 def _merge_parent_children(
-    children: list[_Child], parent_by_name: dict[str, TreeEntry] | None
+    children: list[_Child], parent_by_name: dict[str, Entry] | None
 ) -> list[_Child]:
     """Fold parent-only entries into the worktree children (sorted by name).
 

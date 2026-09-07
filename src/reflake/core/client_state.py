@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from datetime import UTC
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from collections.abc import Iterator
-
 from .domain import BranchRefState
 from .objects.derived import DerivedIndex, load_derived_index
-
 
 HEAD_FILE = "HEAD"
 
@@ -37,13 +36,17 @@ class LocalClientState:
             path.mkdir(parents=True, exist_ok=True)
 
     def append_reflog(
-        self, branch: str, old_commit: str | None, new_commit: str | None, operation: str
+        self,
+        branch: str,
+        old_commit: str | None,
+        new_commit: str | None,
+        operation: str,
     ) -> None:
         """Record a ref update (client-side reflog, one line per entry)."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         path = self.reflog_dir / f"{branch}.log"
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         old = old_commit or "0" * 64
         new = new_commit or "0" * 64
         line = f"{old} {new} {operation} {timestamp}\n"
@@ -115,7 +118,6 @@ class LocalClientState:
         return BranchRefState(
             branch=branch,
             commit_id=payload.get("commit_id"),
-            version_token=payload.get("version_token"),
         )
 
     def write_branch_snapshot(
@@ -123,13 +125,9 @@ class LocalClientState:
         branch: str,
         *,
         commit_id: str | None,
-        version_token: str | None,
     ) -> None:
         payload = json.dumps(
-            {
-                "commit_id": commit_id,
-                "version_token": version_token,
-            },
+            {"commit_id": commit_id},
             sort_keys=True,
         )
         self._atomic_write_text(self.branch_snapshot_path(branch), f"{payload}\n")

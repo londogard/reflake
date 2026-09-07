@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import json
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, BinaryIO, Callable
+from typing import Any, BinaryIO
 
 from blake3 import blake3
 
@@ -230,7 +231,11 @@ def parse_parquet_footer(source: BinaryIO) -> FooterStats:
     if tail[4:] != _PARQUET_MAGIC:
         raise ValueError("missing PAR1 magic — not a parquet file")
     footer_length = struct.unpack("<I", tail[:4])[0]
-    if footer_length <= 0 or footer_length > _MAX_FOOTER_SIZE or footer_length > end - 8:
+    if (
+        footer_length <= 0
+        or footer_length > _MAX_FOOTER_SIZE
+        or footer_length > end - 8
+    ):
         raise ValueError(f"invalid parquet footer length {footer_length}")
     source.seek(end - 8 - footer_length)
     footer_bytes = source.read(footer_length)
@@ -284,7 +289,10 @@ def _parse_file_metadata(data: bytes) -> FooterStats:
         else:
             reader.skip(field_type)
 
-    _read_fields(reader, {2: handle_schema, 3: handle_rows, 4: handle_row_groups, 6: handle_created_by})
+    _read_fields(
+        reader,
+        {2: handle_schema, 3: handle_rows, 4: handle_row_groups, 6: handle_created_by},
+    )
 
     schema = tuple(
         {"name": str(element["name"]), "type": str(element.get("type") or "")}
@@ -425,7 +433,13 @@ def _parse_column_metadata(reader: _Reader) -> ColumnStats:
 
         _read_fields(
             reader,
-            {1: stats_field(1), 2: stats_field(2), 3: stats_nulls, 5: stats_field(5), 6: stats_field(6)},
+            {
+                1: stats_field(1),
+                2: stats_field(2),
+                3: stats_nulls,
+                5: stats_field(5),
+                6: stats_field(6),
+            },
         )
 
     _read_fields(

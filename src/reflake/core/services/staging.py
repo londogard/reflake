@@ -12,13 +12,14 @@ import msgspec
 
 from ..client_state import LocalClientState
 from ..domain import StageChange, StageStatus
+from ..entry_codec import Entry
 from ..hashing import blake3_digest_file
-from ..manifest import FileEntry, ManifestEntry, walk_files
+from ..manifest import FileEntry, walk_files
+from ..objects import QueryRefStore, iter_s3_objects, parse_s3_uri
 from ..repository_support import (
     normalize_repository_path,
     normalize_s3_import_path,
 )
-from ..objects import ObjectStore, iter_s3_objects, parse_s3_uri
 from .refs import RefManager
 
 
@@ -28,7 +29,7 @@ class StagingArea:
         *,
         client_state: LocalClientState,
         root: Path,
-        store: ObjectStore,
+        store: QueryRefStore,
         refs: RefManager,
     ) -> None:
         self.client_state = client_state
@@ -239,7 +240,7 @@ class StagingArea:
         head_commit = branch_ref.commit_id if branch_ref else None
         if head_commit is None:
             manifest_paths: set[str] = set()
-            manifest_by_path: dict[str, ManifestEntry] = {}
+            manifest_by_path: dict[str, Entry] = {}
         else:
             commit_obj = self.refs.read_commit(head_commit)
             manifest_by_path = {

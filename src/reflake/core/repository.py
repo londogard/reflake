@@ -1,32 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator, Literal
+from typing import Any, BinaryIO, Literal
 
 from blake3 import blake3
 
 from .client_state import LocalClientState
 from .config import BaseConfig, S3Config
-from .hashing import blake3_digest_file
-from .layout import initialize_reflake_layout
-from .manifest import ManifestEntry
-from .objects import (
-    LocalObjectStore,
-    ObjectStore,
-    S3ObjectStore,
-)
-from .repository_support import merge_base_commit, matches_logical_path
-from .services.entries import EntryFactory
-from .services.refs import RefManager
-from .services.staging import StagingArea
-from .services.tree import TreeWriter
-from .objects import (
-    BlobTransferBackend,
-    build_blob_transfer_backend,
-    build_s3_client,
-    parse_s3_uri,
-)
-
 from .domain import (
     CommitObject,
     DiffEntry,
@@ -41,6 +22,22 @@ from .domain import (
     StageStatus,
     VerifyResult,
 )
+from .entry_codec import Entry
+from .layout import initialize_reflake_layout
+from .objects import (
+    BlobTransferBackend,
+    LocalObjectStore,
+    RepositoryStore,
+    S3ObjectStore,
+    build_blob_transfer_backend,
+    build_s3_client,
+    parse_s3_uri,
+)
+from .repository_support import matches_logical_path, merge_base_commit
+from .services.entries import EntryFactory
+from .services.refs import RefManager
+from .services.staging import StagingArea
+from .services.tree import TreeWriter
 
 
 class ReflakeRepository:
@@ -48,7 +45,7 @@ class ReflakeRepository:
         self,
         root: str | Path,
         *,
-        store: ObjectStore | None = None,
+        store: RepositoryStore | None = None,
         client_state: LocalClientState | None = None,
         blob_transfer: BlobTransferBackend | None = None,
     ) -> None:
@@ -59,13 +56,7 @@ class ReflakeRepository:
             config.validate()
         self.store = store or LocalObjectStore(self.layout.root)
         if isinstance(self.store, S3ObjectStore) and blob_transfer is not None:
-            self.store = S3ObjectStore(
-                self.store.bucket,
-                self.store.prefix,
-                client=self.store.client,
-                branch_root=self.store.branch_root,
-                blob_transfer=blob_transfer,
-            )
+            self.store.transfer_backend = blob_transfer
         self.client_state = client_state or LocalClientState(self.layout.root)
         self.refs = RefManager(store=self.store, client_state=self.client_state)
         self.tree_writer = TreeWriter(
@@ -101,7 +92,7 @@ class ReflakeRepository:
     def resolve_ref(self, branch_or_commit: str) -> str:
         return self.refs.resolve_ref(branch_or_commit)
 
-    def branch(self, name: str) -> Path:
+    def branch(self, name: str) -> str:
         return self.refs.branch(name)
 
     def merge(self, source_ref: str, target_ref: str) -> MergeResult:
@@ -161,7 +152,7 @@ class ReflakeRepository:
             message=f"merge {source_ref} into {target_ref}",
             parents=[target_commit, source_commit],
             tree_hash=merged_tree,
-            expected_version_token=branch_state.version_token,
+            expected_commit_id=branch_state.commit_id,
             operation="merge",
         )
         return MergeResult(
@@ -200,9 +191,9 @@ class ReflakeRepository:
             raise ValueError("Commit message cannot be empty")
 
         config = BaseConfig.load(self.root)
-        identity_mode = config.identity if config else "blake3"
-        if identity_mode not in ("blake3", "meta"):
-            identity_mode = "blake3"
+        identity_mode = config.identity if config else "content"
+        if identity_mode not in ("content", "pointer"):
+            identity_mode = "content"
         capture_footers = bool(config.parquet_footer) if config else False
 
         branch = self.current_branch()
@@ -221,7 +212,7 @@ class ReflakeRepository:
         # overlay them onto the parent; full commits treat them as part of
         # the effective parent (v1 semantics — staged adds survive a full
         # commit even when the source file is gone).
-        additions: list[ManifestEntry] = []
+        additions: list[Entry] = []
         if staged_additions:
             additions = [
                 self.entries.entry_from_stage_change(
@@ -274,7 +265,7 @@ class ReflakeRepository:
                     message=message,
                     parent_commit=parent_commit,
                     tree_hash=root_tree,
-                    expected_version_token=branch_state.version_token,
+                    expected_commit_id=parent_commit,
                     operation="commit",
                 )
                 break
@@ -297,7 +288,7 @@ class ReflakeRepository:
         self,
         source_uri: str,
         message: str,
-        identity_mode: Literal["blake3", "meta"] = "blake3",
+        identity_mode: Literal["content", "pointer"] = "content",
         *,
         path_patterns: list[str] | None = None,
         ref: str | None = None,
@@ -318,7 +309,7 @@ class ReflakeRepository:
         paths: list[str],
         *,
         ref: str | None = None,
-        identity_mode: str = "blake3",
+        identity_mode: str = "content",
         destination_path: str | None = None,
     ) -> StageStatus:
         from .repository_ops import repo_add
@@ -471,22 +462,35 @@ class ReflakeRepository:
         self,
         ref: str | None = None,
         path_prefixes: list[str] | None = None,
-        *,
-        dry_run: bool = False,
     ) -> VerifyResult:
+        """Audit pointer entries without writing anything (read-only).
+
+        Returns the promotion report; ``created_commit`` is always False.
+        Use :meth:`promote` to materialize canonical blobs.
+        """
         from .repository_ops import repo_verify
 
-        return repo_verify(self, ref, path_prefixes, dry_run=dry_run)
+        return repo_verify(self, ref, path_prefixes, dry_run=True)
 
-    def _tree_entries(self, tree_hash: str) -> dict[str, ManifestEntry]:
-        index: dict[str, ManifestEntry] = {}
+    def promote(
+        self,
+        ref: str | None = None,
+        path_prefixes: list[str] | None = None,
+    ) -> VerifyResult:
+        """Promote pointer entries to content blobs, committing the result."""
+        from .repository_ops import repo_verify
+
+        return repo_verify(self, ref, path_prefixes, dry_run=False)
+
+    def _tree_entries(self, tree_hash: str) -> dict[str, Entry]:
+        index: dict[str, Entry] = {}
         for entry in self.store.iter_all_entries(tree_hash):
             index[entry.path] = entry
         return index
 
     def resolve_entries(
         self, ref: str, *, include_staging: bool = False
-    ) -> dict[str, ManifestEntry]:
+    ) -> dict[str, Entry]:
         commit = self.refs.read_commit(self.refs.resolve_ref(ref))
         index = self._tree_entries(commit.tree)
         if include_staging:
@@ -497,7 +501,7 @@ class ReflakeRepository:
                 if change.action == "add":
                     index[change.path] = self.entries.entry_from_stage_change(
                         change,
-                        change.identity_mode or "blake3",
+                        change.identity_mode or "content",
                         store_blob=False,
                     )
         return index
@@ -509,7 +513,7 @@ class ReflakeRepository:
         *,
         include_staging: bool = False,
         commit_id: str | None = None,
-    ) -> dict[str, ManifestEntry]:
+    ) -> dict[str, Entry]:
         normalized_prefix = logical_prefix.strip("/")
         resolved_commit_id = commit_id or self.refs.resolve_ref(ref)
         commit = self.refs.read_commit(resolved_commit_id)
@@ -538,7 +542,7 @@ class ReflakeRepository:
                 if change.action == "add":
                     index[change.path] = self.entries.entry_from_stage_change(
                         change,
-                        change.identity_mode or "blake3",
+                        change.identity_mode or "content",
                         store_blob=False,
                     )
         return index
@@ -550,7 +554,7 @@ class ReflakeRepository:
         *,
         include_staging: bool = False,
         commit_id: str | None = None,
-    ) -> ManifestEntry | None:
+    ) -> Entry | None:
         normalized_path = logical_path.strip("/")
         if not normalized_path:
             return None
@@ -563,7 +567,7 @@ class ReflakeRepository:
                 if change.action == "add":
                     return self.entries.entry_from_stage_change(
                         change,
-                        change.identity_mode or "blake3",
+                        change.identity_mode or "content",
                         store_blob=False,
                     )
 
@@ -617,22 +621,39 @@ class ReflakeRepository:
         reachable_blobs: set[str] = set()
         reachable_footers: set[str] = set()
 
+        # Collect the full commit DAG first (all parents — merge commits
+        # have two), then walk each unique tree once. The per-tree memo
+        # keeps GC O(T) instead of O(C·T) on shared subtrees.
+        pending: list[str] = []
         for branch in self.store.iter_branches():
             state = self.store.read_branch_ref(branch)
-            commit_id = state.commit_id if state else None
-            while commit_id and commit_id not in reachable_commits:
-                reachable_commits.add(commit_id)
-                commit = self.refs.read_commit(commit_id)
-                for tree_hash in self.tree_writer.iter_tree_hashes(commit.tree):
-                    reachable_trees.add(tree_hash)
-                for blob_hash, footer_hash in self.tree_writer.iter_leaf_refs(
-                    commit.tree
-                ):
-                    if blob_hash:
-                        reachable_blobs.add(blob_hash)
-                    if footer_hash:
-                        reachable_footers.add(footer_hash)
-                commit_id = commit.first_parent
+            if state and state.commit_id:
+                pending.append(state.commit_id)
+        # Global memo so shared subtrees are walked once across commits.
+        # NOTE: only iter_tree_hashes shares the memo — iter_leaf_refs
+        # gets a fresh walk per commit because sharing the same set
+        # would skip leaves of already-listed trees (blobs/footers would
+        # go missing from the reachable set). Re-yielded blob hashes are
+        # deduplicated by the reachable_* sets.
+        seen_trees: set[str] = set()
+        while pending:
+            commit_id = pending.pop()
+            if commit_id in reachable_commits:
+                continue
+            reachable_commits.add(commit_id)
+            commit = self.refs.read_commit(commit_id)
+            for tree_hash in self.tree_writer.iter_tree_hashes(
+                commit.tree, _seen=seen_trees
+            ):
+                reachable_trees.add(tree_hash)
+            for blob_hash, footer_hash in self.tree_writer.iter_leaf_refs(
+                commit.tree
+            ):
+                if blob_hash:
+                    reachable_blobs.add(blob_hash)
+                if footer_hash:
+                    reachable_footers.add(footer_hash)
+            pending.extend(commit.parents)
 
         counts: dict[str, tuple[int, int]] = {}
         pruned_any = False
@@ -679,7 +700,7 @@ class ReflakeRepository:
         branch_name = branch or self.current_branch()
         yield from self.client_state.iter_reflog(branch_name)
 
-    def catalog(self) -> list[dict[str, Any]]:
+    def branches(self) -> list[dict[str, Any]]:
         datasets: list[dict[str, Any]] = []
         for branch_name in sorted(self.store.iter_branches()):
             state = self.store.read_branch_ref(branch_name)
@@ -712,6 +733,49 @@ def _find_repo_root(start: str | Path, *, must_exist: bool = False) -> Path:
         current = parent
 
 
+def init_repository(
+    root: str | Path,
+    *,
+    default_branch: str = "main",
+) -> Path:
+    """Create a local repository: layout, default config, empty branch ref.
+
+    Idempotent like ``git init``: running it on an existing repository only
+    fills in missing pieces (never overwrites config or refs). Opening a
+    repository never mutates it — all creation goes through here.
+    """
+    from .config import init_config
+
+    repo_root = Path(root).resolve()
+    initialize_reflake_layout(repo_root, create_dirs=True)
+    config_path = repo_root / ".reflake" / "config.json"
+    if not config_path.exists():
+        init_config(repo_root, backend="local", default_branch=default_branch).save(
+            repo_root
+        )
+    store = LocalObjectStore(repo_root)
+    if store.read_branch_ref(default_branch) is None:
+        store.compare_and_set_branch_ref(
+            default_branch, None, expected_commit_id=None
+        )
+    return repo_root
+
+
+def create_repository(
+    root: str | Path,
+    *,
+    default_branch: str = "main",
+    **open_kwargs: Any,
+) -> ReflakeRepository:
+    """Ensure a repository exists at *root* (init if needed) and open it.
+
+    S3 URIs skip the local init step — remote opens stay lazy.
+    """
+    if not (isinstance(root, str) and root.startswith("s3://")):
+        init_repository(root, default_branch=default_branch)
+    return open_repository(root, **open_kwargs)
+
+
 def open_repository(
     root: str | Path,
     *,
@@ -720,7 +784,7 @@ def open_repository(
     s3_client: object | None = None,
     s3_endpoint: str | None = None,
     blob_transfer: BlobTransferBackend | str | None = None,
-    must_exist: bool = False,
+    must_exist: bool = True,
 ) -> ReflakeRepository:
     if isinstance(root, str) and root.startswith("s3://"):
         bucket, prefix = parse_s3_uri(root)
@@ -730,7 +794,9 @@ def open_repository(
             if client_root
             else _default_remote_client_root(worktree_root, root)
         )
-        store_client = s3_client if s3_client is not None else build_s3_client(s3_endpoint)
+        store_client = (
+            s3_client if s3_client is not None else build_s3_client(s3_endpoint)
+        )
         if isinstance(blob_transfer, str):
             blob_transfer = build_blob_transfer_backend(
                 blob_transfer, endpoint_url=s3_endpoint
@@ -741,7 +807,6 @@ def open_repository(
                 bucket,
                 prefix,
                 client=store_client,
-                branch_root=worktree_root / ".reflake" / "refs" / "heads",
                 blob_transfer=blob_transfer,
             ),
             client_state=LocalClientState(resolved_client_root),
@@ -768,7 +833,9 @@ def open_repository(
             config.transfer_backend, endpoint_url=endpoint
         )
     elif isinstance(blob_transfer, str):
-        blob_transfer = build_blob_transfer_backend(blob_transfer, endpoint_url=endpoint)
+        blob_transfer = build_blob_transfer_backend(
+            blob_transfer, endpoint_url=endpoint
+        )
 
     if isinstance(config, S3Config):
         bucket = config.bucket
@@ -784,7 +851,6 @@ def open_repository(
                 bucket,
                 prefix,
                 client=store_client,
-                branch_root=worktree_root / ".reflake" / "refs" / "heads",
                 blob_transfer=blob_transfer,
             ),
             client_state=LocalClientState(resolved_client_root),

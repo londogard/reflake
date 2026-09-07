@@ -6,8 +6,81 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
 
 ## Unreleased
 
+### Breaking pre-1.0 cleanup
+
+No backcompat is kept for anything below — this is the last window for it.
+
+- **Commit IDs are content-only**: `id = blake3(message, tree, parents)`.
+  `branch`, `generation` (DAG-derivable perf hint, still stored), and
+  `created_at` are recorded, not hashed — identical content yields identical
+  ids across branches and retries are idempotent. Stored commit objects are
+  compact canonical JSON instead of pretty-printed (parsed identically).
+- **Identity modes renamed**: `blake3` → `content`, `meta` → `pointer`
+  (persisted in every entry, CLI `--identity`, and config). The algorithm
+  name no longer leaks into UX; `pointer` says what it is.
+- **Single `Entry` record** (`core/entry_codec.py`): the `LeafRecord` /
+  `ManifestEntry` / `TreeEntry` trio is gone — one frozen dataclass with
+  `kind`-derived `identity_mode`/`blob_hash`, plus `CorruptEntryError` to
+  distinguish unparseable lines from invalid entries. Validation is kept off
+  the hot path: C-speed hex/path checks, and a plain `encode_leaf_parts()`
+  serializer for producer-guaranteed values — every `Entry` instance stays
+  valid, no exceptions. The 1M-file commit benchmark holds at ~19k files/sec.
+- **CAS on commit ids, version tokens deleted**: `BranchRefState` is
+  `(branch, commit_id)`; `compare_and_set_branch_ref` takes only
+  `expected_commit_id` (`None` = must-not-exist). S3 keeps its ETag purely
+  internal. Client snapshots, `RefManager` caches, and the ETag-quoting code
+  collapse accordingly.
+- **`branch_path()` removed** from the store protocol (`RefManager.branch()`
+  returns the branch name); local locking is portable (`fcntl`/`msvcrt`).
+- **`TransferPlan` replaces batch tuples**: `BlobTransferBackend` now has one
+  `transfer(plan)` entry point with a `direction` enum; s5cmd rejects paths
+  containing newlines (line-delimited manifest injection hardening).
+- **Open never mutates**: `open_repository()` defaults to `must_exist=True`
+  (`NotARepositoryError` otherwise); all creation goes through new
+  `init_repository()` (idempotent, git-style) / `create_repository()`.
+  The implicit default-config write on open is gone. `pull`/`fetch` bootstrap
+  an empty local dir (clone flow); `push` requires a repo.
+- **Global `--repo` / `--json`** (`reflake --repo <uri> [--json] <command>`);
+  per-command copies removed.
+- **`catalog` → `branches`** (plus `ls` alias for `list`).
+- **`verify` is read-only** (exits non-zero while pointer entries remain);
+  new **`promote`** command does the materializing commit.
+- **Exit-code contract**: `0` ok · `1` usage/validation · `2` retryable
+  conflict (`RefConflictError`, `NonFastForwardError`, `MergeConflictError`)
+  · `3` missing ref/object; `--json` failures emit an error envelope on
+  stderr.
+- **Public Python API frozen** (see README): `init/create/open_repository`,
+  `ReflakeRepository`, `ReflakeFileSystem`, `push`/`pull`/`fetch`, error
+  types. `core.services` / `core.objects` internals carry no stability
+  guarantees.
+
 ### Changed
 
+- **Deterministic commit IDs**: the commit id now hashes only content
+  — `created_at` is recorded in the payload but excluded from the hash, so
+  identical content yields identical ids and retries are idempotent. Stored
+  commit objects are now compact canonical JSON instead of pretty-printed
+  (parsed identically). Old commits remain readable; only newly created ids
+  use the new scheme.
+- **Structural refactor — `TreeInspector` split from `TreeWriter`**:
+  GC enumeration (`iter_tree_hashes`, `iter_leaf_refs`) and the
+  derived-manifest cache live in `core/services/tree_inspect.py`;
+  `TreeWriter` keeps thin delegating methods, so existing callers are
+  unaffected and new code can depend on the read-only inspector.
+- **Structural refactor — transfer endpoints out of `StoreInventory`**:
+  `object_path` / `object_uri` moved to `HasLocalPath` / `HasRemoteURI`;
+  `S3ObjectStore` no longer raises `NotImplementedError` for a method it
+  cannot provide, and sync planning fails with a clear `TypeError` instead.
+  Services now annotate narrow compositions (`RefObjectStore`,
+  `ContentQueryStore`, `QueryRefStore`, `RepositoryStore`).
+- **Batch sync is direction-aware**: `BlobTransferBackend` executes a
+  `TransferPlan` (`direction` + items) through one `transfer()` entry point;
+  `pull`/`fetch` through `s5cmd` no longer issue uploads for downloads, and
+  batch paths are rejected if they contain newlines.
+- Local blob writes are atomic (temp file + rename, verified hash) and
+  hash-verified on write (`ValueError` on mismatch, no partial residue);
+  the S3 buffered transfer path verifies too. Fixes torn-blob poisoning
+  where a crashed write could stick forever behind `if_missing` guards.
 - **Structural refactor — capability-split store protocols**: `ObjectStore` is
   now the composition of `ObjectIO`, `RefCas`, `TreeQuery`, and
   `StoreInventory`; services annotate against the narrow capability they use
@@ -28,15 +101,16 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
   dispatch, field rules, encoding, and decoding now live in exactly one module
   shared by manifests and trees; adding a leaf attribute touches the codec and
   the record types instead of every serializer.
-- **Slimmer `ManifestEntry`** *(breaking)*: `identity_value` and `blob_hash`
-  are derived properties (identity is always `hash`; the blob hash exists
-  exactly when `identity_mode == "blake3"`) and are no longer constructor
-  fields. Blob-backed entries can no longer carry `source_uri` — previously it
-  was stored in memory but silently dropped on serialization.
+- **Slimmer entries, then a single `Entry`** *(breaking)*: `identity_value`
+  and `blob_hash` were derived properties first (identity is always `hash`;
+  the blob hash exists exactly when the entry is content-backed), then the
+  whole `LeafRecord` / `ManifestEntry` / `TreeEntry` trio collapsed into one
+  `Entry` record. Blob-backed entries can no longer carry `source_uri` —
+  previously it was stored in memory but silently dropped on serialization.
 - **Repository facade removal** *(breaking)*: the ~20 module-level convenience
   functions (`commit(root, ...)`, `add(root, ...)`, `cat`, `catalog`, …) are
   gone; the Python API is `open_repository()` plus `ReflakeRepository`
-  methods, which now include `move_staged`, `cat`, `reflog`, and `catalog`.
+  methods, which now include `move_staged`, `cat`, `reflog`, and `branches`.
   `repository_ops` imports its types from `domain`, eliminating all runtime
   circular imports.
 - New typed domain errors: `UnknownRefError`, `EmptyBranchError`,
@@ -50,9 +124,21 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
 - Removed dead code: unused `RepositoryObjectKind` members, duplicate
   `AnalyticalIndexPaths` definition, unreachable manifest validation branches,
   and the hidden `_leftover_additions_dirs` side channel.
+- **CI quality gates**: `ruff check` + `pyrefly check` run on every push/PR,
+  tests matrix across Python 3.11/3.12/3.13, clean-tree check ignores `dist/`,
+  CI concurrency cancels superseded runs. `bench/bench.txt` moved out of
+  `.github/workflows/`.
+- **Operator runbook rewritten** for the v2 tree model and CAS-only
+  concurrency: lock/`manifests/*.idx` procedures removed, `trees/` +
+  `footers/` backup layout, `gc --prune` and footer-backfill operations
+  documented.
 
 ### Fixed
 
+- **`gc --prune` no longer deletes merged lineage**: reachability now walks
+  *all* commit parents (BFS from every branch head) instead of the
+  first-parent chain, so second parents of 3-way merge commits — and their
+  trees/blobs — survive pruning. Tree walks are memoized across commits.
 - **`commit --staged` no longer fails when a newly staged path sorts before an
   existing one**: the staged overlay now merges the parent tree and the
   additions as two sorted streams instead of appending leftovers at the end.

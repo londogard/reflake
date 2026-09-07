@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, BinaryIO, Iterator
+from typing import Any, BinaryIO
 
 from botocore.exceptions import ClientError
 
@@ -14,8 +15,8 @@ from ..domain import (
     RepositoryObjectKind,
     StorageUnavailableError,
 )
+from ..entry_codec import Entry
 from ..layout import object_relative_key
-from ..manifest import ManifestEntry
 from .backends import BlobTransferBackend
 from .query import TreeCache, TreeWalker
 from .source import _s3_is_404, _s3_is_precondition_failed, build_s3_client
@@ -28,13 +29,11 @@ class S3ObjectStore:
         prefix: str = "",
         *,
         client: Any | None = None,
-        branch_root: str | Path | None = None,
         blob_transfer: BlobTransferBackend | None = None,
     ) -> None:
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self.client = client or build_s3_client()
-        self.branch_root = Path(branch_root).resolve() if branch_root else None
         self.tree_cache = TreeCache()
         self._walker = TreeWalker(
             read_tree=self.read_tree_bytes,
@@ -46,14 +45,12 @@ class S3ObjectStore:
     def transfer_backend(self) -> BlobTransferBackend | None:
         return self._blob_transfer
 
+    @transfer_backend.setter
+    def transfer_backend(self, backend: BlobTransferBackend | None) -> None:
+        self._blob_transfer = backend
+
     def object_uri(self, kind: RepositoryObjectKind, object_id: str) -> str:
         return f"s3://{self.bucket}/{self._key(kind, object_id)}"
-
-    def object_path(self, kind: RepositoryObjectKind, object_id: str) -> Path:
-        raise NotImplementedError(
-            "S3ObjectStore keeps objects in bucket storage; transfer plans "
-            "require a local source or destination store"
-        )
 
     def read_commit_bytes(self, commit_id: str) -> bytes | None:
         try:
@@ -64,7 +61,7 @@ class S3ObjectStore:
         except ClientError as error:
             if self._missing(error):
                 return None
-            raise self._translate(error, "read_commit_bytes")
+            raise self._translate(error, "read_commit_bytes") from error
         return response["Body"].read()
 
     def write_commit_bytes(
@@ -88,7 +85,7 @@ class S3ObjectStore:
                 raise OptimisticLockError(
                     f"Commit already exists: {commit_id}"
                 ) from error
-            raise self._translate(error, "write_commit_bytes")
+            raise self._translate(error, "write_commit_bytes") from error
 
     def read_tree_bytes(self, tree_hash: str) -> bytes | None:
         try:
@@ -99,7 +96,7 @@ class S3ObjectStore:
         except ClientError as error:
             if self._missing(error):
                 return None
-            raise self._translate(error, "read_tree_bytes")
+            raise self._translate(error, "read_tree_bytes") from error
         return response["Body"].read()
 
     def write_tree_bytes(
@@ -150,7 +147,7 @@ class S3ObjectStore:
         except ClientError as error:
             if self._missing(error):
                 return None
-            raise self._translate(error, "read_footer_bytes")
+            raise self._translate(error, "read_footer_bytes") from error
         return response["Body"].read()
 
     def write_footer_file(
@@ -173,17 +170,17 @@ class S3ObjectStore:
                     return
                 raise
 
-    def iter_all_entries(self, tree_hash: str) -> Iterator[ManifestEntry]:
+    def iter_all_entries(self, tree_hash: str) -> Iterator[Entry]:
         yield from self._walker.iter_all_entries(tree_hash)
 
     def lookup_entry(
         self, tree_hash: str, logical_path: str
-    ) -> ManifestEntry | None:
+    ) -> Entry | None:
         return self._walker.lookup_entry(tree_hash, logical_path)
 
     def iter_entries_for_prefix(
         self, tree_hash: str, logical_prefix: str
-    ) -> Iterator[ManifestEntry]:
+    ) -> Iterator[Entry]:
         yield from self._walker.iter_entries_for_prefix(tree_hash, logical_prefix)
 
     def read_branch_ref(self, branch: str) -> BranchRefState | None:
@@ -193,18 +190,9 @@ class S3ObjectStore:
         except ClientError as error:
             if self._missing(error):
                 return None
-            raise self._translate(error, "read_branch_ref")
+            raise self._translate(error, "read_branch_ref") from error
         commit_id = response["Body"].read().decode("utf-8").strip() or None
-        return BranchRefState(
-            branch=branch,
-            commit_id=commit_id,
-            version_token=response.get("ETag", "").strip('"') or None,
-        )
-
-    def branch_path(self, branch: str) -> Path:
-        if self.branch_root is not None:
-            return self.branch_root / branch
-        return Path(".reflake") / "refs" / "heads" / branch
+        return BranchRefState(branch=branch, commit_id=commit_id)
 
     def write_branch_ref(
         self,
@@ -214,7 +202,7 @@ class S3ObjectStore:
         if_match: str | None = None,
         if_none_match: str | None = None,
     ) -> None:
-        payload = f"{commit_id}\n".encode("utf-8") if commit_id else b""
+        payload = f"{commit_id}\n".encode() if commit_id else b""
         kwargs: dict[str, Any] = {
             "Bucket": self.bucket,
             "Key": self._key("ref", branch),
@@ -232,36 +220,45 @@ class S3ObjectStore:
         except ClientError as error:
             if self._precondition_failed(error):
                 raise PreconditionFailedError(
-                    f"Branch ref '{branch}' update failed precondition (version conflict)"
+                    f"Branch ref '{branch}' update failed "
+                    "precondition (version conflict)"
                 ) from error
-            raise self._translate(error, "write_branch_ref")
+            raise self._translate(error, "write_branch_ref") from error
 
     def compare_and_set_branch_ref(
         self,
         branch: str,
         commit_id: str | None,
         *,
-        expected_version_token: str | None,
-        expected_commit_id: str | None = None,
+        expected_commit_id: str | None,
     ) -> bool:
-        # Atomic CAS: uses S3 conditional PutObject (IfMatch / IfNoneMatch)
-        # to ensure no TOCTOU write races under concurrency.
-        current = self.read_branch_ref(branch)
-        current_version = current.version_token if current else None
-        if current_version != expected_version_token:
+        # Atomic CAS: read the current commit plus its ETag, compare commit
+        # ids in-process, then conditional-Put against the ETag we just read.
+        # The ETag stays an internal detail — callers reason only in commits.
+        key = self._key("ref", branch)
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as error:
+            if not self._missing(error):
+                raise self._translate(error, "compare_and_set_branch_ref") from error
+            response = None
+        current_commit_id = (
+            response["Body"].read().decode("utf-8").strip() or None
+            if response is not None
+            else None
+        )
+        if current_commit_id != expected_commit_id:
             return False
-        if expected_commit_id is not None:
-            current_commit_id = current.commit_id if current else None
-            if current_commit_id != expected_commit_id:
-                return False
 
         try:
-            if expected_version_token is None:
+            if response is None:
                 self.write_branch_ref(branch, commit_id, if_none_match="*")
             else:
-                self.write_branch_ref(
-                    branch, commit_id, if_match=expected_version_token
-                )
+                etag = response.get("ETag", "").strip('"') or None
+                if etag is None:
+                    # No ETag to condition on: refuse rather than write blind.
+                    return False
+                self.write_branch_ref(branch, commit_id, if_match=etag)
         except (PreconditionFailedError, OptimisticLockError):
             return False
         return True
@@ -282,7 +279,7 @@ class S3ObjectStore:
                     relative = key[len(prefix) :] if key.startswith(prefix) else key
                     yield relative
         except ClientError as error:
-            raise self._translate(error, "list_objects")
+            raise self._translate(error, "list_objects") from error
 
     def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]:
         if kind == "blob":
@@ -309,7 +306,7 @@ class S3ObjectStore:
                 Key=self._key(kind, object_id),
             )
         except ClientError as error:
-            raise self._translate(error, "delete_object")
+            raise self._translate(error, "delete_object") from error
 
     def _iter_keys(self, prefix: str) -> Iterator[str]:
         paginator = self.client.get_paginator("list_objects_v2")
@@ -335,7 +332,7 @@ class S3ObjectStore:
                 Key=self._key("blob", blob_hash),
             )
         except ClientError as error:
-            raise self._translate(error, "read_blob_bytes")
+            raise self._translate(error, "read_blob_bytes") from error
         return response["Body"].read()
 
     def open_blob(self, blob_hash: str) -> BinaryIO:
@@ -345,7 +342,7 @@ class S3ObjectStore:
                 Key=self._key("blob", blob_hash),
             )
         except ClientError as error:
-            raise self._translate(error, "open_blob")
+            raise self._translate(error, "open_blob") from error
         return response["Body"]
 
     def write_blob_file(
@@ -387,10 +384,16 @@ class S3ObjectStore:
         if self._blob_transfer is not None:
             temp_path: Path | None = None
             try:
+                from blake3 import blake3 as _blake3
+
+                hasher = _blake3()
                 with NamedTemporaryFile(delete=False) as temp:
                     temp_path = Path(temp.name)
                     while chunk := source.read(1024 * 1024):
+                        hasher.update(chunk)
                         temp.write(chunk)
+                if hasher.hexdigest() != blob_hash:
+                    raise ValueError(f"Blob hash mismatch for {blob_hash}")
                 if if_missing and self.object_exists("blob", blob_hash):
                     return
                 assert temp_path is not None
@@ -424,19 +427,7 @@ class S3ObjectStore:
         except ClientError as error:
             if self._missing(error):
                 return False
-            raise self._translate(error, "object_exists")
-
-    def version_token(self, kind: RepositoryObjectKind, object_id: str) -> str | None:
-        try:
-            response = self.client.head_object(
-                Bucket=self.bucket,
-                Key=self._key(kind, object_id),
-            )
-        except ClientError as error:
-            if self._missing(error):
-                return None
-            raise self._translate(error, "version_token")
-        return response.get("ETag", "").strip('"') or None
+            raise self._translate(error, "object_exists") from error
 
     def _key(self, kind: RepositoryObjectKind, object_id: str) -> str:
         relative_path = self._relative_path(kind, object_id)
@@ -451,7 +442,7 @@ class S3ObjectStore:
         self,
         *,
         key: str,
-        body: BinaryIO,
+        body: bytes | BinaryIO,
         if_missing: bool,
         error_message: str,
     ) -> None:
@@ -467,7 +458,7 @@ class S3ObjectStore:
         except ClientError as error:
             if if_missing and self._precondition_failed(error):
                 raise OptimisticLockError(error_message) from error
-            raise self._translate(error, "put_object")
+            raise self._translate(error, "put_object") from error
 
     def _missing(self, error: ClientError) -> bool:
         return _s3_is_404(error)

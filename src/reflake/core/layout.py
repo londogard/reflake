@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import LocalConfig
 from .domain import RepositoryObjectKind
 
 
@@ -21,7 +20,7 @@ class ReflakeLayout:
     heads_dir: Path
 
     @classmethod
-    def initialize(cls, root: str | Path, *, create_dirs: bool = True) -> "ReflakeLayout":
+    def initialize(cls, root: str | Path, *, create_dirs: bool = True) -> ReflakeLayout:
         root_path = Path(root).resolve()
         reflake_dir = root_path / ".reflake"
         blobs_dir = reflake_dir / "blobs"
@@ -60,13 +59,13 @@ class ReflakeLayout:
         )
 
 
-def initialize_reflake_layout(root: str | Path, *, create_dirs: bool = True) -> ReflakeLayout:
-    layout = ReflakeLayout.initialize(root, create_dirs=create_dirs)
-    config_path = layout.reflake_dir / "config.json"
-    if create_dirs and not config_path.exists():
-        default_config = LocalConfig(dataset_root=str(layout.root))
-        default_config.save(layout.root)
-    return layout
+def initialize_reflake_layout(
+    root: str | Path, *, create_dirs: bool = True
+) -> ReflakeLayout:
+    # Layout creation never writes config: repository config is created
+    # explicitly by init_repository() (or `reflake init`), so opening a
+    # repository can never mutate it.
+    return ReflakeLayout.initialize(root, create_dirs=create_dirs)
 
 
 def blob_relpath(content_hash: str) -> Path:

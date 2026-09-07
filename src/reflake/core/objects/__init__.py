@@ -15,18 +15,26 @@ from __future__ import annotations
 import boto3  # noqa: F401  – kept for monkeypatching in tests
 
 from ..domain import BranchRefState  # noqa: F401 – re-exported for callers
-
 from .backends import (
     BlobTransferBackend,
     LocalStorageBackend,
     S3ObjectMetadata,
     SourceObjectMetadata,
     StorageBackend,
+    TransferDirection,
+    TransferItem,
+    TransferPlan,
 )
 from .base import (
+    ContentQueryStore,
+    HasLocalPath,
+    HasRemoteURI,
     ObjectIO,
     ObjectStore,
+    QueryRefStore,
     RefCas,
+    RefObjectStore,
+    RepositoryStore,
     StoreInventory,
     TreeQuery,
 )
@@ -51,11 +59,17 @@ from .transfer import (
 __all__ = [
     "BlobTransferBackend",
     "BranchRefState",
+    "ContentQueryStore",
+    "HasLocalPath",
+    "HasRemoteURI",
     "LocalObjectStore",
     "LocalStorageBackend",
     "ObjectIO",
     "ObjectStore",
+    "QueryRefStore",
     "RefCas",
+    "RefObjectStore",
+    "RepositoryStore",
     "S3BlobTransferBackend",
     "S3ObjectMetadata",
     "S3ObjectStore",
@@ -64,6 +78,9 @@ __all__ = [
     "SourceObjectMetadata",
     "StorageBackend",
     "StoreInventory",
+    "TransferDirection",
+    "TransferItem",
+    "TransferPlan",
     "TreeQuery",
     "build_blob_transfer_backend",
     "build_s3_client",

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import cProfile
 import io
-import os
 import pstats
 import tempfile
 import time
@@ -39,7 +38,7 @@ def run() -> None:
 
         repo = ReflakeRepository(worktree)
         from reflake.core.config import LocalConfig
-        LocalConfig(dataset_root=str(worktree), identity="meta").save(worktree)
+        LocalConfig(dataset_root=str(worktree), identity="pointer").save(worktree)
 
         pr = cProfile.Profile()
         print("\nProfiling commit...")

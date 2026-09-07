@@ -6,25 +6,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from reflake.core import open_repository
+from reflake.core import create_repository
 from reflake.core.entry_codec import (
-    LeafRecord,
+    Entry,
     decode_leaf,
     encode_leaf,
     leaf_kind_for,
 )
 from reflake.core.layout import object_relative_key
-from reflake.core.manifest import ManifestEntry
-from reflake.core.objects.tree import TreeEntry, parse_tree_object, serialize_tree_object
+from reflake.core.objects.tree import parse_tree_object, serialize_tree_object
 from reflake.core.repository_support import merge_sorted_streams
-
 
 DIGEST = "a" * 64
 FOOTER = "b" * 64
 
 
-def _entry(path: str) -> ManifestEntry:
-    return ManifestEntry(path=path, hash="0" * 64, size=1, mtime_ns=2)
+def _entry(path: str) -> Entry:
+    return Entry(path=path, kind="b", hash="0" * 64, size=1, mtime_ns=2)
 
 
 def _make_commit(repo, name: str, message: str) -> str:
@@ -39,17 +37,17 @@ def _make_commit(repo, name: str, message: str) -> str:
 
 def test_leaf_codec_round_trips_every_shape() -> None:
     cases = [
-        LeafRecord(kind="b", name="f.txt", hash=DIGEST, size=1, mtime_ns=2),
-        LeafRecord(
-            kind="m", name="f.txt", hash=DIGEST, size=1, mtime_ns=2,
+        Entry(kind="b", path="f.txt", hash=DIGEST, size=1, mtime_ns=2),
+        Entry(
+            kind="m", path="f.txt", hash=DIGEST, size=1, mtime_ns=2,
             source_uri="s3://bucket/key",
         ),
-        LeafRecord(
-            kind="bp", name="f.parquet", hash=DIGEST, size=1, mtime_ns=2,
+        Entry(
+            kind="bp", path="f.parquet", hash=DIGEST, size=1, mtime_ns=2,
             footer=FOOTER,
         ),
-        LeafRecord(
-            kind="mp", name="f.parquet", hash=DIGEST, size=1, mtime_ns=2,
+        Entry(
+            kind="mp", path="f.parquet", hash=DIGEST, size=1, mtime_ns=2,
             source_uri="file:///f.parquet", footer=FOOTER,
         ),
     ]
@@ -59,17 +57,17 @@ def test_leaf_codec_round_trips_every_shape() -> None:
 
 
 def test_manifest_and_tree_serializations_agree() -> None:
-    entry = ManifestEntry(
+    entry = Entry(
         path="dir/f.parquet",
+        kind="mp",
         hash=DIGEST,
         size=7,
         mtime_ns=8,
-        identity_mode="meta",
         source_uri="file:///dir/f.parquet",
         footer=FOOTER,
     )
-    tree_entry = TreeEntry(
-        name="f.parquet",
+    tree_entry = Entry(
+        path="f.parquet",
         kind="mp",
         hash=DIGEST,
         size=7,
@@ -79,9 +77,9 @@ def test_manifest_and_tree_serializations_agree() -> None:
     )
     # Same leaf payload modulo the name field: bodies match exactly.
     assert entry.serialize().split(",", 2)[2] == tree_entry.serialize().split(",", 2)[2]
-    parsed = TreeEntry.parse(tree_entry.serialize())
+    parsed = Entry.parse(tree_entry.serialize())
     assert parsed == tree_entry
-    manifest_round_trip = ManifestEntry.deserialize(entry.serialize())
+    manifest_round_trip = Entry.parse(entry.serialize())
     assert manifest_round_trip == entry
 
 
@@ -89,24 +87,24 @@ def test_subtree_lines_reject_leaf_fields() -> None:
     import pytest
 
     with pytest.raises(ValueError, match="Subtree entries only carry"):
-        TreeEntry(name="d", kind="t", hash=DIGEST, size=5)
+        Entry(path="d", kind="t", hash=DIGEST, size=5)
     with pytest.raises(ValueError, match="Blob-backed entries cannot carry source_uri"):
-        ManifestEntry(path="f.txt", hash=DIGEST, size=1, mtime_ns=1,
-                      identity_mode="blake3", source_uri="file:///f.txt")
+        Entry(path="f.txt", kind="b", hash=DIGEST, size=1, mtime_ns=1,
+                      source_uri="file:///f.txt")
 
 
 def test_leaf_kind_derivation_is_single_sourced() -> None:
-    assert leaf_kind_for("blake3", has_footer=False) == "b"
-    assert leaf_kind_for("blake3", has_footer=True) == "bp"
-    assert leaf_kind_for("meta", has_footer=False) == "m"
-    assert leaf_kind_for("meta", has_footer=True) == "mp"
+    assert leaf_kind_for("content", has_footer=False) == "b"
+    assert leaf_kind_for("content", has_footer=True) == "bp"
+    assert leaf_kind_for("pointer", has_footer=False) == "m"
+    assert leaf_kind_for("pointer", has_footer=True) == "mp"
 
 
 def test_tree_object_round_trip_with_mixed_entries() -> None:
     entries = [
-        TreeEntry(name="a.bin", kind="b", hash=DIGEST, size=1, mtime_ns=2),
-        TreeEntry(name="sub", kind="t", hash=DIGEST),
-        TreeEntry(name="z.meta", kind="m", hash=DIGEST, size=1, mtime_ns=2,
+        Entry(path="a.bin", kind="b", hash=DIGEST, size=1, mtime_ns=2),
+        Entry(path="sub", kind="t", hash=DIGEST),
+        Entry(path="z.meta", kind="m", hash=DIGEST, size=1, mtime_ns=2,
                   source_uri="s3://bucket/z"),
     ]
     payload = serialize_tree_object(entries)
@@ -126,7 +124,7 @@ def test_object_relative_key_matches_physical_layout() -> None:
 
 
 def test_local_store_paths_derive_from_key_space(tmp_path: Path) -> None:
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     commit_id = _make_commit(repo, "x.txt", "base")
 
     assert repo.store.blob_path("0" * 64) == tmp_path / ".reflake/blobs/00" / ("0" * 62)
@@ -134,7 +132,10 @@ def test_local_store_paths_derive_from_key_space(tmp_path: Path) -> None:
         tmp_path / ".reflake" / f"commits/{commit_id}.json"
     )
     tree_hash = repo.read_commit(commit_id).tree
-    assert repo.store.tree_path(tree_hash) == tmp_path / ".reflake" / "trees" / tree_hash
+    assert (
+        repo.store.tree_path(tree_hash)
+        == tmp_path / ".reflake" / "trees" / tree_hash
+    )
 
 
 # ── Sorted-stream merging ────────────────────────────────────────────────────
@@ -158,20 +159,22 @@ def test_merge_sorted_streams_handles_empty_streams() -> None:
 
 
 def test_overlay_staged_uses_stream_merge_for_replacement(tmp_path: Path) -> None:
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     (tmp_path / "b.txt").write_text("old")
     repo.commit("base")
     head_tree = repo.read_commit(repo.head_commit()).tree
 
     from reflake.core.services.tree import TreeWriter
 
-    writer = TreeWriter(store=repo.store, refs=repo.refs, client_state=repo.client_state)
-    replacement = ManifestEntry(
+    writer = TreeWriter(
+        store=repo.store, refs=repo.refs, client_state=repo.client_state
+    )
+    replacement = Entry(
         path="b.txt",
+        kind="b",
         hash="1" * 64,
         size=3,
         mtime_ns=4,
-        identity_mode="blake3",
     )
     new_tree = writer.overlay_staged(
         parent_tree=head_tree,
@@ -187,10 +190,10 @@ def test_overlay_staged_uses_stream_merge_for_replacement(tmp_path: Path) -> Non
 
 
 def test_branch_snapshots_relocated_out_of_refs_heads(tmp_path: Path) -> None:
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     _make_commit(repo, "a.txt", "base")
     repo.refs.client_state.write_branch_snapshot(
-        "main", commit_id=repo.head_commit(), version_token=None
+        "main", commit_id=repo.head_commit()
     )
 
     snapshot = tmp_path / ".reflake/state/branch-snapshots/main.json"
@@ -205,15 +208,17 @@ def test_staged_flow_end_to_end_after_refactors(tmp_path: Path, capsys) -> None:
     from reflake import run_cli
 
     (tmp_path / "z.txt").write_text("z")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "base"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "base"]) == 0
     capsys.readouterr()
 
     (tmp_path / "a.txt").write_text("a")
-    assert run_cli(["add", "--repo", str(tmp_path), "a.txt", "--json"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "--json", "add", "a.txt"]) == 0
     capsys.readouterr()
-    assert run_cli(["commit", "--repo", str(tmp_path), "--staged", "-m", "a"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "commit", "--staged", "-m", "a"]) == 0
     capsys.readouterr()
 
-    assert run_cli(["catalog", "--repo", str(tmp_path), "--json"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "--json", "branches"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [item["branch"] for item in payload] == ["main"]

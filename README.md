@@ -42,21 +42,25 @@ Reflake separates data into three layers:
 |---|---|
 | **Repository** | A `.reflake/` directory locally, or an `s3://bucket/prefix` prefix remotely — same commands against both. |
 | **Tree** | A content-addressed Merkle node: sorted JSONL lines addressing child trees or leaf files. Directories over 10k entries shard automatically. |
-| **Commit** | `{tree, parents[], message, generation}` — parents form a real DAG, so merges are first-class. |
-| **Branch** | A pointer updated with compare-and-swap (S3 conditional writes) — safe under concurrent clients without locks. |
+| **Commit** | `{tree, parents[], message}` — parents form a real DAG, so merges are first-class. The commit id hashes only content, so identical content yields identical ids across branches. |
+| **Branch** | A pointer updated with compare-and-swap on the commit id (S3 conditional writes) — safe under concurrent clients without locks. |
 | **Staging** | Per-client, per-branch overlay of adds/removes applied onto the parent tree by `commit --staged`. |
-| **Identity modes** | `blake3` (content hash, default) or `meta` (path+size hash, unverifiable until promoted). |
+| **Identity modes** | `content` (content hash, default) or `pointer` (path+size reference, unverifiable until promoted). |
 
 ### Command map
 
+`--repo` and `--json` are global flags and come before the command: `reflake --repo <uri> [--json] <command>`.
+
 | Area | Commands |
 |---|---|
-| Ingest | `init`, `add`, `commit [--staged]`, `verify` |
-| Inspect | `status`, `log`, `diff`, `list`, `cat`, `catalog`, `reflog` |
+| Ingest | `init`, `add`, `commit [--staged]`, `verify` (audit), `promote` |
+| Inspect | `status`, `log`, `diff`, `list` (`ls`), `cat`, `branches`, `reflog` |
 | Branch | `branch`, `checkout`, `merge` (fast-forward + 3-way metadata merge) |
 | Mutate | `rm`, `mv`, `gc [--prune]`, `restore` |
 | Sync | `push`, `pull`, `fetch`, `transfer` |
 | Analyze | `query build` (DuckDB/Parquet), `query prune` (row-group pruning) |
+
+Exit codes: `0` ok · `1` usage/validation (including `verify` with remaining pointer entries) · `2` conflict, retryable (CAS race, non-fast-forward, merge conflict) · `3` missing ref/object.
 
 ## Guardrails (Strict)
 
@@ -90,144 +94,149 @@ uv run reflake --help
 ## Quickstart
 
 ```bash
-# Initialize a new repository
+# Initialize a new repository (idempotent, like git init)
 mkdir -p /tmp/reflake-demo
-uv run reflake init --repo /tmp/reflake-demo
-# Or with S3 backend: uv run reflake init --repo /tmp/reflake-demo --backend s3 --s3-bucket my-bucket
+uv run reflake --repo /tmp/reflake-demo init
+# Or with S3 backend: uv run reflake --repo /tmp/reflake-demo init --backend s3 --s3-bucket my-bucket
 
 echo "hello" > /tmp/reflake-demo/a.txt
 
-uv run reflake commit --repo /tmp/reflake-demo -m "initial"
+uv run reflake --repo /tmp/reflake-demo commit -m "initial"
 
-# Stage an S3 prefix as metadata-only entries, then commit the staged additions
-uv run reflake add --repo /tmp/reflake-demo --identity meta --as imports/bootstrap s3://my-bucket/bootstrap
-uv run reflake commit --repo /tmp/reflake-demo --staged -m "metadata import"
-uv run reflake verify --repo /tmp/reflake-demo
+# Stage an S3 prefix as pointer entries, then commit the staged additions
+uv run reflake --repo /tmp/reflake-demo add --identity pointer --as imports/bootstrap s3://my-bucket/bootstrap
+uv run reflake --repo /tmp/reflake-demo commit --staged -m "metadata import"
+uv run reflake --repo /tmp/reflake-demo verify
+uv run reflake --repo /tmp/reflake-demo promote
 
 # branch-scoped staged flow
-uv run reflake branch --repo /tmp/reflake-demo feature
-uv run reflake checkout --repo /tmp/reflake-demo feature
-uv run reflake add --repo /tmp/reflake-demo data/new.csv
-uv run reflake add --repo /tmp/reflake-demo --as imports/raw.csv /tmp/outside-repo/raw.csv
-uv run reflake status --repo /tmp/reflake-demo
-uv run reflake commit --repo /tmp/reflake-demo --staged -m "feature updates"
-uv run reflake checkout --repo /tmp/reflake-demo main
-uv run reflake merge --repo /tmp/reflake-demo feature main
+uv run reflake --repo /tmp/reflake-demo branch feature
+uv run reflake --repo /tmp/reflake-demo checkout feature
+uv run reflake --repo /tmp/reflake-demo add data/new.csv
+uv run reflake --repo /tmp/reflake-demo add --as imports/raw.csv /tmp/outside-repo/raw.csv
+uv run reflake --repo /tmp/reflake-demo status
+uv run reflake --repo /tmp/reflake-demo commit --staged -m "feature updates"
+uv run reflake --repo /tmp/reflake-demo checkout main
+uv run reflake --repo /tmp/reflake-demo merge feature main
 
 # restore files from a ref
-uv run reflake restore --repo /tmp/reflake-demo main
-uv run reflake restore --repo /tmp/reflake-demo main --path data/new.csv
-uv run reflake restore --repo /tmp/reflake-demo main --force
+uv run reflake --repo /tmp/reflake-demo restore main
+uv run reflake --repo /tmp/reflake-demo restore main --path data/new.csv
+uv run reflake --repo /tmp/reflake-demo restore main --force
 
 echo "hello v2" > /tmp/reflake-demo/a.txt
-uv run reflake commit --repo /tmp/reflake-demo -m "update"
+uv run reflake --repo /tmp/reflake-demo commit -m "update"
 
-uv run reflake diff --repo /tmp/reflake-demo <from_ref> <to_ref>
+uv run reflake --repo /tmp/reflake-demo diff <from_ref> <to_ref>
 
 # Stage and commit metadata mutations
-uv run reflake rm --repo /tmp/reflake-demo old-prefix
-uv run reflake mv --repo /tmp/reflake-demo raw/images curated/images
-uv run reflake commit --repo /tmp/reflake-demo -m "clean up old files and rename image prefix"
+uv run reflake --repo /tmp/reflake-demo rm old-prefix
+uv run reflake --repo /tmp/reflake-demo mv raw/images curated/images
+uv run reflake --repo /tmp/reflake-demo commit -m "clean up old files and rename image prefix"
 
 # remote repo metadata operations from the current working tree
-uv run reflake branch --repo s3://my-bucket/datasets/demo feature
-uv run reflake commit --repo s3://my-bucket/datasets/demo -m "snapshot current working tree"
-uv run reflake rm --repo s3://my-bucket/datasets/demo obsolete
-uv run reflake mv --repo s3://my-bucket/datasets/demo bootstrap final
-uv run reflake commit --repo s3://my-bucket/datasets/demo --staged -m "drop obsolete paths and rename imported prefix"
+uv run reflake --repo s3://my-bucket/datasets/demo branch feature
+uv run reflake --repo s3://my-bucket/datasets/demo commit -m "snapshot current working tree"
+uv run reflake --repo s3://my-bucket/datasets/demo rm obsolete
+uv run reflake --repo s3://my-bucket/datasets/demo mv bootstrap final
+uv run reflake --repo s3://my-bucket/datasets/demo commit --staged -m "drop obsolete paths and rename imported prefix"
 
-# JSON output for programmatic use (all commands support --json)
-uv run reflake status --repo /tmp/reflake-demo --json
-uv run reflake diff --repo /tmp/reflake-demo main feature --json
+# JSON output for programmatic use (global --json flag)
+uv run reflake --repo /tmp/reflake-demo --json status
+uv run reflake --repo /tmp/reflake-demo --json diff main feature
 ```
 
 ## Identity Modes
 
-Reflake supports two identity modes for manifest entries:
+Reflake supports two identity modes for entries:
 
-- `blake3` (default)
+- `content` (default)
 	- Reads file bytes.
 	- Stores canonical blob in `.reflake/blobs/`.
-	- Manifest entry includes `identity_mode=blake3`, `identity_value`, and `blob_hash`.
+	- Entry includes `identity_mode=content`, `identity_value`, and `blob_hash`.
 
-- `meta`
+- `pointer`
 	- Does not read file bytes.
 	- Computes identity as `blake3("<relative_path>\n<size>")`.
 	- Stores no canonical blob (`blob_hash=null`) and keeps `source_uri` for reads.
 
-Set the mode per staged addition with `reflake add --identity meta`, or set the
-repository-wide default for `reflake commit` with `reflake config set identity meta`.
+Set the mode per staged addition with `reflake add --identity pointer`, or set the
+repository-wide default for `reflake commit` with `reflake config set identity pointer`.
 
 This is useful for large bootstrap imports where strong content verification can be deferred.
 
-### Durability contract for `meta`
+### Durability contract for `pointer`
 
-Metadata-only (`meta`) revisions are **unverifiable**: the entry's
+Pointer (`pointer`) revisions are **unverifiable**: the entry's
 identity is derived from path and size, not from content bytes. Until you run
-`reflake verify`, Reflake cannot prove that the content at `source_uri` matches
+`reflake promote`, Reflake cannot prove that the content at `source_uri` matches
 what was originally imported.
 
 **Warnings.** The CLI emits a warning to stderr whenever you stage with
-`--identity meta` or commit a repository whose identity is configured to `meta`,
-and after `verify` reports how many unverifiable entries remain.
+`--identity pointer` or commit a repository whose identity is configured to `pointer`,
+and `verify` reports how many unverifiable entries remain (exiting non-zero).
 
-**Source-retention policy.** Because metadata-only entries have no canonical
+**Source-retention policy.** Because pointer entries have no canonical
 blob, you **must** retain the source objects at their original `source_uri`
-until the entry has been promoted via `reflake verify`. If a source object is
-deleted, overwritten, or moved before verification, the corresponding manifest
+until the entry has been promoted via `reflake promote`. If a source object is
+deleted, overwritten, or moved before promotion, the corresponding
 entry becomes irrecoverable — no content can be read and no hash can be
 validated.
 
-**Promotion to verifiable.** Run `reflake verify` to read every metadata-only
-entry's source blob, compute a Blake3 content hash, store the canonical blob,
-and rewrite the manifest entry in `blake3` mode. After promotion the source
+**Promotion to verifiable.** Run `reflake promote` to read every pointer
+entry's source blob, compute a content hash, store the canonical blob,
+and rewrite the entry in `content` mode. After promotion the source
 retention requirement is lifted for those entries.
 
 **Lifecycle summary:**
 
 | State | `identity_mode` | `blob_hash` | Can read? | Can prove integrity? | Source required? |
 |---|---|---|---|---|---|
-| Metadata-only | `meta` | `null` | ✅ (from `source_uri`) | ❌ | ✅ |
-| Verified | `blake3` | hash | ✅ (from `blobs/`) | ✅ | ❌ |
+| Pointer | `pointer` | `null` | ✅ (from `source_uri`) | ❌ | ✅ |
+| Verified | `content` | hash | ✅ (from `blobs/`) | ✅ | ❌ |
 
-## Verify Command
+## Verify And Promote Commands
 
-`reflake verify` promotes metadata-only (`meta`) manifest entries of the current branch into canonical `blake3` blob-backed entries:
+`reflake verify` is a read-only audit: it reports how many pointer entries of the current branch would be promoted, and exits non-zero while any remain:
 
 ```bash
-uv run reflake verify --repo /tmp/reflake-demo
-uv run reflake verify --repo /tmp/reflake-demo --path images --path logs/2026
-uv run reflake verify --repo /tmp/reflake-demo --dry-run
+uv run reflake --repo /tmp/reflake-demo verify
+uv run reflake --repo /tmp/reflake-demo verify --path images --path logs/2026
 ```
 
-- Verifies all entries by default (or selected path prefixes with `--path`).
-- `--dry-run` reports how many entries would be promoted without changing blobs/commits.
-- Reads bytes from each entry's `source_uri`, computes Blake3, and stores canonical blob content.
-- Writes a new commit only when at least one entry is promoted.
+`reflake promote` materializes canonical blobs and writes a promotion commit (only when at least one entry is promoted):
+
+```bash
+uv run reflake --repo /tmp/reflake-demo promote
+uv run reflake --repo /tmp/reflake-demo promote --path images --path logs/2026
+```
+
+- Both audit all entries by default (or selected path prefixes with `--path`).
+- Promotion reads bytes from each entry's `source_uri`, computes the content hash, and stores canonical blob content.
 
 ## Incremental Ingress
 
 ```bash
-uv run reflake add --repo /tmp/reflake-demo local/new.csv
-uv run reflake add --repo /tmp/reflake-demo --as imports/new.csv /tmp/random/new.csv
-uv run reflake add --repo /tmp/reflake-demo --as imports/new-batch /tmp/random/new-batch
-uv run reflake add --repo /tmp/reflake-demo --identity meta --as imports/bootstrap.csv s3://my-bucket/bootstrap.csv
-uv run reflake add --repo /tmp/reflake-demo --identity meta --as imports/bootstrap s3://my-bucket/bootstrap
-uv run reflake commit --repo /tmp/reflake-demo --staged -m "add one file"
-uv run reflake verify --repo /tmp/reflake-demo --path images --path root.txt
+uv run reflake --repo /tmp/reflake-demo add local/new.csv
+uv run reflake --repo /tmp/reflake-demo add --as imports/new.csv /tmp/random/new.csv
+uv run reflake --repo /tmp/reflake-demo add --as imports/new-batch /tmp/random/new-batch
+uv run reflake --repo /tmp/reflake-demo add --identity pointer --as imports/bootstrap.csv s3://my-bucket/bootstrap.csv
+uv run reflake --repo /tmp/reflake-demo add --identity pointer --as imports/bootstrap s3://my-bucket/bootstrap
+uv run reflake --repo /tmp/reflake-demo commit --staged -m "add one file"
+uv run reflake --repo /tmp/reflake-demo promote --path images --path root.txt
 ```
 
 - `add` + `commit --staged` preserves the current branch manifest and reads bytes only for staged additions.
 - `add` accepts repo-relative files, arbitrary local files, local directories, single S3 objects, and S3 prefixes; `--as` maps a single file/object to one logical path or remaps a directory/prefix under a destination prefix.
-- `verify` reads bytes only for selected metadata-only entries that still need canonical blobs.
-- Existing manifest entries are preserved without re-uploading unchanged blob content.
+- `promote` reads bytes only for selected pointer entries that still need canonical blobs.
+- Existing entries are preserved without re-uploading unchanged blob content.
 
 ## Merge Command
 
 `reflake merge` updates a target branch from a source ref:
 
 ```bash
-uv run reflake merge --repo /tmp/reflake-demo feature main
+uv run reflake --repo /tmp/reflake-demo merge feature main
 ```
 
 - The source ref can be a branch or commit; the target must be a branch.
@@ -240,9 +249,9 @@ uv run reflake merge --repo /tmp/reflake-demo feature main
 `reflake rm` and `reflake mv` stage metadata-only mutations; `reflake commit --staged` writes a new commit:
 
 ```bash
-uv run reflake rm --repo /tmp/reflake-demo logs/2025
-uv run reflake mv --repo /tmp/reflake-demo incoming/images curated/images
-uv run reflake commit --repo /tmp/reflake-demo --staged -m "remove old logs and rename prefix"
+uv run reflake --repo /tmp/reflake-demo rm logs/2025
+uv run reflake --repo /tmp/reflake-demo mv incoming/images curated/images
+uv run reflake --repo /tmp/reflake-demo commit --staged -m "remove old logs and rename prefix"
 ```
 
 - These operations read tree metadata only; they do not download unchanged blob payloads.
@@ -253,20 +262,20 @@ uv run reflake commit --repo /tmp/reflake-demo --staged -m "remove old logs and 
 ## Sync (push/pull/fetch)
 
 ```bash
-uv run reflake push  --repo . s3://my-bucket/datasets/demo
-uv run reflake pull  --repo . s3://my-bucket/datasets/demo
-uv run reflake fetch --repo . s3://my-bucket/datasets/demo
+uv run reflake --repo . push s3://my-bucket/datasets/demo
+uv run reflake --repo . pull s3://my-bucket/datasets/demo
+uv run reflake --repo . fetch s3://my-bucket/datasets/demo
 ```
 
 - Objects transfer plan-first: the exact missing set (commits, trees, footers, blobs) is computed, then executed via `boto3` per-object or batched through [`s5cmd`](https://github.com/peak/s5cmd) when configured (`config set transfer_backend s5cmd`).
 - Divergent history is rejected before any bytes move (`NonFastForwardError`); the final ref update is a CAS, so concurrent pushes surface conflicts instead of overwriting.
 - Push after a local merge transfers the entire merged lineage, including both parents' commits.
-- S3-compatible endpoints (MinIO, Ministack, …) configured via `reflake init --s3-endpoint …` (or `config set s3.endpoint_url …`) are honored for repository operations; direct `s3://` remotes use the ambient AWS configuration chain.
+- S3-compatible endpoints (MinIO, Ministack, …) configured via `reflake init --backend s3 --s3-endpoint …` (or `config set s3.endpoint_url …`) are honored for repository operations; direct `s3://` remotes use the ambient AWS configuration chain.
 
 ## Analytical Index (Derived, Disposable)
 
 ```bash
-uv run reflake query build --repo /tmp/reflake-demo --parquet
+uv run reflake --repo /tmp/reflake-demo query build --parquet
 ```
 
 `reflake query build` writes a DuckDB database (and optional Parquet export) for the current branch's tree to `.reflake/index/<commit_id>.duckdb`. Query it with the DuckDB CLI:
@@ -282,7 +291,7 @@ If the index is deleted, Reflake remains fully functional from trees and commits
 With `config set parquet_footer true`, parquet ingests also capture compact footer statistics (schema + per-row-group min/max/nulls) under `footers/<hash>`. `reflake query prune` then selects the row groups that may match a WHERE-style predicate — reading metadata only, never data pages:
 
 ```bash
-uv run reflake query prune --repo /tmp/reflake-demo <ref> images/ --where "id >= 100 AND active = true"
+uv run reflake --repo /tmp/reflake-demo query prune <ref> images/ --where "id >= 100 AND active = true"
 ```
 
 ## `fsspec` URI Example
@@ -299,7 +308,36 @@ with fs.open("reflake://my_data@feature+staged/a.txt", "rb") as handle:
     staged_data = handle.read()
 ```
 
-In `meta` snapshots, Reflake reads from `source_uri` when no canonical `blobs/` object exists.
+In `pointer` snapshots, Reflake reads from `source_uri` when no canonical `blobs/` object exists.
+
+## Python API
+
+```python
+from reflake.core import create_repository, open_repository
+
+repo = create_repository("/tmp/reflake-demo")  # init + open (idempotent)
+repo = open_repository("/tmp/reflake-demo")  # fails unless initialized
+repo = open_repository("s3://my-bucket/datasets/demo")  # remote (lazy)
+
+commit_id = repo.commit("snapshot")
+repo.verify()  # read-only audit of pointer entries
+repo.promote()  # materialize blobs + commit
+repo.merge("feature", "main")
+```
+
+Public, stable surface (everything else is internal and may change):
+
+- construction: `init_repository`, `create_repository`, `open_repository`
+- repository: `ReflakeRepository` methods
+- reads: `ReflakeFileSystem`, `ReflakeURI`
+- sync: `push`, `pull`, `fetch`
+- errors: `ReflakeError` and subclasses (`RefConflictError`,
+  `NonFastForwardError`, `UnknownRefError`, …)
+
+`core.services`, `core.objects`, `core.query` internals and the store
+protocols are not covered by stability guarantees. Read paths (`diff`,
+`log`, `status`, VFS, query) depend only on narrow read capabilities, so
+metadata operations never touch blob bytes by construction.
 
 ## Repository Layout
 

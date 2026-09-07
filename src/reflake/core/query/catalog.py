@@ -42,10 +42,20 @@ def build_analytical_index(
     ) as temp:
         manifest_path = Path(temp.name)
         writer = csv.writer(temp)
-        writer.writerow(["path", "hash", "size", "mtime_ns", "footer", "commit_id", "branch"])
+        writer.writerow(
+            ["path", "hash", "size", "mtime_ns", "footer", "commit_id", "branch"]
+        )
         for entry in repo.store.iter_all_entries(commit.tree):
             writer.writerow(
-                [entry.path, entry.hash, entry.size, entry.mtime_ns, entry.footer or "", commit_id, commit.branch]
+                [
+                    entry.path,
+                    entry.hash,
+                    entry.size,
+                    entry.mtime_ns,
+                    entry.footer or "",
+                    commit_id,
+                    commit.branch,
+                ]
             )
 
     conn = duckdb.connect(str(db_path))

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
-from pathlib import Path
 
 from ..client_state import LocalClientState
 from ..domain import (
@@ -20,7 +19,7 @@ from ..domain import (
     UnknownCommitError,
     UnknownRefError,
 )
-from ..objects import ObjectStore
+from ..objects import RefObjectStore
 from ..repository_support import is_ancestor_commit
 
 
@@ -58,13 +57,12 @@ class RefManager:
     def __init__(
         self,
         *,
-        store: ObjectStore,
+        store: RefObjectStore,
         client_state: LocalClientState,
         default_branch: str = "main",
     ) -> None:
         self.store = store
         self.client_state = client_state
-        self._resolved_ref_cache: dict[str, BranchRefState] = {}
         self._commit_cache = _BoundedCache()
         self._ensure_head(default_branch)
 
@@ -86,21 +84,12 @@ class RefManager:
             return None
         return branch_ref.commit_id
 
-    def branch_path(self, branch: str) -> Path:
-        return self.store.branch_path(branch)
-
     def resolve_ref(self, branch_or_commit: str) -> str:
-        cached_branch_ref = self._resolved_ref_cache.get(branch_or_commit)
-        if cached_branch_ref is not None:
-            current_token = self.store.version_token("ref", branch_or_commit)
-            if current_token == cached_branch_ref.version_token:
-                if not cached_branch_ref.commit_id:
-                    raise EmptyBranchError(branch_or_commit)
-                return cached_branch_ref.commit_id
-
+        # Read-through on every call: ref reads are cheap (local file, one
+        # S3 GET) and a validated cache would need the version tokens we
+        # deleted. Commit objects stay cached — they are immutable.
         branch_ref = self.store.read_branch_ref(branch_or_commit)
         if branch_ref is not None:
-            self._resolved_ref_cache[branch_or_commit] = branch_ref
             if not branch_ref.commit_id:
                 raise EmptyBranchError(branch_or_commit)
             return branch_ref.commit_id
@@ -108,16 +97,15 @@ class RefManager:
             return branch_or_commit
         raise UnknownRefError(branch_or_commit)
 
-    def branch(self, name: str) -> Path:
+    def branch(self, name: str) -> str:
         if not name or "/" in name or name.startswith("."):
             raise ValueError("Invalid branch name")
         if self.store.read_branch_ref(name) is not None:
             raise ValueError(f"Branch already exists: {name}")
-        head_commit = self.head_commit() or ""
+        head_commit = self.head_commit()
         if not self.store.compare_and_set_branch_ref(
             name,
-            head_commit or None,
-            expected_version_token=None,
+            head_commit,
             expected_commit_id=None,
         ):
             raise ValueError(f"Branch already exists: {name}")
@@ -126,10 +114,8 @@ class RefManager:
             self.client_state.write_branch_snapshot(
                 name,
                 commit_id=created_state.commit_id,
-                version_token=created_state.version_token,
             )
-        self._resolved_ref_cache.pop(name, None)
-        return self.branch_path(name)
+        return name
 
     def read_commit(self, commit_id: str) -> CommitObject:
         try:
@@ -171,7 +157,6 @@ class RefManager:
         self.client_state.write_branch_snapshot(
             branch,
             commit_id=branch_state.commit_id,
-            version_token=branch_state.version_token,
         )
         return branch_state
 
@@ -220,7 +205,6 @@ class RefManager:
         self.update_branch_ref(
             branch=branch,
             commit_id=target_commit,
-            expected_version_token=branch_state.version_token,
             expected_commit_id=current_commit,
             operation=operation,
         )
@@ -231,25 +215,20 @@ class RefManager:
         *,
         branch: str,
         commit_id: str | None,
-        expected_version_token: str | None,
         expected_commit_id: str | None,
         operation: str,
     ) -> None:
         updated = self.store.compare_and_set_branch_ref(
             branch,
             commit_id,
-            expected_version_token=expected_version_token,
             expected_commit_id=expected_commit_id,
         )
         if updated:
-            self._resolved_ref_cache.pop(branch, None)
             current_state = self.store.read_branch_ref(branch)
             if current_state is not None:
-                self._resolved_ref_cache[branch] = current_state
                 self.client_state.write_branch_snapshot(
                     branch,
                     commit_id=current_state.commit_id,
-                    version_token=current_state.version_token,
                 )
             self.client_state.append_reflog(
                 branch, expected_commit_id, commit_id, operation
@@ -260,7 +239,6 @@ class RefManager:
             self.client_state.write_branch_snapshot(
                 branch,
                 commit_id=current_state.commit_id,
-                version_token=current_state.version_token,
             )
         raise RefConflictError(
             branch=branch,

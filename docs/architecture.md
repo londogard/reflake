@@ -15,10 +15,11 @@ narrow view they need; one key-space mapping (`layout.object_relative_key`) now 
 physical locations for both adapters; client branch snapshots moved out of `refs/heads/`
 into `state/branch-snapshots/` (§5's filename-coupling fix); a canonical
 `merge_sorted_streams` helper owns the sorted-stream invariant used by staged overlays;
-leaf serialization/validation is unified in `core/entry_codec.py` and `ManifestEntry`
-derives `identity_value`/`blob_hash` instead of storing redundant copies; the module-level
-repository facade functions are gone — the Python API is `open_repository()` +
-`ReflakeRepository` methods.
+leaf serialization/validation is unified in `core/entry_codec.py` as a single `Entry`
+record (replacing the former `LeafRecord`/`ManifestEntry`/`TreeEntry` trio);
+`identity_value`/`blob_hash`/`identity_mode` derive from `kind` instead of being
+stored redundantly; the module-level repository facade functions are gone — the
+Python API is `open_repository()`/`init_repository()` + `ReflakeRepository` methods.
 **P0 shipped:** tree objects (`core/objects/tree.py`), tree-walk lookups with a client-side
 prefix cache (`core/objects/query.py`), `TreeWriter` (`core/services/tree.py`), `commit → tree`
 with `{tree, parents}`, staged-overlay commits with CAS retry, derived manifests
@@ -37,7 +38,7 @@ botocore exceptions); `reflake gc` audit with opt-in `--prune`.
 
 **P3 shipped:** metadata-only 3-way merge for diverged branches (LCA + streaming
 base/ours/theirs merge, merge commits with two parents, `MergeConflictError` on conflicting
-paths); per-branch reflog (`reflake reflog`); dataset registry (`reflake catalog`).
+paths); per-branch reflog (`reflake reflog`); branch registry (`reflake branches`).
 **Post-rollout shipped (rev. 3):** the `repository_store/` + `storage/` → `objects/` store
 unification (§12 — one `ObjectStore` protocol; `LocalObjectStore` / `S3ObjectStore`
 adapters) and the query pruning engine over footer stats (§4 — `core/query/pruning.py` +
@@ -157,7 +158,11 @@ flowchart LR
   cacheable.
 - **commit** — `{ tree, parents: [...], message, created_at, branch, generation }`, with
   `generation = 1 + max(parent generations)` (1 for a root commit).
-- **ref** — branch → commit id, updated via version-token CAS (unchanged).
+  The commit id hashes only content (`message, tree, parents`) —
+  `created_at`/`branch` are recorded, not hashed, and `generation` is a
+  DAG-derivable perf hint — so identical content yields identical ids
+  across branches and retries are idempotent.
+- **ref** — branch → commit id, updated via commit-id CAS (unchanged).
 
 Serialization sketch (keeps today's compact line style — tree lines are the current
 manifest lines, relabeled):
@@ -171,8 +176,8 @@ manifest lines, relabeled):
 ["mp", name, hash, size, mtime_ns, source_uri, footer]  # parquet, source pointer, + footer stats
 ```
 
-Entry validation on read stays — the v1 `ManifestEntry` validation contract survives as
-tree-entry validation (`test_mandatory_validation` is ported, not deleted).
+Entry validation on read stays — the v1 entry validation contract survives as
+`Entry` validation (`test_mandatory_validation` is ported, not deleted).
 
 ### 2.3 What each operation becomes
 
@@ -182,7 +187,7 @@ tree-entry validation (`test_mandatory_validation` is ported, not deleted).
 | `commit --staged` / `add` | merge into full manifest | overlay-tree merge into parent tree, O(changes) |
 | `diff a b` | two full-manifest walks | parallel tree walk; identical subtrees skipped by hash compare |
 | `list` | manifest + `.idx` | streamed tree walk (§3) |
-| `verify` | full manifest rewrite | promote `m`/`mp`→`b`/`bp`; only affected subtrees rewritten |
+| `promote` | full manifest rewrite | promote `m`/`mp`→`b`/`bp`; only affected subtrees rewritten |
 | `mv` / `rm` (prefix) | full manifest rewrite | rewrite only the affected subtree(s) |
 | `import` | full manifest merge | same as staged-add tree merge |
 | `sync` | per-object copies of all reachable blobs | reachable set computed by tree walk (§7) |
@@ -261,7 +266,7 @@ plumbing. One lookup core + one optional materialization instead of three paths.
     `SELECT … WHERE col = x` prunes row groups from the stats **without reading object
     bytes**. This is the single biggest data-specific differentiator, and it stays
     metadata-only. Footer capture is opt-in at ingest (cost: one footer read per file);
-    entries carry a `has_footer` marker so `verify` can backfill it later.
+    entries carry a `has_footer` marker so `promote` can backfill it later.
     **Shipped (rev. 3):** the pruning engine lives in `core/query/pruning.py`
     (`parse_where_clause`, `prune_row_groups`, `plan_pruned_scan`) and is exposed as
     `reflake query prune <ref> <path> --where "col >= x"` — it reads only the
@@ -294,7 +299,11 @@ v2 (format change is free):
 
 ## 6. Concurrency: CAS only — drop locks
 
-- Keep `compare_and_set_branch_ref` (version-token CAS) as the **only** safety primitive.
+- Keep `compare_and_set_branch_ref` (commit-id CAS) as the **only** safety primitive.
+  A ref's content *is* its commit id, so no version tokens travel the protocol:
+  local CAS compares under an `fcntl`/`msvcrt` lock file, S3 CAS re-reads the
+  commit plus its ETag and conditional-Puts against it (the ETag stays an
+  internal detail).
 - Remove S3 branch-lock objects (`locks/refs/heads/*`) and the `lock list` / `lock cleanup`
   surface, or demote them to optional diagnostics. Expiry-based locks are not load-bearing
   (clock skew / long operations), and with no backcompat there's no reason to keep them in
@@ -348,13 +357,12 @@ v2:
 
 ## 10. Identity modes
 
-- Keep `blake3` (default) and `meta` (opt-in; unverifiable until `verify`).
-- Rename `meta` → `source` (it stores a source pointer) and add an explicit `unverifiable`
-  flag so tooling can surface it. Free now.
+- Keep `content` (default) and `pointer` (opt-in; unverifiable until `promote`).
+  `verify` is the read-only audit, `promote` the materializing commit.
 - New mode: **parquet-footer identity** — for parquet inputs, identity = hash of the
   compact footer stats object + schema, with **no blob read**; entries are `mp` (source
   pointer) unless a blob is also stored. Pruning works off the footer; fetching row
-  groups reads the source. This is the `verify`-able fast path for parquet workloads.
+  groups reads the source. This is the `promote`-able fast path for parquet workloads.
 
 ---
 
@@ -394,7 +402,7 @@ Covered in §1. Summary of renames:
 - Client-first/serverless: no daemon, no central database. Lookup caches are per-client
   and content-addressed (never stale, never shared).
 - The services decomposition (`RefManager`, `StagingArea`, `EntryFactory` + new `TreeWriter`).
-- `verify` / promotion model (source → blob-backed).
+- `verify` / `promote` model (source → blob-backed).
 - Entry validation on read (tree entries validate exactly like manifest entries do today).
 
 ---
@@ -422,7 +430,7 @@ Covered in §1. Summary of renames:
 - Keep full-manifest export first-class (`reflake export <ref>`), or is tree walk + vfs
   enough?
 - Parquet footer ingestion: always capture, or opt-in flag? (cost: `head_object` + footer
-  read per file at ingest; entries keep a `has_footer` marker so `verify` can backfill.)
+  read per file at ingest; entries keep a `has_footer` marker so `promote` can backfill.)
 - Should `mp` entries optionally carry remote row-group stats so distributed parquet can
   prune without any local read?
 - Tree-prefix cache policy: pin root + first level always, LRU below — or make pinning

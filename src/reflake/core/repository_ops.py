@@ -8,7 +8,8 @@ manifests; unchanged subtrees are reused by content-addressing.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterator, Literal
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Literal
 
 from .domain import (
     MoveResult,
@@ -17,11 +18,8 @@ from .domain import (
     StageStatus,
     VerifyResult,
 )
-from .hashing import blake3_digest_file
-
-from .manifest import ManifestEntry
+from .entry_codec import Entry
 from .repository_support import (
-    matches_any_logical_path,
     matches_logical_path,
     move_logical_path,
     normalize_logical_paths,
@@ -38,11 +36,11 @@ def repo_add(
     paths: list[str],
     *,
     ref: str | None = None,
-    identity_mode: str = "blake3",
+    identity_mode: str = "content",
     destination_path: str | None = None,
 ) -> StageStatus:
-    if identity_mode not in {"blake3", "meta"}:
-        raise ValueError("identity_mode must be one of: blake3, meta")
+    if identity_mode not in {"content", "pointer"}:
+        raise ValueError("identity_mode must be one of: content, pointer")
     branch = ref or repo.current_branch()
     repo.refs.ensure_branch_exists(branch)
     staged = repo.staging.load(branch)
@@ -67,15 +65,15 @@ def repo_import_s3(
     repo: ReflakeRepository,
     source_uri: str,
     message: str,
-    identity_mode: Literal["blake3", "meta"] = "blake3",
+    identity_mode: Literal["content", "pointer"] = "content",
     *,
     path_patterns: list[str] | None = None,
     ref: str | None = None,
 ) -> str:
     if not message.strip():
         raise ValueError("Commit message cannot be empty")
-    if identity_mode not in {"blake3", "meta"}:
-        raise ValueError("identity_mode must be one of: blake3, meta")
+    if identity_mode not in {"content", "pointer"}:
+        raise ValueError("identity_mode must be one of: content, pointer")
     branch = ref or repo.current_branch()
     branch_state = repo.refs.require_branch_state(branch)
     parent_commit = branch_state.commit_id
@@ -107,7 +105,7 @@ def repo_import_s3(
         message=message,
         parent_commit=parent_commit,
         tree_hash=root_tree,
-        expected_version_token=branch_state.version_token,
+        expected_commit_id=parent_commit,
         operation="commit",
     )
 
@@ -162,7 +160,7 @@ def repo_remove_paths(
         message=message,
         parent_commit=branch_state.commit_id,
         tree_hash=root_tree,
-        expected_version_token=branch_state.version_token,
+        expected_commit_id=branch_state.commit_id,
         operation="rm",
     )
     return RemoveResult(
@@ -193,7 +191,7 @@ def repo_move(
     if destination.startswith(f"{source}/"):
         raise ValueError("Cannot move a path into itself")
 
-    source_entries: list[ManifestEntry] = []
+    source_entries: list[Entry] = []
     exact_source = repo.store.lookup_entry(base_commit.tree, source)
     if exact_source is not None:
         source_entries.append(exact_source)
@@ -205,7 +203,7 @@ def repo_move(
         raise FileNotFoundError(f"Path not found in branch '{branch}': {source}")
 
     source_path_set = {entry.path for entry in source_entries}
-    moved_entries: list[ManifestEntry] = []
+    moved_entries: list[Entry] = []
     moved_paths: list[str] = []
 
     for entry in source_entries:
@@ -237,7 +235,7 @@ def repo_move(
         message=message,
         parent_commit=branch_state.commit_id,
         tree_hash=root_tree,
-        expected_version_token=branch_state.version_token,
+        expected_commit_id=branch_state.commit_id,
         operation="mv",
     )
     return MoveResult(
@@ -312,7 +310,6 @@ def repo_verify(
 ) -> VerifyResult:
     if ref is None:
         ref = repo.current_branch()
-    branch_state = repo.refs.require_branch_state(ref)
 
     base_commit_id = repo.resolve_ref(ref)
     base_commit = repo.read_commit(base_commit_id)
@@ -332,7 +329,7 @@ def repo_verify(
             for prefix in normalized_prefixes
         )
 
-    def iter_verified_entries() -> Iterator[ManifestEntry]:
+    def iter_verified_entries() -> Iterator[Entry]:
         nonlocal verified_entries, candidate_entries, total_entries
         for entry in repo.store.iter_all_entries(base_commit.tree):
             total_entries += 1
@@ -352,12 +349,12 @@ def repo_verify(
                 )
             digest = repo.entries.store_blob_from_source_uri(entry.source_uri)
             verified_entries += 1
-            yield ManifestEntry(
-                path=entry.path,
-                hash=digest,
-                size=entry.size,
-                mtime_ns=entry.mtime_ns,
-                identity_mode="blake3",
+            yield Entry.with_identity(
+                entry.path,
+                digest,
+                entry.size,
+                entry.mtime_ns,
+                "content",
             )
 
     root_tree = repo.tree_writer.build_from_entries(iter_verified_entries())
@@ -373,11 +370,11 @@ def repo_verify(
 
     commit_id = repo.tree_writer.write_commit_object(
         branch=ref,
-        message=f"verify {ref}",
+        message=f"promote {ref}",
         parent_commit=base_commit_id,
         tree_hash=root_tree,
-        expected_version_token=branch_state.version_token,
-        operation="verify",
+        expected_commit_id=base_commit_id,
+        operation="promote",
     )
     return VerifyResult(
         commit_id=commit_id,
@@ -400,7 +397,7 @@ def repo_restore_files(
     commit = repo.read_commit(commit_id)
 
     if paths:
-        entries: dict[str, ManifestEntry] = {}
+        entries: dict[str, Entry] = {}
         for p in paths:
             entry = repo.store.lookup_entry(commit.tree, p)
             if entry is not None:

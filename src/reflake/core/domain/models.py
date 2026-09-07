@@ -12,7 +12,6 @@ RepositoryObjectKind = Literal["blob", "commit", "ref", "tree", "footer"]
 class BranchRefState:
     branch: str
     commit_id: str | None
-    version_token: str | None
 
 
 

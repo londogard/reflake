@@ -9,6 +9,7 @@ import duckdb
 import pytest
 
 from reflake.core.config import LocalConfig
+from reflake.core.entry_codec import Entry
 from reflake.core.objects.footer import (
     parse_parquet_footer,
     serialize_footer_stats,
@@ -77,7 +78,7 @@ def test_commit_captures_footer_only_when_enabled(tmp_path: Path) -> None:
     assert entry.footer is None
 
     # Enable capture; an unchanged file gets its footer backfilled.
-    LocalConfig(identity="blake3", parquet_footer=True).save(tmp_path)
+    LocalConfig(identity="content", parquet_footer=True).save(tmp_path)
     repo2 = ReflakeRepository(tmp_path)
     repo2.commit("captured")
     entry = repo2.resolve_entry("main", "data.parquet")
@@ -96,11 +97,11 @@ def test_commit_captures_footer_only_when_enabled(tmp_path: Path) -> None:
 
 def test_commit_meta_mode_captures_mp_entry(tmp_path: Path) -> None:
     _write_parquet(tmp_path / "data.parquet")
-    LocalConfig(identity="meta", parquet_footer=True).save(tmp_path)
+    LocalConfig(identity="pointer", parquet_footer=True).save(tmp_path)
     repo = ReflakeRepository(tmp_path)
     repo.commit("meta footer")
     entry = repo.resolve_entry("main", "data.parquet")
-    assert entry.identity_mode == "meta"
+    assert entry.identity_mode == "pointer"
     assert entry.footer is not None
     assert entry.source_uri is not None
     assert entry.blob_hash is None
@@ -113,7 +114,7 @@ def test_staged_add_captures_footer(tmp_path: Path) -> None:
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    LocalConfig(identity="blake3", parquet_footer=True).save(repo_root)
+    LocalConfig(identity="content", parquet_footer=True).save(repo_root)
     repo = ReflakeRepository(repo_root)
     repo.add([str(source_dir / "remote.parquet")], ref="main")
     repo.commit("staged footer", staged_only=True)
@@ -124,7 +125,7 @@ def test_staged_add_captures_footer(tmp_path: Path) -> None:
 
 def test_tree_entry_round_trips_footer(tmp_path: Path) -> None:
     _write_parquet(tmp_path / "data.parquet")
-    LocalConfig(identity="blake3", parquet_footer=True).save(tmp_path)
+    LocalConfig(identity="content", parquet_footer=True).save(tmp_path)
     repo = ReflakeRepository(tmp_path)
     repo.commit("captured")
     entry = repo.resolve_entry("main", "data.parquet")
@@ -133,11 +134,9 @@ def test_tree_entry_round_trips_footer(tmp_path: Path) -> None:
     commit = repo.read_commit(repo.resolve_ref("main"))
     derived = repo.tree_writer.export_derived_manifest(commit.tree)
     assert derived.exists()
-    from reflake.core.manifest import ManifestEntry
-
     found = None
     for line in derived.read_text().splitlines():
-        candidate = ManifestEntry.deserialize(line)
+        candidate = Entry.parse(line)
         if candidate.path == "data.parquet":
             found = candidate
     assert found is not None

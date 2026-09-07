@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
 import os
 import time
 import tracemalloc
@@ -10,17 +9,18 @@ from pathlib import Path
 import pytest
 
 from reflake.core import (
+    Entry,
     FileEntry,
-    ReflakeFileSystem,
-    ReflakeRepository,
     LocalClientState,
     LocalObjectStore,
-    ManifestEntry,
     ManifestReader,
     ManifestWriter,
     RefConflictError,
+    ReflakeFileSystem,
+    ReflakeRepository,
     S3ObjectStore,
     build_analytical_index,
+    create_repository,
     drop_analytical_index,
     open_repository,
     query_analytical_index,
@@ -40,8 +40,7 @@ class ConflictOnceLocalObjectStore(LocalObjectStore):
         branch: str,
         commit_id: str | None,
         *,
-        expected_version_token: str | None,
-        expected_commit_id: str | None = None,
+        expected_commit_id: str | None,
     ) -> bool:
         if self.conflict_next_ref_update:
             self.conflict_next_ref_update = False
@@ -50,7 +49,6 @@ class ConflictOnceLocalObjectStore(LocalObjectStore):
         return super().compare_and_set_branch_ref(
             branch,
             commit_id,
-            expected_version_token=expected_version_token,
             expected_commit_id=expected_commit_id,
         )
 
@@ -134,7 +132,7 @@ def test_metadata_only_move_updates_meta_identity_without_blob_read(
 
     assert result.moved_paths == ["archive/file.txt"]
     assert "dir/file.txt" not in after_entries
-    assert moved_entry.identity_mode == "blake3"
+    assert moved_entry.identity_mode == "content"
     assert moved_entry.hash == before_entry.hash
     assert moved_entry.blob_hash is not None
 
@@ -145,8 +143,9 @@ def test_memory_safe_manifesting_100k_entries(tmp_path: Path) -> None:
 
     def entries():
         for i in range(entry_count):
-            yield ManifestEntry(
+            yield Entry(
                 path=f"dir/file_{i}.dat",
+                kind="b",
                 hash=f"{i:064x}",
                 size=i,
                 mtime_ns=i,
@@ -202,7 +201,7 @@ def test_manifest_entry_validation_rejects_invalid_payloads() -> None:
                 "hash": "a" * 64,
                 "size": 1,
                 "mtime_ns": 1,
-                "identity_mode": "meta",
+                "identity_mode": "pointer",
             },
             "Source-pointer entries must carry a non-empty source_uri",
         ),
@@ -210,7 +209,7 @@ def test_manifest_entry_validation_rejects_invalid_payloads() -> None:
 
     for payload, message in invalid_payloads:
         with pytest.raises(ValueError, match=message):
-            ManifestEntry.from_dict(payload)  # type: ignore[arg-type]
+            Entry.from_dict(payload)  # type: ignore[arg-type]
 
 
 def test_manifest_reader_reports_corrupt_json_with_line_context(
@@ -371,7 +370,7 @@ def test_remote_exact_lookup_uses_manifest_sidecar(
     client_root.mkdir(parents=True)
     (worktree / "remote.txt").write_text("payload")
 
-    repo = open_repository(
+    repo = create_repository(
         "s3://demo-bucket/repos/demo",
         worktree=worktree,
         client_root=client_root,
@@ -410,7 +409,7 @@ def test_remote_prefix_listing_uses_manifest_sidecar(
     (worktree / "logs" / "b.txt").write_text("b")
     (worktree / "other.txt").write_text("c")
 
-    repo = open_repository(
+    repo = create_repository(
         "s3://demo-bucket/repos/demo-prefix",
         worktree=worktree,
         client_root=client_root,
@@ -461,6 +460,10 @@ class _RecordingBlobTransfer:
 
 
 def test_s3_write_blob_stream_uses_transfer_backend(fake_s3_installer) -> None:
+    from blake3 import blake3
+
+    payload = b"some-payload-bytes"
+    digest = blake3(payload).hexdigest()
     client = fake_s3_installer({})
     transfer = _RecordingBlobTransfer()
     store = S3ObjectStore(
@@ -469,10 +472,12 @@ def test_s3_write_blob_stream_uses_transfer_backend(fake_s3_installer) -> None:
         client=client,
         blob_transfer=transfer,
     )
-    store.write_blob_stream("a" * 64, io.BytesIO(b"some-payload-bytes"))
+    store.write_blob_stream(digest, io.BytesIO(payload))
 
     assert len(transfer.uploaded) == 1
-    assert transfer.uploaded[0].startswith("s3://demo-bucket/repos/demo/blobs/aa/")
+    assert transfer.uploaded[0].startswith(
+        f"s3://demo-bucket/repos/demo/blobs/{digest[:2]}/"
+    )
 
 
 def test_commit_cache_is_bounded(tmp_path: Path) -> None:
@@ -502,7 +507,7 @@ def test_s3_compare_and_set_checks_expected_commit_id_under_lock(
     worktree.mkdir(parents=True)
     client_root.mkdir(parents=True)
 
-    repo = open_repository(
+    repo = create_repository(
         "s3://demo-bucket/repos/conflict-store",
         worktree=worktree,
         client_root=client_root,
@@ -520,7 +525,6 @@ def test_s3_compare_and_set_checks_expected_commit_id_under_lock(
     updated = store.compare_and_set_branch_ref(
         "main",
         "stale",
-        expected_version_token=base_state.version_token,
         expected_commit_id=base_state.commit_id,
     )
 
@@ -549,7 +553,7 @@ def test_remote_repo_commit_detects_conflict_even_if_s3_etag_is_unchanged(
         path.mkdir(parents=True)
 
     (client_a_worktree / "data.txt").write_text("alpha")
-    repo_a = open_repository(
+    repo_a = create_repository(
         "s3://demo-bucket/repos/conflict-repo",
         worktree=client_a_worktree,
         client_root=client_a_root,
@@ -644,7 +648,7 @@ def test_repository_mutations_can_use_separate_local_store(tmp_path: Path) -> No
     ).read_text().strip() == commit_id
 
     tree_entries = parse_tree_object(tree_paths[0].read_bytes())
-    assert [entry.name for entry in tree_entries] == ["sample.txt"]
+    assert [entry.path for entry in tree_entries] == ["sample.txt"]
 
 
 def test_current_branch_preference_is_local_per_client(tmp_path: Path) -> None:
@@ -740,7 +744,8 @@ def test_commit_fails_clearly_on_branch_update_conflict(tmp_path: Path) -> None:
         repo.commit("update")
     except RefConflictError as error:
         assert str(error) == (
-            f"Branch update conflict for 'main' during commit: expected {base_commit}, found {conflict_commit_id}"
+            f"Branch update conflict for 'main' during commit: "
+            f"expected {base_commit}, found {conflict_commit_id}"
         )
     else:
         raise AssertionError("Expected RefConflictError")
@@ -774,7 +779,8 @@ def test_merge_fails_clearly_on_branch_update_conflict(tmp_path: Path) -> None:
         repo.merge("feature", "main")
     except RefConflictError as error:
         assert str(error) == (
-            f"Branch update conflict for 'main' during merge: expected {base_commit}, found {conflict_commit_id}"
+            f"Branch update conflict for 'main' during merge: "
+            f"expected {base_commit}, found {conflict_commit_id}"
         )
     else:
         raise AssertionError("Expected RefConflictError")
@@ -962,7 +968,7 @@ def test_fake_s3_scale_100k_files_meta_mode(tmp_path: Path, fake_s3_installer) -
         (subdir / f"file_{i:05d}.txt").touch()
 
     print("\n[FAKE S3 SCALE] Committing 100K files to fake S3...")
-    repo = open_repository(
+    repo = create_repository(
         "s3://demo-bucket/reflake",
         worktree=worktree,
         client_root=client_root,
@@ -994,7 +1000,8 @@ def test_fake_s3_scale_100k_files_meta_mode(tmp_path: Path, fake_s3_installer) -
 
     print("\n[FAKE S3 SCALE] Summary:")
     print(
-        f"  Commit:            {commit_time:.2f}s ({100_000 / commit_time:.0f} files/sec)"
+        f"  Commit:            {commit_time:.2f}s "
+        f"({100_000 / commit_time:.0f} files/sec)"
     )
     print(f"  Single lookup:     {lookup_time * 1000:.3f}ms")
     print(f"  Prefix list (1k):  {listing_time * 1000:.3f}ms")
@@ -1011,7 +1018,7 @@ def test_fake_s3_scale_100k_files_meta_mode(tmp_path: Path, fake_s3_installer) -
 def test_three_way_merge_combines_disjoint_changes(tmp_path: Path) -> None:
     (tmp_path / "shared.txt").write_text("base")
     repo = ReflakeRepository(tmp_path)
-    base = repo.commit("base")
+    _base = repo.commit("base")
     repo.branch("feature")
     repo.set_current_branch("feature")
     (tmp_path / "feature.txt").write_text("feat")

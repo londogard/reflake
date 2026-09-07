@@ -11,15 +11,14 @@ from reflake import run_cli
 from reflake.core import (
     NonFastForwardError,
     RefConflictError,
-    open_repository,
+    create_repository,
 )
 from reflake.core.repository_sync import (
-    push,
-    pull,
-    fetch,
-    PushResult,
-    PullResult,
     FetchResult,
+    PushResult,
+    fetch,
+    pull,
+    push,
 )
 
 # ── push ──────────────────────────────────────────────────────────────────────
@@ -34,11 +33,13 @@ def test_push_blobs_and_commits_to_s3(
 
     (tmp_path / "a.txt").write_text("alpha")
     (tmp_path / "b.txt").write_text("beta")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "initial"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "initial"]) == 0
     commit_id = capsys.readouterr().out.strip()
     assert len(commit_id) == 64
 
-    repo = open_repository(str(tmp_path))
+    repo = create_repository(str(tmp_path))
     result = push(repo, "s3://demo-bucket/repos/test")
 
     assert isinstance(result, PushResult)
@@ -58,7 +59,7 @@ def test_push_with_no_commits(tmp_path: Path, fake_s3_installer) -> None:
     """Push from a branch with no commits raises ValueError."""
     fake_s3_installer({})
 
-    repo = open_repository(str(tmp_path))
+    repo = create_repository(str(tmp_path))
     with pytest.raises(ValueError, match="no commits"):
         push(repo, "s3://demo-bucket/repos/test")
 
@@ -71,10 +72,12 @@ def test_push_idempotent(
     monkeypatch.chdir(tmp_path)
 
     (tmp_path / "x.txt").write_text("data")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "first"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "first"]) == 0
     capsys.readouterr()
 
-    repo = open_repository(str(tmp_path))
+    repo = create_repository(str(tmp_path))
     result1 = push(repo, "s3://demo-bucket/repos/test")
     assert result1.updated is True
     assert result1.pushed_commits == 1
@@ -93,14 +96,16 @@ def test_push_multiple_commits(
     monkeypatch.chdir(tmp_path)
 
     (tmp_path / "f.txt").write_text("v1")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "c1"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "c1"]) == 0
     c1 = capsys.readouterr().out.strip()
 
     (tmp_path / "f.txt").write_text("v2")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "c2"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "c2"]) == 0
     c2 = capsys.readouterr().out.strip()
 
-    repo = open_repository(str(tmp_path))
+    repo = create_repository(str(tmp_path))
     result = push(repo, "s3://demo-bucket/repos/test")
     assert result.pushed_commits == 2
     assert result.updated is True
@@ -125,10 +130,12 @@ def test_pull_from_s3(tmp_path: Path, capsys, monkeypatch, fake_s3_installer) ->
     (repo_a / "hello.txt").write_text("world")
     (repo_a / "sub").mkdir()
     (repo_a / "sub" / "nested.txt").write_text("deep")
-    assert run_cli(["commit", "--repo", str(repo_a), "-m", "initial"]) == 0
+    assert run_cli(["--repo", str(repo_a), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(repo_a), "commit", "-m", "initial"]) == 0
     capsys.readouterr()
 
-    a_repo = open_repository(str(repo_a))
+    a_repo = create_repository(str(repo_a))
     result = push(a_repo, "s3://demo-bucket/repos/test")
     assert result.updated is True
     assert result.pushed_commits == 1
@@ -140,7 +147,7 @@ def test_pull_from_s3(tmp_path: Path, capsys, monkeypatch, fake_s3_installer) ->
     monkeypatch.chdir(repo_b)
 
     pull_from_remote = run_cli(
-        ["pull", "--repo", str(repo_b), "s3://demo-bucket/repos/test", "--json"]
+        ["--repo", str(repo_b), "--json", "pull", "s3://demo-bucket/repos/test"]
     )
     assert pull_from_remote == 0
     pull_json = json.loads(capsys.readouterr().out)
@@ -149,7 +156,7 @@ def test_pull_from_s3(tmp_path: Path, capsys, monkeypatch, fake_s3_installer) ->
     assert pull_json["updated"] is True
 
     # Restore files from the pulled branch and verify content
-    assert run_cli(["restore", "--repo", str(repo_b), "main"]) == 0
+    assert run_cli(["--repo", str(repo_b), "restore", "main"]) == 0
     restore_out = capsys.readouterr().out
     assert "Restored 2 file(s)" in restore_out
     assert (repo_b / "hello.txt").read_text() == "world"
@@ -163,10 +170,12 @@ def test_pull_with_no_remote_branch(
     fake_s3_installer({})
     monkeypatch.chdir(tmp_path)
     (tmp_path / "_dummy.txt").write_text("x")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "initial"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "initial"]) == 0
     capsys.readouterr()
 
-    repo = open_repository(str(tmp_path))
+    repo = create_repository(str(tmp_path))
     with pytest.raises(ValueError, match="no commits"):
         pull(repo, "s3://demo-bucket/repos/test")
 
@@ -182,17 +191,19 @@ def test_pull_idempotent(
     repo_a.mkdir()
     monkeypatch.chdir(repo_a)
     (repo_a / "data.txt").write_text("payload")
-    assert run_cli(["commit", "--repo", str(repo_a), "-m", "c"]) == 0
+    assert run_cli(["--repo", str(repo_a), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(repo_a), "commit", "-m", "c"]) == 0
     capsys.readouterr()
 
-    a_repo = open_repository(str(repo_a))
+    a_repo = create_repository(str(repo_a))
     assert push(a_repo, "s3://demo-bucket/repos/test").updated is True
 
     # Repo B: pull twice from an empty branch.
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
 
-    b_repo = open_repository(str(repo_b))
+    b_repo = create_repository(str(repo_b))
     result1 = pull(b_repo, "s3://demo-bucket/repos/test")
     assert result1.updated is True
     assert result1.pulled_commits == 1
@@ -218,20 +229,24 @@ def test_fetch_downloads_objects_without_branch_update(
     repo_a.mkdir()
     monkeypatch.chdir(repo_a)
     (repo_a / "f1.txt").write_text("one")
-    assert run_cli(["commit", "--repo", str(repo_a), "-m", "c1"]) == 0
+    assert run_cli(["--repo", str(repo_a), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(repo_a), "commit", "-m", "c1"]) == 0
     capsys.readouterr()
 
-    a_repo = open_repository(str(repo_a))
+    a_repo = create_repository(str(repo_a))
     assert push(a_repo, "s3://demo-bucket/repos/test").updated is True
 
     # Repo B: init + fetch
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
     (repo_b / "_init.txt").write_text("x")
-    assert run_cli(["commit", "--repo", str(repo_b), "-m", "b"]) == 0
+    assert run_cli(["--repo", str(repo_b), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(repo_b), "commit", "-m", "b"]) == 0
     capsys.readouterr()
 
-    b_repo = open_repository(str(repo_b))
+    b_repo = create_repository(str(repo_b))
     # Record branch state before fetch
     pre_branch = b_repo.store.read_branch_ref("main")
     pre_commit = pre_branch.commit_id if pre_branch else None
@@ -261,19 +276,23 @@ def test_fetch_idempotent(
     repo_a.mkdir()
     monkeypatch.chdir(repo_a)
     (repo_a / "f.txt").write_text("data")
-    assert run_cli(["commit", "--repo", str(repo_a), "-m", "c"]) == 0
+    assert run_cli(["--repo", str(repo_a), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(repo_a), "commit", "-m", "c"]) == 0
     capsys.readouterr()
 
-    a_repo = open_repository(str(repo_a))
+    a_repo = create_repository(str(repo_a))
     assert push(a_repo, "s3://demo-bucket/repos/test").updated is True
 
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
     (repo_b / "_init.txt").write_text("x")
-    assert run_cli(["commit", "--repo", str(repo_b), "-m", "b"]) == 0
+    assert run_cli(["--repo", str(repo_b), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(repo_b), "commit", "-m", "b"]) == 0
     capsys.readouterr()
 
-    b_repo = open_repository(str(repo_b))
+    b_repo = create_repository(str(repo_b))
 
     r1 = fetch(b_repo, "s3://demo-bucket/repos/test")
     assert r1.fetched_commits == 1
@@ -294,12 +313,14 @@ def test_cli_push_json_output(
     monkeypatch.chdir(tmp_path)
 
     (tmp_path / "x.txt").write_text("hello")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "initial"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "initial"]) == 0
     capsys.readouterr()
 
     assert (
         run_cli(
-            ["push", "--repo", str(tmp_path), "s3://demo-bucket/repos/test", "--json"]
+            ["--repo", str(tmp_path), "--json", "push", "s3://demo-bucket/repos/test"]
         )
         == 0
     )
@@ -322,10 +343,12 @@ def test_cli_pull_json_output(
     repo_a.mkdir()
     monkeypatch.chdir(repo_a)
     (repo_a / "f.txt").write_text("data")
-    assert run_cli(["commit", "--repo", str(repo_a), "-m", "c"]) == 0
+    assert run_cli(["--repo", str(repo_a), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(repo_a), "commit", "-m", "c"]) == 0
     capsys.readouterr()
 
-    a_repo = open_repository(str(repo_a))
+    a_repo = create_repository(str(repo_a))
     push(a_repo, "s3://demo-bucket/repos/test")
 
     # Repo B: pull --json from an empty branch.
@@ -334,7 +357,7 @@ def test_cli_pull_json_output(
 
     assert (
         run_cli(
-            ["pull", "--repo", str(repo_b), "s3://demo-bucket/repos/test", "--json"]
+            ["--repo", str(repo_b), "--json", "pull", "s3://demo-bucket/repos/test"]
         )
         == 0
     )
@@ -356,13 +379,13 @@ def test_push_rejects_divergent_remote_history(
     repo_a_root = tmp_path / "repo_a"
     repo_a_root.mkdir()
     (repo_a_root / "shared.txt").write_text("base")
-    repo_a = open_repository(str(repo_a_root))
+    repo_a = create_repository(str(repo_a_root))
     repo_a.commit("base")
     push(repo_a, remote)
 
     repo_b_root = tmp_path / "repo_b"
     repo_b_root.mkdir()
-    repo_b = open_repository(str(repo_b_root))
+    repo_b = create_repository(str(repo_b_root))
     pull(repo_b, remote)
     (repo_b_root / "from-b.txt").write_text("b")
     repo_b.commit("b change")
@@ -390,13 +413,13 @@ def test_pull_rejects_divergent_local_history(
     repo_a_root = tmp_path / "repo_a"
     repo_a_root.mkdir()
     (repo_a_root / "shared.txt").write_text("base")
-    repo_a = open_repository(str(repo_a_root))
+    repo_a = create_repository(str(repo_a_root))
     repo_a.commit("base")
     push(repo_a, remote)
 
     repo_b_root = tmp_path / "repo_b"
     repo_b_root.mkdir()
-    repo_b = open_repository(str(repo_b_root))
+    repo_b = create_repository(str(repo_b_root))
     pull(repo_b, remote)
     (repo_b_root / "from-b.txt").write_text("b")
     repo_b.commit("b change")
@@ -423,22 +446,26 @@ def test_cli_fetch_output(
     repo_a.mkdir()
     monkeypatch.chdir(repo_a)
     (repo_a / "x.txt").write_text("data")
-    assert run_cli(["commit", "--repo", str(repo_a), "-m", "c"]) == 0
+    assert run_cli(["--repo", str(repo_a), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(repo_a), "commit", "-m", "c"]) == 0
     capsys.readouterr()
 
-    a_repo = open_repository(str(repo_a))
+    a_repo = create_repository(str(repo_a))
     push(a_repo, "s3://demo-bucket/repos/test")
 
     # Repo B: fetch --json
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
     (repo_b / "_init.txt").write_text("x")
-    assert run_cli(["commit", "--repo", str(repo_b), "-m", "b"]) == 0
+    assert run_cli(["--repo", str(repo_b), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(repo_b), "commit", "-m", "b"]) == 0
     capsys.readouterr()
 
     assert (
         run_cli(
-            ["fetch", "--repo", str(repo_b), "s3://demo-bucket/repos/test", "--json"]
+            ["--repo", str(repo_b), "--json", "fetch", "s3://demo-bucket/repos/test"]
         )
         == 0
     )
@@ -465,14 +492,14 @@ def test_push_two_client_multi_commit_divergence(
     shared = tmp_path / "shared"
     shared.mkdir()
     (shared / "base.txt").write_text("base")
-    shared_repo = open_repository(str(shared))
+    shared_repo = create_repository(str(shared))
     shared_repo.commit("base commit")
     push(shared_repo, remote)
 
     # Client A: pull, make two commits
     repo_a = tmp_path / "repo_a"
     repo_a.mkdir()
-    a_repo = open_repository(str(repo_a))
+    a_repo = create_repository(str(repo_a))
     pull(a_repo, remote)
     (repo_a / "a1.txt").write_text("a1")
     a_repo.commit("a first change")
@@ -483,7 +510,7 @@ def test_push_two_client_multi_commit_divergence(
     # Client B: pull, make a different commit, push
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
-    b_repo = open_repository(str(repo_b))
+    b_repo = create_repository(str(repo_b))
     pull(b_repo, remote)
     (repo_b / "b.txt").write_text("b")
     b_repo.commit("b change")
@@ -510,14 +537,14 @@ def test_pull_two_client_multi_commit_divergence(
     shared = tmp_path / "shared"
     shared.mkdir()
     (shared / "base.txt").write_text("base")
-    shared_repo = open_repository(str(shared))
+    shared_repo = create_repository(str(shared))
     shared_repo.commit("base commit")
     push(shared_repo, remote)
 
     # Client A pushes two more commits.
     repo_a = tmp_path / "repo_a"
     repo_a.mkdir()
-    a_repo = open_repository(str(repo_a))
+    a_repo = create_repository(str(repo_a))
     pull(a_repo, remote)
     (repo_a / "a1.txt").write_text("a1")
     a_repo.commit("a first")
@@ -528,7 +555,7 @@ def test_pull_two_client_multi_commit_divergence(
     # Client B pulls the base, then makes local commits without pushing.
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
-    b_repo = open_repository(str(repo_b))
+    b_repo = create_repository(str(repo_b))
     pull(b_repo, remote)
     # Now rewind B to base so B's history diverges (A has already advanced).
     # Re-open to avoid stale snapshot: create a fresh repo at B's worktree
@@ -570,14 +597,14 @@ def test_push_cas_race_via_stale_snapshot(
     repo_a_root = tmp_path / "repo_a"
     repo_a_root.mkdir()
     (repo_a_root / "base.txt").write_text("base")
-    repo_a = open_repository(str(repo_a_root))
+    repo_a = create_repository(str(repo_a_root))
     repo_a.commit("base")
     push(repo_a, remote)
 
     # ── Client B pulls the base and builds on top ──
     repo_b_root = tmp_path / "repo_b"
     repo_b_root.mkdir()
-    repo_b = open_repository(str(repo_b_root))
+    repo_b = create_repository(str(repo_b_root))
     pull(repo_b, remote)
     (repo_b_root / "b.txt").write_text("b-data")
     b_commit = repo_b.commit("b commit")
@@ -602,10 +629,12 @@ def test_push_cas_race_via_stale_snapshot(
         concurrent_commit,
         b'{"id":"'
         + concurrent_commit.encode()
-        + b'","parent":"'
+        + b'","parents":["'
         + remote_state.commit_id.encode()
-        + b'","message":"concurrent",'
-        b'"manifest":"","branch":"main","generation":1,"created_at":""}',
+        + b'"],"message":"concurrent",'
+        b'"tree":"'
+        + remote_state.commit_id.encode()
+        + b'","branch":"main","generation":1,"created_at":""}',
     )
     remote_repo.store.write_branch_ref("main", concurrent_commit)
 
@@ -619,7 +648,6 @@ def test_push_cas_race_via_stale_snapshot(
     repo_b.client_state.write_branch_snapshot(
         "main",
         commit_id=remote_state.commit_id,
-        version_token="stale-race-token",
     )
     # Now fast_forward_branch will use the stale snapshot: it sees the
     # old remote head as current, checks ancestry (passes because B's
@@ -642,18 +670,18 @@ def test_pull_cas_race_via_stale_snapshot(
     repo_a_root = tmp_path / "repo_a"
     repo_a_root.mkdir()
     (repo_a_root / "base.txt").write_text("base")
-    repo_a = open_repository(str(repo_a_root))
+    repo_a = create_repository(str(repo_a_root))
     repo_a.commit("base")
     push(repo_a, remote)
 
     (repo_a_root / "a2.txt").write_text("a2")
-    a_c2 = repo_a.commit("a2")
+    _a_c2 = repo_a.commit("a2")
     push(repo_a, remote)
 
     # B pulls a_c2 so B has the commit objects locally.
     repo_b_root = tmp_path / "repo_b"
     repo_b_root.mkdir()
-    repo_b = open_repository(str(repo_b_root))
+    repo_b = create_repository(str(repo_b_root))
     pull(repo_b, remote)
 
     # A pushes one more commit so the remote head advances.
@@ -666,29 +694,24 @@ def test_pull_cas_race_via_stale_snapshot(
 
     _fetch(repo_b, remote)
 
-    # Now corrupt B's client_state so _require_branch_state returns a
-    # stale version token (but correct commit_id) during fast_forward_branch.
-    repo_b.client_state.write_branch_snapshot(
-        "main",
-        commit_id=a_c2,
-        version_token="stale-pull-token-ffff",
-    )
+    # Simulate a concurrent local writer: advance B's real head to a_c3
+    # behind the snapshot's back (snapshot still says a_c2).
+    repo_b.store.write_branch_ref("main", a_c3)
 
     # fast_forward_branch: ancestry check passes (a_c2 is ancestor of a_c3),
-    # but CAS fails because the stale version token doesn't match the store.
+    # but CAS fails because the real head already moved past the snapshot.
     with pytest.raises(RefConflictError):
         repo_b.fast_forward_branch("main", a_c3, operation="pull")
 
 
-def test_compare_and_set_branch_ref_rejects_wrong_token(
+def test_compare_and_set_branch_ref_create_is_exclusive(
     tmp_path: Path,
     fake_s3_installer,
 ) -> None:
-    """Unit-level: compare_and_set_branch_ref returns False when the
-    expected version token does not match the current store state."""
+    """Unit-level: create-only CAS (expected None) fails on an existing ref."""
     fake_s3_installer({})
 
-    repo = open_repository(str(tmp_path))
+    repo = create_repository(str(tmp_path))
     repo.commit("initial")
     commit_id = repo.resolve_ref("main")
 
@@ -696,17 +719,15 @@ def test_compare_and_set_branch_ref_rejects_wrong_token(
     result = repo.store.compare_and_set_branch_ref(
         "feature",
         commit_id,
-        expected_version_token=None,
         expected_commit_id=None,
     )
     assert result is True
 
-    # Second CAS with a wrong version token must return False.
+    # Second create-only CAS on the existing ref must return False.
     result = repo.store.compare_and_set_branch_ref(
         "feature",
         commit_id,
-        expected_version_token="wrong-token-0000",
-        expected_commit_id=commit_id,
+        expected_commit_id=None,
     )
     assert result is False
 
@@ -719,15 +740,13 @@ def test_compare_and_set_branch_ref_rejects_wrong_commit(
     expected commit ID does not match the current store state."""
     fake_s3_installer({})
 
-    repo = open_repository(str(tmp_path))
+    repo = create_repository(str(tmp_path))
     repo.commit("initial")
-    commit_id = repo.resolve_ref("main")
 
     # CAS with a wrong expected_commit_id must return False.
     result = repo.store.compare_and_set_branch_ref(
         "main",
         "aaaa" * 16,  # different commit
-        expected_version_token=repo.store.version_token("ref", "main"),
         expected_commit_id="bbbb" * 16,  # wrong
     )
     assert result is False
@@ -749,19 +768,19 @@ def test_push_recovery_after_divergent_pull_and_fetch(
     base = tmp_path / "base"
     base.mkdir()
     (base / "f.txt").write_text("base")
-    base_repo = open_repository(str(base))
+    base_repo = create_repository(str(base))
     base_repo.commit("base")
     push(base_repo, remote)
 
     # A and B both pull the base
     repo_a = tmp_path / "repo_a"
     repo_a.mkdir()
-    a_repo = open_repository(str(repo_a))
+    a_repo = create_repository(str(repo_a))
     pull(a_repo, remote)
 
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
-    b_repo = open_repository(str(repo_b))
+    b_repo = create_repository(str(repo_b))
     pull(b_repo, remote)
 
     # A commits and pushes
@@ -796,7 +815,7 @@ def test_push_progress_callback_reports_each_item(
     """push() invokes the progress callback per transferred item."""
     fake_s3_installer({})
     (tmp_path / "a.txt").write_text("alpha")
-    repo = open_repository(str(tmp_path))
+    repo = create_repository(str(tmp_path))
     repo.commit("initial")
 
     events: list[tuple[int, int]] = []
@@ -825,8 +844,8 @@ def test_push_transfers_footer_objects(
         "COPY (SELECT range AS id FROM range(0, 5)) "
         f"TO '{pfile}' (FORMAT PARQUET)"
     )
-    LocalConfig(identity="blake3", parquet_footer=True).save(tmp_path)
-    repo = open_repository(str(tmp_path))
+    LocalConfig(identity="content", parquet_footer=True).save(tmp_path)
+    repo = create_repository(str(tmp_path))
     repo.commit("with footer")
     entry = repo.resolve_entry("main", "data.parquet")
     assert entry.footer is not None

@@ -13,10 +13,11 @@ All botocore errors are translated at this boundary into domain errors
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator
+from typing import Any, BinaryIO
 from urllib.parse import unquote, urlparse
 
 import boto3
@@ -72,7 +73,7 @@ def _mtime_ns(value: object) -> int:
     if isinstance(value, datetime):
         timestamp = value
         if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
+            timestamp = timestamp.replace(tzinfo=UTC)
         return int(timestamp.timestamp() * 1_000_000_000)
     return 0
 
@@ -97,7 +98,7 @@ def iter_s3_objects(
                     mtime_ns=_mtime_ns(obj.get("LastModified")),
                 )
     except ClientError as error:
-        raise _translate_s3_error(error, "list_objects")
+        raise _translate_s3_error(error, "list_objects") from error
 
 
 def describe_source_uri(
@@ -117,7 +118,7 @@ def describe_source_uri(
                 raise FileNotFoundError(
                     f"Cannot stage missing file: {source_uri}"
                 ) from error
-            raise _translate_s3_error(error, "head_object")
+            raise _translate_s3_error(error, "head_object") from error
         return SourceObjectMetadata(
             source_uri=source_uri,
             size=int(response.get("ContentLength", 0)),
@@ -151,7 +152,7 @@ def open_source_uri(
         try:
             response = s3_client.get_object(Bucket=bucket, Key=key)
         except ClientError as error:
-            raise _translate_s3_error(error, "get_object")
+            raise _translate_s3_error(error, "get_object") from error
         body = response["Body"]
         try:
             yield body
@@ -191,7 +192,7 @@ class S3StorageBackend:
                 Bucket=self.bucket, Key=self._key(relative_path)
             )
         except ClientError as error:
-            raise _translate_s3_error(error, "read_bytes")
+            raise _translate_s3_error(error, "read_bytes") from error
         return response["Body"].read()
 
     def write_bytes(
@@ -215,7 +216,7 @@ class S3StorageBackend:
                 raise PreconditionFailedError(
                     f"Path already exists: {relative_path}"
                 ) from error
-            raise _translate_s3_error(error, "write_bytes")
+            raise _translate_s3_error(error, "write_bytes") from error
 
     def exists(self, relative_path: str) -> bool:
         try:
@@ -224,7 +225,7 @@ class S3StorageBackend:
         except ClientError as error:
             if _s3_is_404(error):
                 return False
-            raise _translate_s3_error(error, "exists")
+            raise _translate_s3_error(error, "exists") from error
 
     def ensure_dir(self, _relative_path: str) -> None:
         return None
@@ -241,13 +242,13 @@ class S3StorageBackend:
                         key = key[len(self.prefix) + 1 :]
                     yield key
         except ClientError as error:
-            raise _translate_s3_error(error, "list_objects")
+            raise _translate_s3_error(error, "list_objects") from error
 
     def delete(self, relative_path: str) -> None:
         try:
             self.client.delete_object(Bucket=self.bucket, Key=self._key(relative_path))
         except ClientError as error:
-            raise _translate_s3_error(error, "delete")
+            raise _translate_s3_error(error, "delete") from error
 
     def etag(self, relative_path: str) -> str | None:
         try:
@@ -257,5 +258,5 @@ class S3StorageBackend:
         except ClientError as error:
             if _s3_is_404(error):
                 return None
-            raise _translate_s3_error(error, "etag")
+            raise _translate_s3_error(error, "etag") from error
         return response.get("ETag", "").strip('"') or None

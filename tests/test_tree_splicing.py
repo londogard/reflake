@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-import pytest
 
 from reflake.core import (
-    ManifestEntry,
     ReflakeRepository,
-    open_repository,
 )
+from reflake.core.entry_codec import Entry
 from reflake.core.objects.tree import (
-    TreeEntry,
     parse_tree_object,
     serialize_tree_object,
 )
@@ -31,7 +28,7 @@ def test_splice_tree_reuses_untouched_subtrees(tmp_path: Path) -> None:
 
     # Find the hash of dir_a and dir_b subtrees in root_1
     root_entries_1 = {
-        e.name: e
+        e.path: e
         for e in parse_tree_object(repo.store.read_tree_bytes(root_1) or b"")
     }
     assert "dir_a" in root_entries_1
@@ -57,7 +54,7 @@ def test_splice_tree_reuses_untouched_subtrees(tmp_path: Path) -> None:
     root_2 = repo.read_commit(commit_2).tree
 
     root_entries_2 = {
-        e.name: e
+        e.path: e
         for e in parse_tree_object(repo.store.read_tree_bytes(root_2) or b"")
     }
 
@@ -71,7 +68,9 @@ def test_splice_tree_reuses_untouched_subtrees(tmp_path: Path) -> None:
     assert dir_a_hash_before not in read_tree_hashes
 
 
-def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(tmp_path: Path) -> None:
+def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(
+    tmp_path: Path,
+) -> None:
     """Verifies that repo.remove_paths and repo.move use path splicing
     and do not disturb sibling subtrees."""
     repo = ReflakeRepository(tmp_path)
@@ -84,7 +83,7 @@ def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(tmp_path: Path)
     commit_1 = repo.commit("init")
     root_1 = repo.read_commit(commit_1).tree
     keep_hash_before = {
-        e.name: e
+        e.path: e
         for e in parse_tree_object(repo.store.read_tree_bytes(root_1) or b"")
     }["keep"].hash
 
@@ -94,7 +93,7 @@ def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(tmp_path: Path)
     assert commit_2 is not None
     root_2 = repo.read_commit(commit_2).tree
     entries_2 = {
-        e.name: e
+        e.path: e
         for e in parse_tree_object(repo.store.read_tree_bytes(root_2) or b"")
     }
 
@@ -108,7 +107,7 @@ def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(tmp_path: Path)
     assert commit_3 is not None
     root_3 = repo.read_commit(commit_3).tree
     entries_3 = {
-        e.name: e
+        e.path: e
         for e in parse_tree_object(repo.store.read_tree_bytes(root_3) or b"")
     }
 
@@ -119,18 +118,18 @@ def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(tmp_path: Path)
 def test_tree_entry_msgspec_serialization_roundtrip() -> None:
     """Verifies that msgspec serialization preserves exact tree entry fields."""
     entries = [
-        TreeEntry(name="dir1", kind="t", hash="a" * 64),
-        TreeEntry(name="file1.txt", kind="b", hash="b" * 64, size=1024, mtime_ns=5000),
-        TreeEntry(
-            name="file2.parquet",
+        Entry(path="dir1", kind="t", hash="a" * 64),
+        Entry(path="file1.txt", kind="b", hash="b" * 64, size=1024, mtime_ns=5000),
+        Entry(
+            path="file2.parquet",
             kind="bp",
             hash="c" * 64,
             size=2048,
             mtime_ns=6000,
             footer="d" * 64,
         ),
-        TreeEntry(
-            name="file3.meta",
+        Entry(
+            path="file3.meta",
             kind="m",
             hash="e" * 64,
             size=512,

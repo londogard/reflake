@@ -9,9 +9,10 @@ layer depend on these names.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Protocol, Sequence
+from typing import Literal, Protocol
 
 from ..domain import OptimisticLockError
 
@@ -55,6 +56,34 @@ class SourceObjectMetadata:
     mtime_ns: int
 
 
+TransferDirection = Literal["upload", "download"]
+
+
+@dataclass(frozen=True)
+class TransferItem:
+    """One object copy in a transfer plan (docs/architecture.md §7)."""
+
+    kind: str
+    object_id: str
+    local_path: str
+    remote_uri: str
+
+
+@dataclass(frozen=True)
+class TransferPlan:
+    """A batch of object copies in one direction."""
+
+    direction: TransferDirection
+    items: tuple[TransferItem, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.direction not in ("upload", "download"):
+            raise ValueError(
+                f"Transfer direction must be 'upload' or 'download', "
+                f"got: {self.direction!r}"
+            )
+
+
 class BlobTransferBackend(Protocol):
     """Interface for blob storage transfer operations.
 
@@ -79,16 +108,11 @@ class BlobTransferBackend(Protocol):
     def exists(self, remote_uri: str) -> bool: ...
 
     def supports_batch(self) -> bool:
-        """True when the backend can execute a batch of copies at once."""
+        """True when the backend can execute a whole plan at once."""
         ...
 
-    def upload_batch(
-        self,
-        pairs: Sequence[tuple[str, str]],
-        *,
-        if_not_exists: bool = False,
-    ) -> int:
-        """Execute many ``(local_path, remote_uri)`` copies; returns count."""
+    def transfer(self, plan: TransferPlan) -> int:
+        """Execute every item in *plan*; returns the transferred count."""
         ...
 
 

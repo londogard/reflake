@@ -6,7 +6,8 @@ class ReflakeError(ValueError):
 
 
 class RefConflictError(ReflakeError):
-    """Raised when a reference update conflicts with another client or concurrent operation."""
+    """Raised when a reference update conflicts with another client or
+    concurrent operation."""
 
     def __init__(
         self,
@@ -19,7 +20,8 @@ class RefConflictError(ReflakeError):
         expected = expected_commit_id or "<empty>"
         current = current_commit_id or "<empty>"
         super().__init__(
-            f"Branch update conflict for '{branch}' during {operation}: expected {expected}, found {current}"
+            f"Branch update conflict for '{branch}' during {operation}: "
+            f"expected {expected}, found {current}"
         )
         self.branch = branch
         self.operation = operation
@@ -74,9 +76,7 @@ class NotARepositoryError(ReflakeError):
 
     def __init__(self, root: object = ".") -> None:
         self.root = str(root)
-        super().__init__(
-            f"not a reflake repository (or any of the parent directories): .reflake"
-        )
+        super().__init__(f"not a reflake repository: {self.root}")
 
 
 class UnknownRefError(ReflakeError):

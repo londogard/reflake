@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
 import pytest
 
 from reflake import (
-    ReflakeFileSystem,
     NotARepositoryError,
+    ReflakeFileSystem,
     S3ObjectStore,
+    create_repository,
     open_repository,
-    parse_where_clause,
-    plan_pruned_scan,
-    prune_row_groups,
     run_cli,
 )
 
@@ -31,24 +30,27 @@ def test_s3_atomic_cas_conditional_write(fake_s3_installer) -> None:
     client = fake_s3_installer({})
     store = S3ObjectStore("demo-bucket", "repos/test", client=client)
 
-    # Initial CAS: expected_version_token is None -> creates ref with IfNoneMatch='*'
+    # Initial CAS: expected None -> creates ref with IfNoneMatch='*'
     assert store.compare_and_set_branch_ref(
-        "main", "1" * 64, expected_version_token=None
+        "main", "1" * 64, expected_commit_id=None
     ) is True
     ref_state = store.read_branch_ref("main")
     assert ref_state is not None
     assert ref_state.commit_id == "1" * 64
-    initial_version = ref_state.version_token
-    assert initial_version is not None
 
-    # CAS with wrong version token fails
+    # Create-only CAS on an existing branch fails
     assert store.compare_and_set_branch_ref(
-        "main", "2" * 64, expected_version_token="stale_token"
+        "main", "2" * 64, expected_commit_id=None
     ) is False
 
-    # CAS with correct version token succeeds
+    # CAS with wrong expected commit fails
     assert store.compare_and_set_branch_ref(
-        "main", "2" * 64, expected_version_token=initial_version
+        "main", "2" * 64, expected_commit_id="0" * 64
+    ) is False
+
+    # CAS with correct expected commit succeeds
+    assert store.compare_and_set_branch_ref(
+        "main", "2" * 64, expected_commit_id="1" * 64
     ) is True
     updated_state = store.read_branch_ref("main")
     assert updated_state is not None
@@ -58,12 +60,12 @@ def test_s3_atomic_cas_conditional_write(fake_s3_installer) -> None:
 def test_vfs_s3_dataset_roots(
     fake_s3_installer, tmp_path: Path, monkeypatch
 ) -> None:
-    client = fake_s3_installer({})
+    fake_s3_installer({})
     repo_uri = "s3://demo-bucket/repos/remote_demo"
     monkeypatch.chdir(tmp_path)
 
     (tmp_path / "data.txt").write_text("s3 dataset content")
-    assert run_cli(["commit", "--repo", repo_uri, "-m", "remote seed"]) == 0
+    assert run_cli(["--repo", repo_uri, "commit", "-m", "remote seed"]) == 0
 
     fs = ReflakeFileSystem(dataset_roots={"remote": repo_uri})
     # Check that dataset_roots preserves the s3:// URI
@@ -81,7 +83,7 @@ def test_vfs_s3_dataset_roots(
 
 def test_repository_methods_cover_convenience_operations(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("content a")
-    repo = open_repository(tmp_path)
+    repo = create_repository(tmp_path)
     commit_id = repo.commit("commit 1")
     assert len(commit_id) == 64
 
@@ -95,7 +97,7 @@ def test_repository_methods_cover_convenience_operations(tmp_path: Path) -> None
     assert "commit" in logs[0]
 
     # Test catalog
-    cat_entries = repo.catalog()
+    cat_entries = repo.branches()
     assert len(cat_entries) == 1
     assert cat_entries[0]["branch"] == "main"
     assert cat_entries[0]["commit_id"] == commit_id
@@ -110,7 +112,7 @@ def test_not_a_repository_validation(tmp_path: Path, capsys) -> None:
     empty_dir = tmp_path / "uninitialized"
     empty_dir.mkdir()
 
-    assert run_cli(["status", "--repo", str(empty_dir)]) == 1
+    assert run_cli(["--repo", str(empty_dir), "status"]) == 1
     err = capsys.readouterr().err
     assert "not a reflake repository" in err
 
@@ -120,7 +122,9 @@ def test_not_a_repository_validation(tmp_path: Path, capsys) -> None:
 
 def test_commit_json_flag(tmp_path: Path, capsys) -> None:
     (tmp_path / "file.txt").write_text("hello json")
-    assert run_cli(["commit", "--repo", str(tmp_path), "-m", "init", "--json"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+    assert run_cli(["--repo", str(tmp_path), "--json", "commit", "-m", "init"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert "commit_id" in out
     assert len(out["commit_id"]) == 64

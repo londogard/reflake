@@ -69,12 +69,7 @@ def test_cli_metadata_only_rm_and_mv_work_for_s3_repositories(
     (tmp_path / "a.txt").unlink()
     shutil.rmtree(tmp_path / "dir")
 
-    assert (
-        run_cli(
-            ["--repo", repo_uri, "--json", "mv", "a.txt", "renamed.txt"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", repo_uri, "--json", "mv", "a.txt", "renamed.txt"]) == 0
     mv_payload = json.loads(capsys.readouterr().out)
     assert mv_payload["added"] == ["renamed.txt"]
     assert mv_payload["removed"] == ["a.txt"]
@@ -83,12 +78,7 @@ def test_cli_metadata_only_rm_and_mv_work_for_s3_repositories(
     rm_payload = json.loads(capsys.readouterr().out)
     assert rm_payload["removed"] == ["a.txt", "dir"]
 
-    assert (
-        run_cli(
-            ["--repo", repo_uri, "commit", "-m", "rename and remove"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", repo_uri, "commit", "-m", "rename and remove"]) == 0
     commit_id = capsys.readouterr().out.strip()
     assert len(commit_id) == 64
 
@@ -332,12 +322,7 @@ def test_cli_staging_commit_is_branch_scoped(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "checkout", "feature"]) == 0
     capsys.readouterr()
 
-    assert (
-        run_cli(
-            ["--repo", str(tmp_path), "--json", "add", "feature.txt"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "--json", "add", "feature.txt"]) == 0
     add_payload = json.loads(capsys.readouterr().out)
     assert add_payload["added"] == ["feature.txt"]
 
@@ -353,12 +338,7 @@ def test_cli_staging_commit_is_branch_scoped(tmp_path: Path, capsys) -> None:
     with fs.open("reflake://demo@feature+staged/feature.txt", "rb") as handle:
         assert handle.read() == b"feature"
 
-    assert (
-        run_cli(
-            ["--repo", str(tmp_path), "commit", "-m", "feature only"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "feature only"]) == 0
     feature_commit = capsys.readouterr().out.strip()
     assert feature_commit and feature_commit != base_commit
 
@@ -408,12 +388,7 @@ def test_cli_add_supports_arbitrary_local_source_with_logical_destination(
     add_payload = json.loads(capsys.readouterr().out)
     assert add_payload["added"] == ["imports/external.txt"]
 
-    assert (
-        run_cli(
-            ["--repo", str(repo_root), "commit", "-m", "ingest external"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(repo_root), "commit", "-m", "ingest external"]) == 0
     commit_id = capsys.readouterr().out.strip()
     assert len(commit_id) == 64
 
@@ -459,12 +434,7 @@ def test_cli_add_supports_s3_source_with_staged_read_and_logical_destination(
     with fs.open("reflake://demo@main+staged/imports/source.txt", "rb") as handle:
         assert handle.read() == b"remote payload"
 
-    assert (
-        run_cli(
-            ["--repo", str(repo_root), "commit", "-m", "ingest remote"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(repo_root), "commit", "-m", "ingest remote"]) == 0
     commit_id = capsys.readouterr().out.strip()
     assert len(commit_id) == 64
 
@@ -509,12 +479,7 @@ def test_cli_add_supports_local_directory_source_with_destination_prefix(
         "imports/bundle/nested/b.txt",
     ]
 
-    assert (
-        run_cli(
-            ["--repo", str(repo_root), "commit", "-m", "ingest bundle"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(repo_root), "commit", "-m", "ingest bundle"]) == 0
     capsys.readouterr()
     repo = create_repository(repo_root)
     assert list(repo.resolve_entries("main")) == [
@@ -568,12 +533,7 @@ def test_cli_add_supports_s3_prefix_with_destination_prefix(
     ) as handle:
         assert handle.read() == b"beta"
 
-    assert (
-        run_cli(
-            ["--repo", str(repo_root), "commit", "-m", "ingest batch"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(repo_root), "commit", "-m", "ingest batch"]) == 0
     capsys.readouterr()
 
 
@@ -666,20 +626,10 @@ def test_cli_merge_fast_forwards_target_branch(tmp_path: Path, capsys) -> None:
     (tmp_path / "feature.txt").write_text("feature")
     assert run_cli(["--repo", str(tmp_path), "checkout", "feature"]) == 0
     capsys.readouterr()
-    assert (
-        run_cli(
-            ["--repo", str(tmp_path), "add", "feature.txt"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "add", "feature.txt"]) == 0
     capsys.readouterr()
 
-    assert (
-        run_cli(
-            ["--repo", str(tmp_path), "commit", "-m", "feature commit"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "feature commit"]) == 0
     feature_commit = capsys.readouterr().out.strip()
     assert feature_commit and feature_commit != base_commit
 
@@ -717,27 +667,15 @@ def test_cli_merge_three_way_succeeds(tmp_path: Path, capsys) -> None:
     (tmp_path / "feature.txt").write_text("feature")
     assert run_cli(["--repo", str(tmp_path), "checkout", "feature"]) == 0
     capsys.readouterr()
-    assert (
-        run_cli(
-            ["--repo", str(tmp_path), "add", "feature.txt"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "add", "feature.txt"]) == 0
     capsys.readouterr()
 
-    assert (
-        run_cli(
-            ["--repo", str(tmp_path), "commit", "-m", "feature commit"]
-        )
-        == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "feature commit"]) == 0
     feature_commit = capsys.readouterr().out.strip()
     assert feature_commit and feature_commit != main_commit
 
     # Diverged branches with disjoint files: metadata-only 3-way merge succeeds.
-    assert (
-        run_cli(["--repo", str(tmp_path), "--json", "merge", "feature", "main"]) == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "--json", "merge", "feature", "main"]) == 0
     merge_payload = json.loads(capsys.readouterr().out)
     assert merge_payload["updated"] is True
     assert merge_payload["commit_id"] != main_commit
@@ -785,7 +723,8 @@ def test_cli_log_command(tmp_path: Path, capsys, monkeypatch) -> None:
     assert log_json[0]["id"] == commit_b
     assert log_json[0]["parents"] == [commit_a]
     assert log_json[0]["message"] == "update progress"
-    assert log_json[0]["branch"] == "main"
+    # Commits no longer record a branch: membership derives from refs, not the object.
+    assert "branch" not in log_json[0]
     assert log_json[1]["id"] == commit_a
     assert log_json[1]["parents"] == []
     assert log_json[1]["message"] == "initial seed"

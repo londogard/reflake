@@ -42,9 +42,7 @@ def build_analytical_index(
     ) as temp:
         manifest_path = Path(temp.name)
         writer = csv.writer(temp)
-        writer.writerow(
-            ["path", "hash", "size", "mtime_ns", "footer", "commit_id", "branch"]
-        )
+        writer.writerow(["path", "hash", "size", "mtime_ns", "footer", "commit_id"])
         for entry in repo.store.iter_all_entries(commit.tree):
             writer.writerow(
                 [
@@ -54,7 +52,6 @@ def build_analytical_index(
                     entry.mtime_ns,
                     entry.footer or "",
                     commit_id,
-                    commit.branch,
                 ]
             )
 
@@ -69,8 +66,7 @@ def build_analytical_index(
                 size::BIGINT AS size,
                 mtime_ns::BIGINT AS mtime_ns,
                 NULLIF(footer, '')::VARCHAR AS footer,
-                commit_id::VARCHAR AS commit_id,
-                branch::VARCHAR AS branch
+                commit_id::VARCHAR AS commit_id
             FROM read_csv_auto(?, header=true)
             """,
             [str(manifest_path)],

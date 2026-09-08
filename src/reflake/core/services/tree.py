@@ -25,6 +25,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+import msgspec
 from blake3 import blake3
 
 from ..client_state import LocalClientState
@@ -79,13 +80,11 @@ def _leaf_line(
     # Hot path (once per committed file): inputs are producer-guaranteed
     # (digest output, stat values, walk names, closed kind branch), so
     # serialize directly without building a validated Entry.
-    return encode_leaf_parts(
-        kind, name, hash_value, size, mtime_ns, source_uri, footer
-    )
+    return encode_leaf_parts(kind, name, hash_value, size, mtime_ns, source_uri, footer)
 
 
 def _subtree_line(kind: str, name: str, hash_value: str) -> str:
-    return json.dumps([kind, name, hash_value], separators=(",", ":"))
+    return msgspec.json.encode([kind, name, hash_value]).decode("utf-8")
 
 
 def _entry_to_leaf_line(entry: Entry) -> str:
@@ -388,9 +387,7 @@ class TreeWriter:
         with source_path.open("rb") as handle:
             return capture_footer_stats(self.store, handle)
 
-    def _prune_tree(
-        self, root_tree: str, removed: set[str]
-    ) -> str | None:
+    def _prune_tree(self, root_tree: str, removed: set[str]) -> str | None:
         """Rebuild the tree DAG, dropping entries under removal prefixes.
 
         Returns ``None`` when the whole tree is removed.  Subtrees untouched
@@ -419,9 +416,7 @@ class TreeWriter:
                         kept.append(
                             (
                                 entry.path,
-                                _subtree_line(
-                                    entry.kind, entry.path, entry.hash
-                                ),
+                                _subtree_line(entry.kind, entry.path, entry.hash),
                             )
                         )
                         continue
@@ -502,9 +497,7 @@ class TreeWriter:
         modified on both sides.  Returns ``(merged_tree_hash, conflict_paths)``.
         """
         base_iter = (
-            iter(())
-            if base_tree is None
-            else self._walker.iter_all_entries(base_tree)
+            iter(()) if base_tree is None else self._walker.iter_all_entries(base_tree)
         )
         ours_iter = self._walker.iter_all_entries(ours_tree)
         theirs_iter = self._walker.iter_all_entries(theirs_tree)
@@ -525,9 +518,7 @@ class TreeWriter:
 
             def advance() -> None:
                 nonlocal base, ours, theirs
-                path = min(
-                    p.path for p in (base, ours, theirs) if p is not None
-                )
+                path = min(p.path for p in (base, ours, theirs) if p is not None)
                 if base is not None and base.path == path:
                     base = next(base_iter, None)
                 if ours is not None and ours.path == path:
@@ -577,9 +568,7 @@ class TreeWriter:
         """Three-way merge that raises ``MergeConflictError`` on conflicts."""
         from ..domain import MergeConflictError
 
-        merged_tree, conflicts = self.three_way_merge(
-            base_tree, ours_tree, theirs_tree
-        )
+        merged_tree, conflicts = self.three_way_merge(base_tree, ours_tree, theirs_tree)
         if conflicts:
             raise MergeConflictError(paths=sorted(conflicts))
         return merged_tree
@@ -694,9 +683,7 @@ class TreeWriter:
                         kept.append(
                             (
                                 entry.path,
-                                _subtree_line(
-                                    entry.kind, entry.path, entry.hash
-                                ),
+                                _subtree_line(entry.kind, entry.path, entry.hash),
                             )
                         )
                         continue
@@ -717,9 +704,7 @@ class TreeWriter:
                         kept.append(
                             (
                                 name,
-                                _subtree_line(
-                                    KIND_TREE, name, new_sub_hash
-                                ),
+                                _subtree_line(KIND_TREE, name, new_sub_hash),
                             )
                         )
 
@@ -741,9 +726,7 @@ class TreeWriter:
                         kept.append(
                             (
                                 child_name,
-                                _subtree_line(
-                                    KIND_TREE, child_name, new_sub_hash
-                                ),
+                                _subtree_line(KIND_TREE, child_name, new_sub_hash),
                             )
                         )
                         changed = True
@@ -765,9 +748,7 @@ class TreeWriter:
                     kept.append(
                         (
                             child_name,
-                            _subtree_line(
-                                KIND_TREE, child_name, new_sub_hash
-                            ),
+                            _subtree_line(KIND_TREE, child_name, new_sub_hash),
                         )
                     )
                     changed = True
@@ -816,17 +797,20 @@ class TreeWriter:
         if parents:
             generation = (
                 max(
-                    self.refs.read_commit(parent_id).generation
-                    for parent_id in parents
+                    self.refs.read_commit(parent_id).generation for parent_id in parents
                 )
                 + 1
             )
         created_at = datetime.now(UTC).isoformat()
-        # The commit id hashes only content (not timestamp, branch, or
-        # generation), so the same content always yields the same id across
-        # branches and retries are idempotent. ``created_at``/``branch`` are
-        # recorded in the stored payload for humans, not in the hash;
-        # ``generation`` is DAG-derivable and kept as a stored perf hint.
+        # The commit id hashes only content (not timestamp or generation), so
+        # the same content always yields the same id across branches and
+        # retries are idempotent. ``created_at`` is recorded in the stored
+        # payload for humans, not in the hash; ``generation`` is DAG-derivable
+        # and kept as a stored perf hint.
+        #
+        # The identity body stays on stdlib ``json`` (sorted keys, ensure_ascii)
+        # on purpose: it is a frozen canonical form that must never change.
+        # Everything else in this module serializes with msgspec.
         identity_body: dict[str, object] = {
             "message": message,
             "tree": tree_hash,
@@ -842,23 +826,23 @@ class TreeWriter:
             tree=tree_hash,
             parents=tuple(parents),
             created_at=created_at,
-            branch=branch,
             generation=generation,
         )
         self.refs.cache_commit(commit_object)
-        stored = json.dumps(
-            {
-                "id": commit_id,
-                "message": message,
-                "tree": tree_hash,
-                "parents": parents,
-                "created_at": created_at,
-                "branch": branch,
-                "generation": generation,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8") + b"\n"
+        stored = (
+            msgspec.json.encode(
+                {
+                    "id": commit_id,
+                    "message": message,
+                    "tree": tree_hash,
+                    "parents": parents,
+                    "created_at": created_at,
+                    "generation": generation,
+                },
+                order="deterministic",
+            )
+            + b"\n"
+        )
         self.store.write_commit_bytes(
             commit_id,
             stored,
@@ -890,17 +874,13 @@ class TreeWriter:
         _seen_trees: set[str] | None = None,
     ) -> Iterator[tuple[str | None, str | None]]:
         """Yield ``(blob_hash, footer_hash)`` for every leaf in the tree DAG."""
-        yield from self.inspector.iter_leaf_refs(
-            root_tree, _seen_trees=_seen_trees
-        )
+        yield from self.inspector.iter_leaf_refs(root_tree, _seen_trees=_seen_trees)
 
     def export_derived_manifest(self, tree_hash: str) -> Path:
         """Flatten *tree_hash* into a JSONL manifest with block offsets."""
         return self.inspector.export_derived_manifest(tree_hash)
 
-    def lookup_derived_entry(
-        self, tree_hash: str, logical_path: str
-    ) -> Entry | None:
+    def lookup_derived_entry(self, tree_hash: str, logical_path: str) -> Entry | None:
         """Point lookup through the cached derived manifest (optional path)."""
         return self.inspector.lookup_derived_entry(tree_hash, logical_path)
 

@@ -14,7 +14,7 @@ from reflake.core.entry_codec import (
     leaf_kind_for,
 )
 from reflake.core.layout import object_relative_key
-from reflake.core.objects.tree import parse_tree_object, serialize_tree_object
+from reflake.core.objects.tree import parse_tree_object
 from reflake.core.repository_support import merge_sorted_streams
 
 DIGEST = "a" * 64
@@ -39,16 +39,29 @@ def test_leaf_codec_round_trips_every_shape() -> None:
     cases = [
         Entry(kind="b", path="f.txt", hash=DIGEST, size=1, mtime_ns=2),
         Entry(
-            kind="m", path="f.txt", hash=DIGEST, size=1, mtime_ns=2,
+            kind="m",
+            path="f.txt",
+            hash=DIGEST,
+            size=1,
+            mtime_ns=2,
             source_uri="s3://bucket/key",
         ),
         Entry(
-            kind="bp", path="f.parquet", hash=DIGEST, size=1, mtime_ns=2,
+            kind="bp",
+            path="f.parquet",
+            hash=DIGEST,
+            size=1,
+            mtime_ns=2,
             footer=FOOTER,
         ),
         Entry(
-            kind="mp", path="f.parquet", hash=DIGEST, size=1, mtime_ns=2,
-            source_uri="file:///f.parquet", footer=FOOTER,
+            kind="mp",
+            path="f.parquet",
+            hash=DIGEST,
+            size=1,
+            mtime_ns=2,
+            source_uri="file:///f.parquet",
+            footer=FOOTER,
         ),
     ]
     for record in cases:
@@ -89,8 +102,14 @@ def test_subtree_lines_reject_leaf_fields() -> None:
     with pytest.raises(ValueError, match="Subtree entries only carry"):
         Entry(path="d", kind="t", hash=DIGEST, size=5)
     with pytest.raises(ValueError, match="Blob-backed entries cannot carry source_uri"):
-        Entry(path="f.txt", kind="b", hash=DIGEST, size=1, mtime_ns=1,
-                      source_uri="file:///f.txt")
+        Entry(
+            path="f.txt",
+            kind="b",
+            hash=DIGEST,
+            size=1,
+            mtime_ns=1,
+            source_uri="file:///f.txt",
+        )
 
 
 def test_leaf_kind_derivation_is_single_sourced() -> None:
@@ -104,10 +123,16 @@ def test_tree_object_round_trip_with_mixed_entries() -> None:
     entries = [
         Entry(path="a.bin", kind="b", hash=DIGEST, size=1, mtime_ns=2),
         Entry(path="sub", kind="t", hash=DIGEST),
-        Entry(path="z.meta", kind="m", hash=DIGEST, size=1, mtime_ns=2,
-                  source_uri="s3://bucket/z"),
+        Entry(
+            path="z.meta",
+            kind="m",
+            hash=DIGEST,
+            size=1,
+            mtime_ns=2,
+            source_uri="s3://bucket/z",
+        ),
     ]
-    payload = serialize_tree_object(entries)
+    payload = ("\n".join(entry.serialize() for entry in entries) + "\n").encode("utf-8")
     assert parse_tree_object(payload) == entries
 
 
@@ -133,8 +158,7 @@ def test_local_store_paths_derive_from_key_space(tmp_path: Path) -> None:
     )
     tree_hash = repo.read_commit(commit_id).tree
     assert (
-        repo.store.tree_path(tree_hash)
-        == tmp_path / ".reflake" / "trees" / tree_hash
+        repo.store.tree_path(tree_hash) == tmp_path / ".reflake" / "trees" / tree_hash
     )
 
 
@@ -192,9 +216,7 @@ def test_overlay_staged_uses_stream_merge_for_replacement(tmp_path: Path) -> Non
 def test_branch_snapshots_relocated_out_of_refs_heads(tmp_path: Path) -> None:
     repo = create_repository(tmp_path)
     _make_commit(repo, "a.txt", "base")
-    repo.refs.client_state.write_branch_snapshot(
-        "main", commit_id=repo.head_commit()
-    )
+    repo.refs.client_state.write_branch_snapshot("main", commit_id=repo.head_commit())
 
     snapshot = tmp_path / ".reflake/state/branch-snapshots/main.json"
     assert snapshot.exists()

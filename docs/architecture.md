@@ -156,10 +156,10 @@ flowchart LR
 - **footer** — compact parquet stats object (§4): schema hash + per-row-group column
   min/max/nulls. Referenced from `bp`/`mp` tree entries. Small, content-addressed,
   cacheable.
-- **commit** — `{ tree, parents: [...], message, created_at, branch, generation }`, with
+- **commit** — `{ tree, parents: [...], message, created_at, generation }`, with
   `generation = 1 + max(parent generations)` (1 for a root commit).
   The commit id hashes only content (`message, tree, parents`) —
-  `created_at`/`branch` are recorded, not hashed, and `generation` is a
+  `created_at` is recorded, not hashed, and `generation` is a
   DAG-derivable perf hint — so identical content yields identical ids
   across branches and retries are idempotent.
 - **ref** — branch → commit id, updated via commit-id CAS (unchanged).

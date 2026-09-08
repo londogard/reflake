@@ -6,10 +6,7 @@ from reflake.core import (
     ReflakeRepository,
 )
 from reflake.core.entry_codec import Entry
-from reflake.core.objects.tree import (
-    parse_tree_object,
-    serialize_tree_object,
-)
+from reflake.core.objects.tree import parse_tree_object
 
 
 def test_splice_tree_reuses_untouched_subtrees(tmp_path: Path) -> None:
@@ -28,8 +25,7 @@ def test_splice_tree_reuses_untouched_subtrees(tmp_path: Path) -> None:
 
     # Find the hash of dir_a and dir_b subtrees in root_1
     root_entries_1 = {
-        e.path: e
-        for e in parse_tree_object(repo.store.read_tree_bytes(root_1) or b"")
+        e.path: e for e in parse_tree_object(repo.store.read_tree_bytes(root_1) or b"")
     }
     assert "dir_a" in root_entries_1
     assert "dir_b" in root_entries_1
@@ -54,8 +50,7 @@ def test_splice_tree_reuses_untouched_subtrees(tmp_path: Path) -> None:
     root_2 = repo.read_commit(commit_2).tree
 
     root_entries_2 = {
-        e.path: e
-        for e in parse_tree_object(repo.store.read_tree_bytes(root_2) or b"")
+        e.path: e for e in parse_tree_object(repo.store.read_tree_bytes(root_2) or b"")
     }
 
     # dir_a must retain its exact same hash!
@@ -83,8 +78,7 @@ def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(
     commit_1 = repo.commit("init")
     root_1 = repo.read_commit(commit_1).tree
     keep_hash_before = {
-        e.path: e
-        for e in parse_tree_object(repo.store.read_tree_bytes(root_1) or b"")
+        e.path: e for e in parse_tree_object(repo.store.read_tree_bytes(root_1) or b"")
     }["keep"].hash
 
     # Move data to archive
@@ -93,8 +87,7 @@ def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(
     assert commit_2 is not None
     root_2 = repo.read_commit(commit_2).tree
     entries_2 = {
-        e.path: e
-        for e in parse_tree_object(repo.store.read_tree_bytes(root_2) or b"")
+        e.path: e for e in parse_tree_object(repo.store.read_tree_bytes(root_2) or b"")
     }
 
     assert "data" not in entries_2
@@ -107,8 +100,7 @@ def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(
     assert commit_3 is not None
     root_3 = repo.read_commit(commit_3).tree
     entries_3 = {
-        e.path: e
-        for e in parse_tree_object(repo.store.read_tree_bytes(root_3) or b"")
+        e.path: e for e in parse_tree_object(repo.store.read_tree_bytes(root_3) or b"")
     }
 
     assert "archive" not in entries_3
@@ -137,6 +129,6 @@ def test_tree_entry_msgspec_serialization_roundtrip() -> None:
             source_uri="s3://bucket/key",
         ),
     ]
-    payload = serialize_tree_object(entries)
+    payload = ("\n".join(entry.serialize() for entry in entries) + "\n").encode("utf-8")
     parsed = parse_tree_object(payload)
     assert parsed == entries

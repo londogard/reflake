@@ -22,7 +22,6 @@ adds the tree-object container operations.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import replace
 
 from blake3 import blake3
@@ -64,12 +63,6 @@ def _validate_component_name(name: str) -> None:
         raise ValueError("Tree entry name must be a single path component")
     if name in {".", ".."}:
         raise ValueError("Tree entry name cannot be '.' or '..'")
-
-
-def serialize_tree_object(entries: Iterable[Entry]) -> bytes:
-    """Serialize entries (sorted by name) into tree object bytes."""
-    lines = [entry.serialize() for entry in entries]
-    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def parse_tree_object(payload: bytes) -> list[Entry]:

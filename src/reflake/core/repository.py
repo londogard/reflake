@@ -57,7 +57,7 @@ class ReflakeRepository:
         self.store = store or LocalObjectStore(self.layout.root)
         if isinstance(self.store, S3ObjectStore) and blob_transfer is not None:
             self.store.transfer_backend = blob_transfer
-        self.client_state = client_state or LocalClientState(self.layout.root)
+        self.client_state = client_state or self._default_client_state()
         self.refs = RefManager(store=self.store, client_state=self.client_state)
         self.tree_writer = TreeWriter(
             store=self.store,
@@ -75,6 +75,20 @@ class ReflakeRepository:
             store=self.store,
             refs=self.refs,
         )
+
+    def _default_client_state(self) -> LocalClientState:
+        """Default client-state root, mirroring ``open_repository``.
+
+        Local stores keep client state beside the repository. Remote stores
+        namespace it under ``.reflake/clients/<repo-id>`` so opening a remote
+        repository never creates a bare local ``.reflake`` storage tree.
+        """
+        if isinstance(self.store, S3ObjectStore):
+            repo_uri = f"s3://{self.store.bucket}/{self.store.prefix}"
+            return LocalClientState(
+                _default_remote_client_root(self.layout.root, repo_uri)
+            )
+        return LocalClientState(self.layout.root)
 
     @property
     def root(self) -> Path:
@@ -127,9 +141,7 @@ class ReflakeRepository:
             ancestor_commit=target_commit,
             descendant_commit=source_commit,
         ):
-            self.refs.fast_forward_branch(
-                target_ref, source_commit, operation="merge"
-            )
+            self.refs.fast_forward_branch(target_ref, source_commit, operation="merge")
             return MergeResult(
                 source_ref=source_ref,
                 target_ref=target_ref,
@@ -646,9 +658,7 @@ class ReflakeRepository:
                 commit.tree, _seen=seen_trees
             ):
                 reachable_trees.add(tree_hash)
-            for blob_hash, footer_hash in self.tree_writer.iter_leaf_refs(
-                commit.tree
-            ):
+            for blob_hash, footer_hash in self.tree_writer.iter_leaf_refs(commit.tree):
                 if blob_hash:
                     reachable_blobs.add(blob_hash)
                 if footer_hash:
@@ -755,9 +765,7 @@ def init_repository(
         )
     store = LocalObjectStore(repo_root)
     if store.read_branch_ref(default_branch) is None:
-        store.compare_and_set_branch_ref(
-            default_branch, None, expected_commit_id=None
-        )
+        store.compare_and_set_branch_ref(default_branch, None, expected_commit_id=None)
     return repo_root
 
 

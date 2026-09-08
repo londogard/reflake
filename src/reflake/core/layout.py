@@ -14,7 +14,6 @@ class ReflakeLayout:
     commits_dir: Path
     trees_dir: Path
     footers_dir: Path
-    manifests_dir: Path
     staging_dir: Path
     refs_dir: Path
     heads_dir: Path
@@ -27,7 +26,6 @@ class ReflakeLayout:
         commits_dir = reflake_dir / "commits"
         trees_dir = reflake_dir / "trees"
         footers_dir = reflake_dir / "footers"
-        manifests_dir = reflake_dir / "manifests"
         staging_dir = reflake_dir / "staging"
         refs_dir = reflake_dir / "refs"
         heads_dir = refs_dir / "heads"
@@ -38,7 +36,6 @@ class ReflakeLayout:
                 commits_dir,
                 trees_dir,
                 footers_dir,
-                manifests_dir,
                 staging_dir,
                 refs_dir,
                 heads_dir,
@@ -52,7 +49,6 @@ class ReflakeLayout:
             commits_dir=commits_dir,
             trees_dir=trees_dir,
             footers_dir=footers_dir,
-            manifests_dir=manifests_dir,
             staging_dir=staging_dir,
             refs_dir=refs_dir,
             heads_dir=heads_dir,

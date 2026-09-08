@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
 
 ## Unreleased
 
+## [0.2.0] - 2026-09-08
+
 ### Breaking pre-1.0 cleanup
 
 No backcompat is kept for anything below — this is the last window for it.

@@ -766,9 +766,9 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, StatusArgs):
-            stage = open_repository(
-                repo_root, must_exist=True
-            ).status(working_tree=True)
+            stage = open_repository(repo_root, must_exist=True).status(
+                working_tree=True
+            )
             if as_json:
                 print(json.dumps(_stage_payload(stage), indent=2))
             else:
@@ -1020,7 +1020,6 @@ def run_cli(argv: list[str] | None = None) -> int:
                         "tree": c.tree,
                         "parents": list(c.parents),
                         "created_at": c.created_at,
-                        "branch": c.branch,
                     }
                     for c in commits
                 ]
@@ -1033,7 +1032,6 @@ def run_cli(argv: list[str] | None = None) -> int:
                     print(f"Date:   {c.created_at}")
                     for p in c.parents:
                         print(f"Parent: {p}")
-                    print(f"Branch: {c.branch}")
                     print()
                     msg_indented = "\n".join(
                         f"    {line}" for line in c.message.splitlines()

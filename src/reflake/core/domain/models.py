@@ -14,7 +14,6 @@ class BranchRefState:
     commit_id: str | None
 
 
-
 @dataclass(frozen=True)
 class CommitObject:
     id: str
@@ -22,7 +21,6 @@ class CommitObject:
     tree: str
     parents: tuple[str, ...] = ()
     created_at: str = ""
-    branch: str = ""
     generation: int = 0
 
     @property

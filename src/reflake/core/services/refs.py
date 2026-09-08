@@ -6,8 +6,9 @@ read and every mutation flows through one consistent place.
 
 from __future__ import annotations
 
-import json
 from collections import OrderedDict
+
+import msgspec
 
 from ..client_state import LocalClientState
 from ..domain import (
@@ -125,7 +126,7 @@ class RefManager:
         commit_payload = self.store.read_commit_bytes(commit_id)
         if commit_payload is None:
             raise UnknownCommitError(commit_id)
-        data = json.loads(commit_payload.decode("utf-8"))
+        data = msgspec.json.decode(commit_payload)
         parents_raw = data.get("parents") or []
         commit = CommitObject(
             id=str(data["id"]),
@@ -133,7 +134,6 @@ class RefManager:
             tree=str(data["tree"]),
             parents=tuple(str(p) for p in parents_raw),
             created_at=str(data["created_at"]),
-            branch=str(data["branch"]),
             generation=int(data.get("generation", 0)),
         )
         self._commit_cache[commit_id] = commit

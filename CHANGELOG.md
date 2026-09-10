@@ -6,6 +6,14 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
 
 ## Unreleased
 
+## [0.2.1] - 2026-09-10
+
+### Deprecated
+
+- **v0.2.0** is deprecated and superseded by 0.2.1 — it corrupts full commits
+  in directories with more than 10k entries (sharded directories). See the
+  notice under 0.2.0 below.
+
 ### Fixed
 
 - **`identity promote` keeps parquet footer stats.** Promotion rewrote
@@ -126,6 +134,10 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
   runtime state must never be committed.
 
 ## [0.2.0] - 2026-09-08
+
+> **Deprecated — superseded by 0.2.1.** This release corrupts full commits in
+> directories with more than 10k entries (sharded directories) and can drop
+> parquet footer statistics on `identity promote`. Use 0.2.1 or later.
 
 ### Breaking pre-1.0 cleanup
 

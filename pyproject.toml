@@ -1,6 +1,6 @@
 [project]
 name = "reflake"
-version = "0.2.0"
+version = "0.2.1"
 description = "A client-first, object-storage-first data versioning engine"
 readme = "README.md"
 authors = [{ name = "Hampus Londögård", email = "hampus.londogard@gmail.com" }]

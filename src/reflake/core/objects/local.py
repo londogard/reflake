@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import BinaryIO
@@ -290,8 +290,14 @@ class LocalObjectStore:
         elif kind == "commit":
             yield from (p.stem for p in self.layout.commits_dir.glob("*.json"))
 
-    def delete_object(self, kind: RepositoryObjectKind, object_id: str) -> None:
-        self._path_for(kind, object_id).unlink(missing_ok=True)
+    def delete_objects(
+        self, kind: RepositoryObjectKind, object_ids: Iterable[str]
+    ) -> int:
+        deleted = 0
+        for object_id in object_ids:
+            self._path_for(kind, object_id).unlink(missing_ok=True)
+            deleted += 1
+        return deleted
 
     def object_path(self, kind: RepositoryObjectKind, object_id: str) -> Path:
         return self._path_for(kind, object_id)

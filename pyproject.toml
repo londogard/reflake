@@ -73,6 +73,11 @@ project-includes = ["src/reflake"]
 project-excludes = ["tests/"]
 
 [tool.pytest.ini_options]
+# Benchmarks (wall-clock/memory asserts) are excluded from the default run:
+# they are environment-sensitive and would make CI flaky. Run them explicitly
+# with `uv run pytest -m benchmark` (or combine with integration tests).
+addopts = "-m 'not benchmark'"
 markers = [
     "integration: tests that require a real S3-compatible service such as Ministack",
+    "benchmark: wall-clock or memory benchmarks (excluded unless selected)",
 ]

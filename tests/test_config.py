@@ -83,7 +83,9 @@ def test_config_get_subcommand_is_removed(tmp_path: Path) -> None:
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "init"]) == 0
 
-    assert run_cli(["--repo", str(tmp_path), "config", "get", "backend"]) == 2
+    # Unknown subcommand is a usage error → exit 1 (2 is reserved for
+    # retryable conflicts).
+    assert run_cli(["--repo", str(tmp_path), "config", "get", "backend"]) == 1
 
 
 def test_config_set_via_cli(tmp_path: Path, capsys) -> None:

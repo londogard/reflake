@@ -63,7 +63,7 @@ jobs:
                   fi
 
             - name: Run non-integration tests
-              run: uv run pytest tests -m "not integration"
+              run: uv run pytest tests -m "not integration and not benchmark"
 
             - name: Smoke-test CLI help
               run: uv run reflake --help

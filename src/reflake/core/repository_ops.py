@@ -8,6 +8,7 @@ manifests; unchanged subtrees are reused by content-addressing.
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Literal
 
@@ -75,7 +76,7 @@ def repo_import_s3(
     if identity_mode not in {"content", "pointer"}:
         raise ValueError("identity_mode must be one of: content, pointer")
     branch = ref or repo.current_branch()
-    branch_state = repo.refs.require_branch_state(branch)
+    branch_state = repo.refs.require_branch_state(branch, allow_unborn=True)
     parent_commit = branch_state.commit_id
 
     parent_tree: str | None = None
@@ -308,6 +309,17 @@ def repo_verify(
     *,
     dry_run: bool = False,
 ) -> VerifyResult:
+    """Audit pointer entries, optionally promoting them to canonical blobs.
+
+    ``dry_run=True`` is strictly read-only: it walks tree metadata, counts
+    candidate entries, and writes nothing (no tree objects, no commit).
+
+    Promotion path-splices the promoted leaves into the parent tree
+    (``TreeWriter.splice_tree``), so only directories containing promoted
+    entries are rewritten — never the whole tree. ``--path`` prefixes scope
+    the walk (and the reported totals) to those prefixes, so auditing one
+    directory does not enumerate the repository.
+    """
     if ref is None:
         ref = repo.current_branch()
 
@@ -317,57 +329,76 @@ def repo_verify(
         prefix.strip("/") for prefix in (path_prefixes or []) if prefix.strip("/")
     ]
 
-    verified_entries = 0
-    candidate_entries = 0
-    total_entries = 0
-
-    def should_verify(entry_path: str) -> bool:
+    def iter_scope() -> Iterator[Entry]:
         if not normalized_prefixes:
-            return True
-        return any(
-            entry_path == prefix or entry_path.startswith(f"{prefix}/")
-            for prefix in normalized_prefixes
-        )
+            yield from repo.store.iter_all_entries(base_commit.tree)
+            return
+        seen: set[str] = set()
+        for prefix in normalized_prefixes:
+            for entry in repo.store.iter_entries_for_prefix(
+                base_commit.tree, prefix
+            ):
+                if entry.path in seen:
+                    continue
+                seen.add(entry.path)
+                yield entry
 
-    def iter_verified_entries() -> Iterator[Entry]:
-        nonlocal verified_entries, candidate_entries, total_entries
-        for entry in repo.store.iter_all_entries(base_commit.tree):
+    if dry_run:
+        total_entries = 0
+        candidate_entries = 0
+        for entry in iter_scope():
             total_entries += 1
-            if not should_verify(entry.path):
-                yield entry
-                continue
-            if entry.blob_hash:
-                yield entry
-                continue
-            candidate_entries += 1
-            if dry_run:
-                yield entry
-                continue
-            if not entry.source_uri:
-                raise FileNotFoundError(
-                    f"Cannot verify '{entry.path}' because source_uri is missing"
-                )
-            digest = repo.entries.store_blob_from_source_uri(entry.source_uri)
-            verified_entries += 1
-            yield Entry.with_identity(
-                entry.path,
-                digest,
-                entry.size,
-                entry.mtime_ns,
-                "content",
-            )
-
-    root_tree = repo.tree_writer.build_from_entries(iter_verified_entries())
-    if verified_entries == 0:
+            if entry.blob_hash is None:
+                candidate_entries += 1
         return VerifyResult(
             commit_id=base_commit_id,
             verified_entries=0,
             candidate_entries=candidate_entries,
             total_entries=total_entries,
             created_commit=False,
-            dry_run=dry_run,
+            dry_run=True,
         )
 
+    total_entries = 0
+    additions: list[Entry] = []
+    for entry in iter_scope():
+        total_entries += 1
+        if entry.blob_hash is not None:
+            continue
+        if not entry.source_uri:
+            raise FileNotFoundError(
+                f"Cannot promote '{entry.path}' because source_uri is missing"
+            )
+        digest = repo.entries.store_blob_from_source_uri(entry.source_uri)
+        additions.append(
+            # Carry the footer over: promoting an `mp` (parquet, source
+            # pointer) entry must produce `bp`, not `b`, or the captured
+            # row-group statistics would be silently dropped.
+            Entry.with_identity(
+                entry.path,
+                digest,
+                entry.size,
+                entry.mtime_ns,
+                "content",
+                footer=entry.footer,
+            )
+        )
+
+    if not additions:
+        return VerifyResult(
+            commit_id=base_commit_id,
+            verified_entries=0,
+            candidate_entries=0,
+            total_entries=total_entries,
+            created_commit=False,
+            dry_run=False,
+        )
+
+    root_tree = repo.tree_writer.splice_tree(
+        parent_tree=base_commit.tree,
+        additions=additions,
+        removed_prefixes=set(),
+    )
     commit_id = repo.tree_writer.write_commit_object(
         branch=ref,
         message=f"promote {ref}",
@@ -378,11 +409,11 @@ def repo_verify(
     )
     return VerifyResult(
         commit_id=commit_id,
-        verified_entries=verified_entries,
-        candidate_entries=candidate_entries,
+        verified_entries=len(additions),
+        candidate_entries=len(additions),
         total_entries=total_entries,
         created_commit=True,
-        dry_run=dry_run,
+        dry_run=False,
     )
 
 
@@ -398,10 +429,24 @@ def repo_restore_files(
 
     if paths:
         entries: dict[str, Entry] = {}
-        for p in paths:
-            entry = repo.store.lookup_entry(commit.tree, p)
-            if entry is not None:
-                entries[p] = entry
+        unmatched: list[str] = []
+        for raw_path in paths:
+            normalized = normalize_repository_path(raw_path)
+            exact = repo.store.lookup_entry(commit.tree, normalized)
+            if exact is not None:
+                entries[exact.path] = exact
+                continue
+            # Accept directory prefixes as well as exact file paths.
+            matches = list(repo.store.iter_entries_for_prefix(commit.tree, normalized))
+            if not matches:
+                unmatched.append(raw_path)
+                continue
+            for entry in matches:
+                entries[entry.path] = entry
+        if unmatched:
+            raise FileNotFoundError(
+                f"Path not found in ref '{ref}': {', '.join(sorted(unmatched))}"
+            )
     else:
         entries = {
             entry.path: entry
@@ -451,6 +496,12 @@ def repo_generate_transfer_commands(
     commands: list[str] = []
     seen: set[str] = set()
 
+    def copy_command(local_path: str, s3_uri: str) -> str:
+        # Quote both operands: paths may contain spaces or shell metacharacters.
+        if mode == "upload":
+            return f"cp {shlex.quote(local_path)} {shlex.quote(s3_uri)}"
+        return f"cp {shlex.quote(s3_uri)} {shlex.quote(local_path)}"
+
     for entry in local_store.iter_all_entries(commit.tree):
         if entry.blob_hash and entry.blob_hash not in seen:
             seen.add(entry.blob_hash)
@@ -458,33 +509,33 @@ def repo_generate_transfer_commands(
             s3_key = f"blobs/{rel}"
             if s3_prefix:
                 s3_key = f"{s3_prefix}/{s3_key}"
-            s3_uri = f"s3://{bucket}/{s3_key}"
-            local = str(repo.layout.blobs_dir / rel)
-            if mode == "upload":
-                commands.append(f"cp {local} {s3_uri}")
-            else:
-                commands.append(f"cp {s3_uri} {local}")
+            commands.append(
+                copy_command(
+                    str(repo.layout.blobs_dir / rel),
+                    f"s3://{bucket}/{s3_key}",
+                )
+            )
 
     if include_metadata:
         for tree_hash in repo.tree_writer.iter_tree_hashes(commit.tree):
             s3_key = f"trees/{tree_hash}"
             if s3_prefix:
                 s3_key = f"{s3_prefix}/{s3_key}"
-            s3_uri = f"s3://{bucket}/{s3_key}"
-            local = str(repo.layout.trees_dir / tree_hash)
-            if mode == "upload":
-                commands.append(f"cp {local} {s3_uri}")
-            else:
-                commands.append(f"cp {s3_uri} {local}")
+            commands.append(
+                copy_command(
+                    str(repo.layout.trees_dir / tree_hash),
+                    f"s3://{bucket}/{s3_key}",
+                )
+            )
 
         commit_s3_key = f"commits/{commit_id}.json"
         if s3_prefix:
             commit_s3_key = f"{s3_prefix}/{commit_s3_key}"
-        commit_s3_uri = f"s3://{bucket}/{commit_s3_key}"
-        commit_local = str(repo.layout.commits_dir / f"{commit_id}.json")
-        if mode == "upload":
-            commands.append(f"cp {commit_local} {commit_s3_uri}")
-        else:
-            commands.append(f"cp {commit_s3_uri} {commit_local}")
+        commands.append(
+            copy_command(
+                str(repo.layout.commits_dir / f"{commit_id}.json"),
+                f"s3://{bucket}/{commit_s3_key}",
+            )
+        )
 
     return commands

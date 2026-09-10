@@ -226,7 +226,9 @@ def test_cli_verify_on_content_commit_is_clean(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "meta"]) == 0
     capsys.readouterr()
 
-    assert run_cli(["--repo", str(tmp_path), "--json", "verify"]) == 0
+    assert (
+        run_cli(["--repo", str(tmp_path), "--json", "identity", "verify"]) == 0
+    )
     verify_payload = json.loads(capsys.readouterr().out)
     assert verify_payload["verified_entries"] == 0
     assert verify_payload["unverifiable_entries"] == 0
@@ -256,7 +258,7 @@ def test_cli_verify_reports_pointer_candidates_and_fails(
     first_commit = capsys.readouterr().out.strip()
 
     # Read-only audit: reports the candidate and exits non-zero.
-    assert run_cli(["--repo", str(tmp_path), "--json", "verify"]) == 1
+    assert run_cli(["--repo", str(tmp_path), "--json", "identity", "verify"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["candidate_entries"] == 1
     assert payload["unverifiable_entries"] == 1
@@ -286,7 +288,7 @@ def test_cli_promote_on_pointer_entry_promotes_it(
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "import"]) == 0
     first_commit = capsys.readouterr().out.strip()
 
-    assert run_cli(["--repo", str(tmp_path), "--json", "promote"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "--json", "identity", "promote"]) == 0
     promote_payload = json.loads(capsys.readouterr().out)
     assert promote_payload["created_commit"] is True
     assert promote_payload["verified_entries"] == 1
@@ -301,7 +303,9 @@ def test_cli_promote_on_pointer_entry_promotes_it(
     latest_entries = parse_tree_object(tree_path.read_bytes())
     assert latest_entries[0].kind == "b"
 
-    assert run_cli(["--repo", str(tmp_path), "--json", "verify"]) == 0
+    assert (
+        run_cli(["--repo", str(tmp_path), "--json", "identity", "verify"]) == 0
+    )
     verify_again_payload = json.loads(capsys.readouterr().out)
     assert verify_again_payload["unverifiable_entries"] == 0
     assert verify_again_payload["verified_entries"] == 0
@@ -980,7 +984,9 @@ def test_cli_checkout_restore_safe_skips_existing(tmp_path: Path, capsys) -> Non
 def test_cli_restore_requires_ref(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
-    assert run_cli(["--repo", str(tmp_path), "restore"]) == 2
+    # Missing required argument is a usage error → exit 1 (2 is reserved for
+    # retryable conflicts).
+    assert run_cli(["--repo", str(tmp_path), "restore"]) == 1
     err_out = capsys.readouterr().err.strip()
     assert "the following arguments are required" in err_out
 

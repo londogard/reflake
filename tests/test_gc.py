@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from reflake.core import create_repository
+from reflake.core.objects.s3 import S3ObjectStore
 
 
 def _commit_file(repo_dir: Path, name: str, content: str, message: str) -> str:
@@ -47,3 +50,22 @@ def test_gc_prune_keeps_merged_second_parent_blobs(tmp_path: Path) -> None:
 
     # Feature content still readable after prune.
     assert repo.cat("main", "feature.txt") == b"feature-data"
+
+
+def test_s3_deletes_are_batched(
+    tmp_path: Path,
+    fake_s3_installer: pytest.MonkeyPatch,
+) -> None:
+    """GC on S3 issues one DeleteObjects call per ≤1000 keys."""
+    del tmp_path
+    client = fake_s3_installer({})
+    store = S3ObjectStore(bucket="demo-bucket", prefix="repo", client=client)
+    object_ids = [f"{index:064x}" for index in range(2500)]
+    for object_id in object_ids:
+        client.put_object(
+            Bucket="demo-bucket", Key=store._key("blob", object_id), Body=b"x"  # noqa: SLF001
+        )
+
+    assert store.delete_objects("blob", object_ids) == 2500
+    assert client.delete_calls == [1000, 1000, 500]
+    assert list(store.iter_object_ids("blob")) == []

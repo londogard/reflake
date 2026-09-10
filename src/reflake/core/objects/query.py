@@ -35,42 +35,27 @@ class TreeCache:
     """LRU cache of parsed tree objects, keyed by content hash.
 
     Content-addressing makes the cache safe: a hash always maps to identical
-    bytes, so cached entries can never go stale.  ``pin`` marks hashes that
-    must survive eviction (e.g. the current HEAD root tree).
+    bytes, so cached entries can never go stale.
     """
 
     def __init__(self, maxsize: int = 2048) -> None:
         self._entries: OrderedDict[str, list[Entry]] = OrderedDict()
         self._maxsize = maxsize
-        self._pinned: set[str] = set()
 
     def get(self, tree_hash: str) -> list[Entry] | None:
         entries = self._entries.get(tree_hash)
         if entries is not None:
-            if tree_hash not in self._pinned:
-                self._entries.move_to_end(tree_hash)
-            return entries
-        return None
+            self._entries.move_to_end(tree_hash)
+        return entries
 
     def put(self, tree_hash: str, entries: list[Entry]) -> None:
         self._entries[tree_hash] = entries
-        if tree_hash not in self._pinned:
-            self._entries.move_to_end(tree_hash)
+        self._entries.move_to_end(tree_hash)
         self._evict()
-
-    def pin(self, tree_hash: str) -> None:
-        self._pinned.add(tree_hash)
-
-    def unpin(self, tree_hash: str) -> None:
-        self._pinned.discard(tree_hash)
 
     def _evict(self) -> None:
         while len(self._entries) > self._maxsize:
-            oldest = next(iter(self._entries))
-            if oldest in self._pinned:
-                # Everything left is pinned; stop evicting.
-                break
-            self._entries.pop(oldest)
+            self._entries.popitem(last=False)
 
 
 def _descend(entries: list[Entry], part: str) -> Entry | None:
@@ -114,25 +99,74 @@ class TreeWalker:
         """Parse (and cache) a tree object's entries; ``None`` if unknown."""
         return self._load(tree_hash)
 
-    def resolve_subtree(
-        self, root_tree_hash: str, directory_path: str
-    ) -> list[Entry] | None:
-        """Return the entries of the subtree at *directory_path*.
+    def expand_shards(self, entries: list[Entry]) -> list[Entry]:
+        """Return *entries* with every shard pointer replaced by its children.
 
-        Returns ``None`` when the directory does not exist in the tree.
-        Sharded trees are navigated transparently.
+        A directory node that exceeds ``MAX_TREE_ENTRIES`` stores name-range
+        shards (``s`` entries) instead of its real children. Callers that must
+        reason about a directory's *children* (merging a parent directory into
+        a new tree, pruning, removing) have to expand those shards first,
+        otherwise they see a handful of shard pointers named after the first
+        entry of each range. Shards never nest, so one pass suffices.
+        """
+        if not any(entry.kind == KIND_SHARD for entry in entries):
+            return entries
+        expanded: list[Entry] = []
+        for entry in entries:
+            if entry.kind != KIND_SHARD:
+                expanded.append(entry)
+                continue
+            shard_entries = self._load(entry.hash)
+            if shard_entries is None:
+                raise ValueError(f"Unknown tree object: {entry.hash}")
+            expanded.extend(shard_entries)
+        return expanded
+
+    def resolve_directory(
+        self, root_tree_hash: str, directory_path: str
+    ) -> tuple[str, list[Entry]] | None:
+        """Return ``(node_hash, children)`` for the directory at *directory_path*.
+
+        Children are expanded to real files/subdirectories (shards unpacked).
+        ``None`` when the directory does not exist in the tree.
         """
         parts = [p for p in directory_path.strip("/").split("/") if p]
         current = root_tree_hash
         for part in parts:
-            entries = self._load(current)
-            if entries is None:
-                raise ValueError(f"Unknown tree object: {current}")
+            entries = self.expand_shards(self._load_or_raise(current))
             target = _descend(entries, part)
             if target is None or not target.is_subtree:
                 return None
             current = target.hash
-        return self._load(current)
+        return current, self.expand_shards(self._load_or_raise(current))
+
+    def resolve_directory_children(
+        self, root_tree_hash: str, directory_path: str
+    ) -> list[Entry] | None:
+        """Return the *real* children of the directory at *directory_path*.
+
+        Unlike a raw node load, this expands name-range shards so every entry
+        is an actual file or subdirectory of the directory. Returns ``None``
+        when the directory does not exist in the tree.
+        """
+        resolved = self.resolve_directory(root_tree_hash, directory_path)
+        if resolved is None:
+            return None
+        return resolved[1]
+
+    def load_children(self, tree_hash: str) -> list[Entry]:
+        """Load a directory node's entries with shard pointers expanded.
+
+        The result has one entry per real child (leaf or ``t`` subtree), keyed
+        by name — the form merge and splice operations need.
+        """
+        return self.expand_shards(self._load_or_raise(tree_hash))
+
+    def _load_or_raise(self, tree_hash: str) -> list[Entry]:
+        entries = self._load(tree_hash)
+        if entries is None:
+            raise ValueError(f"Unknown tree object: {tree_hash}")
+        return entries
 
     def _iter_entries(
         self, tree_hash: str
@@ -146,9 +180,7 @@ class TreeWalker:
         stack: list[tuple[str, str, int]] = [(tree_hash, "", 0)]
         while stack:
             current_hash, prefix, resume_index = stack.pop()
-            entries = self._load(current_hash)
-            if entries is None:
-                raise ValueError(f"Unknown tree object: {current_hash}")
+            entries = self._load_or_raise(current_hash)
             index = resume_index
             while index < len(entries) and not entries[index].is_subtree:
                 entry = entries[index]
@@ -178,9 +210,7 @@ class TreeWalker:
         current_hash = tree_hash
         part_index = 0
         while part_index < len(parts):
-            entries = self._load(current_hash)
-            if entries is None:
-                raise ValueError(f"Unknown tree object: {current_hash}")
+            entries = self._load_or_raise(current_hash)
             target = _descend(entries, parts[part_index])
             if target is None:
                 return None
@@ -198,23 +228,27 @@ class TreeWalker:
     def iter_entries_for_prefix(
         self, tree_hash: str, logical_prefix: str
     ) -> Iterator[Entry]:
-        """Stream leaf entries whose path starts with *logical_prefix*.
+        """Stream leaf entries under *logical_prefix*.
 
-        Subtrees whose path prefix cannot overlap the target prefix are
-        skipped, so the walk is O(matches + depth) rather than O(N).
+        Matching is **path-component aware**, not raw string prefix: prefix
+        ``data/raw`` matches ``data/raw/x.parquet`` and an entry named exactly
+        ``data/raw`` — never ``data/rawish/...``. This is the same rule as
+        ``repository_support.matches_logical_path``, so staged overlays and
+        committed trees agree.
+
+        Subtrees whose path cannot contain the prefix are skipped, so the walk
+        is O(matches + depth) rather than O(N).
         """
         normalized = logical_prefix.strip("/")
         stack: list[tuple[str, str, int]] = [(tree_hash, "", 0)]
         while stack:
             current_hash, prefix, resume_index = stack.pop()
-            entries = self._load(current_hash)
-            if entries is None:
-                raise ValueError(f"Unknown tree object: {current_hash}")
+            entries = self._load_or_raise(current_hash)
             index = resume_index
             while index < len(entries) and not entries[index].is_subtree:
                 entry = entries[index]
                 path = prefix + entry.path
-                if not normalized or path.startswith(normalized):
+                if not normalized or matches_prefix(path, normalized):
                     yield _leaf_to_manifest(entry, path)
                 index += 1
             if index < len(entries):
@@ -225,7 +259,7 @@ class TreeWalker:
                     else f"{prefix}{subtree.path}/"
                 )
                 if normalized and not (
-                    child_prefix.startswith(normalized)
+                    child_prefix.startswith(f"{normalized}/")
                     or normalized.startswith(child_prefix)
                 ):
                     # No match can live under this subtree; skip it entirely.
@@ -234,3 +268,8 @@ class TreeWalker:
                     continue
                 stack.append((current_hash, prefix, index + 1))
                 stack.append((subtree.hash, child_prefix, 0))
+
+
+def matches_prefix(path: str, normalized_prefix: str) -> bool:
+    """Component-aware prefix match: ``a/b`` matches ``a/b`` and ``a/b/c``."""
+    return path == normalized_prefix or path.startswith(f"{normalized_prefix}/")

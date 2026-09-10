@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, BinaryIO
@@ -299,14 +299,31 @@ class S3ObjectStore:
                 if name.endswith(".json"):
                     yield name[: -len(".json")]
 
-    def delete_object(self, kind: RepositoryObjectKind, object_id: str) -> None:
-        try:
-            self.client.delete_object(
-                Bucket=self.bucket,
-                Key=self._key(kind, object_id),
-            )
-        except ClientError as error:
-            raise self._translate(error, "delete_object") from error
+    #: S3 ``DeleteObjects`` accepts at most 1000 keys per request.
+    _DELETE_BATCH_SIZE = 1000
+
+    def delete_objects(
+        self, kind: RepositoryObjectKind, object_ids: Iterable[str]
+    ) -> int:
+        ids = list(object_ids)
+        deleted = 0
+        for start in range(0, len(ids), self._DELETE_BATCH_SIZE):
+            batch = ids[start : start + self._DELETE_BATCH_SIZE]
+            try:
+                self.client.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={
+                        "Objects": [
+                            {"Key": self._key(kind, object_id)}
+                            for object_id in batch
+                        ],
+                        "Quiet": True,
+                    },
+                )
+            except ClientError as error:
+                raise self._translate(error, "delete_objects") from error
+            deleted += len(batch)
+        return deleted
 
     def _iter_keys(self, prefix: str) -> Iterator[str]:
         paginator = self.client.get_paginator("list_objects_v2")

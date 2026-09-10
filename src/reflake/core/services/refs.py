@@ -65,12 +65,9 @@ class RefManager:
         self.store = store
         self.client_state = client_state
         self._commit_cache = _BoundedCache()
-        self._ensure_head(default_branch)
-
-    def _ensure_head(self, default_branch: str) -> None:
+        # Only client-local state is touched here: opening a repository must
+        # never write to the shared store (no ref creation on open).
         self.client_state.ensure_current_branch(default_branch)
-        if self.store.read_branch_ref(default_branch) is None:
-            self.store.write_branch_ref(default_branch, None)
 
     def current_branch(self) -> str:
         return self.client_state.current_branch()
@@ -144,15 +141,31 @@ class RefManager:
         self._commit_cache[commit.id] = commit
 
     def ensure_branch_exists(self, branch: str) -> None:
-        self.require_branch_state(branch)
+        """Validate that *branch* can be operated on.
 
-    def require_branch_state(self, branch: str) -> BranchRefState:
+        A branch with no ref yet is *unborn* — tolerated only for the current
+        branch, mirroring git: staging into a fresh repository works, the ref
+        is created by the first commit. Any other unknown branch is an error.
+        """
+        if self.store.read_branch_ref(branch) is not None:
+            return
+        if branch == self.current_branch():
+            return
+        raise UnknownRefError(branch)
+
+    def require_branch_state(
+        self, branch: str, *, allow_unborn: bool = False
+    ) -> BranchRefState:
         cached_state = self.client_state.read_branch_snapshot(branch)
         if cached_state is not None:
             return cached_state
 
         branch_state = self.store.read_branch_ref(branch)
         if branch_state is None:
+            if allow_unborn:
+                # Unborn branch: expectations are "must not exist yet", and
+                # nothing is cached so a peer's creation is observed next call.
+                return BranchRefState(branch=branch, commit_id=None)
             raise UnknownRefError(branch)
         self.client_state.write_branch_snapshot(
             branch,

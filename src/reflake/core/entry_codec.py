@@ -41,8 +41,6 @@ LEAF_KINDS = frozenset({KIND_BLOB, KIND_META, KIND_BP, KIND_MP})
 SUBTREE_KINDS = frozenset({KIND_TREE, KIND_SHARD})
 SUPPORTED_KINDS = frozenset({KIND_TREE, KIND_SHARD, *LEAF_KINDS})
 
-SUPPORTED_IDENTITY_MODES = frozenset({"content", "pointer"})
-
 _ARITY_BY_KIND = {
     KIND_BLOB: 5,
     KIND_META: 6,
@@ -181,60 +179,6 @@ class Entry:
                 ) from error
             return Entry(path=name, kind=kind, hash=hash_value)
         return _entry_from_leaf_payload(payload)
-
-    @staticmethod
-    def path_from_payload(payload_text: str | bytes) -> str:
-        """Extract the path without a full parse (for sort/index checks)."""
-        try:
-            payload = msgspec.json.decode(payload_text)
-        except (msgspec.DecodeError, ValueError) as error:
-            raise CorruptEntryError("Corrupt entry payload") from error
-        if not isinstance(payload, list) or len(payload) < 2:
-            raise ValueError("Entry payload must be a JSON array")
-        return str(payload[1])
-
-    @staticmethod
-    def from_dict(data: dict[str, object]) -> Entry:
-        """Build an entry from a ``{path, hash, ...}`` mapping.
-
-        Accepts either ``kind`` or ``identity_mode`` (plus ``footer`` to
-        disambiguate parquet shapes).
-        """
-        if not isinstance(data, dict):
-            raise ValueError("Entry payload must be an object")
-        hash_value = str(data.get("hash") or data.get("identity_value") or "")
-        if not hash_value:
-            raise ValueError("Entry must include hash or identity_value")
-        try:
-            path = str(data["path"])
-            size = int(data["size"])  # type: ignore[arg-type]
-            mtime_ns = int(data["mtime_ns"])  # type: ignore[arg-type]
-        except KeyError as error:
-            raise ValueError(
-                f"Entry is missing required field: {error.args[0]}"
-            ) from error
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "Entry size and mtime_ns must be integers"
-            ) from error
-        source_uri = data.get("source_uri")
-        footer = data.get("footer")
-        footer_str = str(footer) if footer is not None else None
-        kind_raw = data.get("kind")
-        if kind_raw is not None:
-            kind = str(kind_raw)
-        else:
-            mode = str(data.get("identity_mode") or "content")
-            kind = leaf_kind_for(mode, has_footer=footer_str is not None)
-        return Entry(
-            path=path,
-            kind=kind,
-            hash=hash_value,
-            size=size,
-            mtime_ns=mtime_ns,
-            source_uri=str(source_uri) if source_uri is not None else None,
-            footer=footer_str,
-        )
 
     @staticmethod
     def with_identity(

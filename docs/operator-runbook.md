@@ -62,6 +62,24 @@ Reflake never stores credentials itself.
 
 ---
 
+## Initialization And Refs
+
+Opening a repository is **side-effect free**: it never writes refs and never
+"creates" a prefix that was not initialized. A branch with no ref yet is
+*unborn* (staging works, the first `commit` creates the ref with a CAS).
+
+- Bootstrap a remote repository explicitly, once: `reflake --repo . push <s3-uri>` creates `refs/heads/<branch>` on the remote.
+- `reflake pull`/`fetch` into an empty directory bootstrap the local repository (clone flow).
+- Pointing at a typo'd prefix therefore fails loudly instead of silently creating an empty repo.
+
+`reflake identity verify` is a strictly read-only audit: it walks tree metadata
+and counts unverifiable (`pointer`) entries without writing any object. Only
+`reflake identity promote` materializes blobs and commits. `reflake checkout`
+changes the client's branch pointer only — it never rewrites a working tree,
+by design (downloads are explicit: `restore`, `pull`, `cat`).
+
+---
+
 ## Encryption
 
 ### In transit
@@ -192,7 +210,7 @@ reflake --repo s3://my-bucket/my-prefix gc --prune # delete orphans
 Footer-stats objects (`footers/`) exist only for repos with
 `config set parquet_footer true` at ingest time. Older parquet entries
 gain footers on the next commit that touches them, or via
-`reflake promote`. `query prune` keeps row groups conservatively when
+`reflake identity promote`. `query prune` keeps row groups conservatively when
 stats are absent — missing footers never cause wrong query results.
 
 ---
@@ -219,14 +237,14 @@ write (optimistic-concurrency conflict). There is no lock to clear.
 2. `reflake merge <source> <target>`; resolve conflicts if any.
 3. Push again.
 
-### Symptom: `promote` fails with `FileNotFoundError` (source_uri missing)
+### Symptom: `identity promote` fails with `FileNotFoundError` (source_uri missing)
 
 **Cause:** A pointer (`pointer`) entry's source object was deleted or
 moved before promotion.
 
 **Resolution:**
 1. Restore the source object at its original `source_uri`.
-2. Re-run `reflake promote`.
+2. Re-run `reflake identity promote`.
 3. If unrestorable, the entry is unrecoverable: `reflake rm <path>` +
    `reflake commit --staged`.
 

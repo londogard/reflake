@@ -11,21 +11,27 @@ if TYPE_CHECKING:
     from .repository import ReflakeRepository
 
 
-from .domain import FetchResult, PullResult, PushResult, RepositoryObjectKind
+from .domain import (
+    FetchResult,
+    PullResult,
+    PushResult,
+    RepositoryObjectKind,
+    TransferEndpointError,
+)
 from .objects.backends import (
     BlobTransferBackend,
     TransferDirection,
     TransferItem,
     TransferPlan,
 )
-from .objects.base import HasLocalPath, HasRemoteURI, ObjectIO
+from .objects.base import HasLocalPath, HasRemoteURI, ObjectIO, RepositoryStore
 from .repository_support import is_ancestor_commit
 
 
 def _require_local_path(store: object, *, role: str) -> HasLocalPath:
     """Return *store* as a local-path endpoint or raise a clear error."""
     if not hasattr(store, "object_path"):
-        raise TypeError(
+        raise TransferEndpointError(
             f"Transfer plan needs a local filesystem path for the {role} "
             f"store, but {type(store).__name__} has no object_path "
             "(sync requires one local and one S3 repository)"
@@ -36,12 +42,62 @@ def _require_local_path(store: object, *, role: str) -> HasLocalPath:
 def _require_remote_uri(store: object, *, role: str) -> HasRemoteURI:
     """Return *store* as a remote-URI endpoint or raise a clear error."""
     if not hasattr(store, "object_uri"):
-        raise TypeError(
+        raise TransferEndpointError(
             f"Transfer plan needs a remote URI for the {role} "
             f"store, but {type(store).__name__} has no object_uri "
             "(sync requires one local and one S3 repository)"
         )
     return store  # type: ignore[return-value]
+
+
+#: Above this many candidate objects, transfer planning switches from
+#: per-object existence probes (one HEAD per object on S3) to a single
+#: paginated inventory listing per object kind. Below it, probes are cheaper
+#: than listing a potentially huge prefix.
+_INVENTORY_THRESHOLD = 64
+
+
+def _missing_ids(
+    store: RepositoryStore, kind: RepositoryObjectKind, object_ids: set[str]
+) -> set[str]:
+    """Return the subset of *object_ids* missing from *store*."""
+    if len(object_ids) <= _INVENTORY_THRESHOLD:
+        return {
+            object_id
+            for object_id in object_ids
+            if not store.object_exists(kind, object_id)
+        }
+    present = set(store.iter_object_ids(kind))
+    return {
+        object_id for object_id in object_ids if object_id not in present
+    }
+
+
+def _collect_candidates(
+    src_repo: ReflakeRepository, commit_ids: list[str]
+) -> dict[RepositoryObjectKind, set[str]]:
+    """Every object reachable from *commit_ids* (deduplicated, no I/O probes)."""
+    candidates: dict[RepositoryObjectKind, set[str]] = {
+        "commit": set(),
+        "tree": set(),
+        "blob": set(),
+        "footer": set(),
+    }
+    leaf_refs_memo: dict[str, tuple[tuple[str | None, str | None], ...]] = {}
+    for commit_id in commit_ids:
+        commit_obj = src_repo.read_commit(commit_id)
+        candidates["tree"].update(
+            src_repo.tree_writer.iter_tree_hashes(commit_obj.tree)
+        )
+        for blob_hash, footer_hash in src_repo.tree_writer.iter_leaf_refs(
+            commit_obj.tree, memo=leaf_refs_memo
+        ):
+            if blob_hash:
+                candidates["blob"].add(blob_hash)
+            if footer_hash:
+                candidates["footer"].add(footer_hash)
+        candidates["commit"].add(commit_id)
+    return candidates
 
 
 def _build_plan(
@@ -51,44 +107,36 @@ def _build_plan(
     *,
     direction: TransferDirection,
 ) -> TransferPlan:
-    """Compute the exact missing-object set for *commit_ids* on the destination."""
-    items: list[TransferItem] = []
-    seen: set[tuple[str, str]] = set()
+    """Compute the exact missing-object set for *commit_ids* on the destination.
 
-    def add(kind: RepositoryObjectKind, object_id: str) -> None:
-        key = (kind, object_id)
-        if key in seen or dst_repo.store.object_exists(kind, object_id):
-            return
-        seen.add(key)
-        if direction == "upload":
-            local_store = _require_local_path(src_repo.store, role="source")
-            remote_store = _require_remote_uri(dst_repo.store, role="target")
-        else:
-            local_store = _require_local_path(dst_repo.store, role="target")
-            remote_store = _require_remote_uri(src_repo.store, role="source")
-        local_path = local_store.object_path(kind, object_id)
-        items.append(
-            TransferItem(
-                kind=kind,
-                object_id=object_id,
-                local_path=str(local_path),
-                remote_uri=remote_store.object_uri(kind, object_id),
-            )
+    Existence checks are adaptive: small plans use per-object probes, larger
+    plans list the destination's object ids once per kind (one paginated
+    ``list_objects_v2`` instead of N HEAD requests).
+    """
+    candidates = _collect_candidates(src_repo, commit_ids)
+    missing = [
+        (kind, object_id)
+        for kind, object_ids in candidates.items()
+        for object_id in sorted(_missing_ids(dst_repo.store, kind, object_ids))
+    ]
+
+    if direction == "upload":
+        local_store = _require_local_path(src_repo.store, role="source")
+        remote_store = _require_remote_uri(dst_repo.store, role="target")
+    else:
+        local_store = _require_local_path(dst_repo.store, role="target")
+        remote_store = _require_remote_uri(src_repo.store, role="source")
+
+    items = tuple(
+        TransferItem(
+            kind=kind,
+            object_id=object_id,
+            local_path=str(local_store.object_path(kind, object_id)),
+            remote_uri=remote_store.object_uri(kind, object_id),
         )
-
-    for commit_id in commit_ids:
-        commit_obj = src_repo.read_commit(commit_id)
-        for tree_hash in src_repo.tree_writer.iter_tree_hashes(commit_obj.tree):
-            add("tree", tree_hash)
-        for blob_hash, footer_hash in src_repo.tree_writer.iter_leaf_refs(
-            commit_obj.tree
-        ):
-            if blob_hash:
-                add("blob", blob_hash)
-            if footer_hash:
-                add("footer", footer_hash)
-        add("commit", commit_id)
-    return TransferPlan(direction=direction, items=tuple(items))
+        for kind, object_id in missing
+    )
+    return TransferPlan(direction=direction, items=items)
 
 
 def _copy_item(
@@ -183,18 +231,20 @@ def _collect_commits_to_push(
     """Commits reachable from *commit_id* that are missing on the destination.
 
     Merge-aware: every parent edge is traversed.  Results are ordered oldest
-    first (parents before children) by generation.
+    first (parents before children) by generation.  Missing commits are found
+    with the same adaptive existence strategy as object planning.
     """
-    commits: list[str] = []
-    seen: set[str] = set()
+    reachable: set[str] = set()
     stack: list[str] = [commit_id]
     while stack:
         current = stack.pop()
-        if current in seen or dst_repo.store.object_exists("commit", current):
+        if current in reachable:
             continue
-        seen.add(current)
-        commits.append(current)
+        reachable.add(current)
         stack.extend(src_repo.read_commit(current).parents)
+
+    missing = _missing_ids(dst_repo.store, "commit", reachable)
+    commits = list(missing)
     commits.sort(key=lambda cid: src_repo.read_commit(cid).generation)
     return commits
 
@@ -318,9 +368,11 @@ def push(
         blob_transfer=blob_transfer,
     )
 
-    # Ensure remote branch exists
+    # Ensure remote branch exists (CAS: create only when still absent).
     if remote_repo.store.read_branch_ref(branch) is None:
-        remote_repo.store.write_branch_ref(branch, None)
+        remote_repo.store.compare_and_set_branch_ref(
+            branch, None, expected_commit_id=None
+        )
 
     # ── Pre-check: reject divergent history before copying any objects ──
     can_fast_forward = _verify_push_fast_forward(
@@ -413,9 +465,9 @@ def pull(
     remote_commit_id = remote_repo.resolve_ref(branch)
 
     # ── Pre-check: reject divergent history before copying any objects ──
-    # Ensure local branch exists for the check
+    # Ensure the local branch exists for the check (CAS: create if absent).
     if repo.store.read_branch_ref(branch) is None:
-        repo.store.write_branch_ref(branch, None)
+        repo.store.compare_and_set_branch_ref(branch, None, expected_commit_id=None)
 
     can_fast_forward = _verify_pull_fast_forward(
         repo,

@@ -22,6 +22,11 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
     identity: str = "content"
     transfer_backend: str | None = None
     parquet_footer: bool = False
+    #: Skip re-hashing worktree files whose size *and* mtime match the
+    #: committed entry. Big ingest speedup; weakens the guarantee that a
+    #: commit proves the bytes it references (a same-size, same-mtime edit
+    #: would go unnoticed). Off by default.
+    trust_mtime: bool = False
 
     def __post_init__(self) -> None:
         if self.format_version not in SUPPORTED_FORMAT_VERSIONS:

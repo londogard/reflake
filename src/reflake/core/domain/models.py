@@ -99,7 +99,6 @@ class StageStatus:
     ref: str
     added: list[str]
     removed: list[str]
-    modified: list[str] = field(default_factory=list)
     working_tree_added: list[str] = field(default_factory=list)
     working_tree_removed: list[str] = field(default_factory=list)
     working_tree_modified: list[str] = field(default_factory=list)
@@ -107,7 +106,6 @@ class StageStatus:
     def __post_init__(self) -> None:
         object.__setattr__(self, "added", list(self.added))
         object.__setattr__(self, "removed", list(self.removed))
-        object.__setattr__(self, "modified", list(self.modified))
         object.__setattr__(self, "working_tree_added", list(self.working_tree_added))
         object.__setattr__(
             self, "working_tree_removed", list(self.working_tree_removed)

@@ -18,14 +18,18 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..objects.base import ContentQueryStore
-from ..objects.footer import FooterStats, RowGroupStats, parse_footer_stats
+from ..objects.footer import FooterCache, FooterStats, RowGroupStats, parse_footer_stats
 
 Op = Literal["=", "!=", "<", "<=", ">", ">=", "is_null", "is_not_null"]
 
 _COMPARISON_OPS = frozenset({"=", "!=", "<", "<=", ">", ">="})
 _NULL_OPS = frozenset({"is_null", "is_not_null"})
 
-_CLAUSE_SPLIT = re.compile(r"\s+AND\s+", re.IGNORECASE)
+#: Clause separator: `AND` at the top level. Quoted literals are matched as
+#: single tokens so an `AND` inside a string value is never a separator.
+_CLAUSE_SPLIT = re.compile(
+    r"'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\"|\s+AND\s+", re.IGNORECASE
+)
 _NULL_CLAUSE = re.compile(
     r"^\s*(?P<col>[A-Za-z_][A-Za-z0-9_.]*)\s+"
     r"(?P<op>IS\s+NOT\s+NULL|IS\s+NULL)\s*$",
@@ -35,6 +39,19 @@ _COMPARISON_CLAUSE = re.compile(
     r"^\s*(?P<col>[A-Za-z_][A-Za-z0-9_.]*)\s*"
     r"(?P<op>=|!=|<>|<=|>=|<|>)\s*(?P<val>.+?)\s*$"
 )
+
+
+def _split_and_clauses(text: str) -> list[str]:
+    """Split *text* on unquoted ``AND`` keywords."""
+    clauses: list[str] = []
+    last = 0
+    for match in _CLAUSE_SPLIT.finditer(text):
+        token = match.group(0)
+        if token.strip().upper() == "AND":
+            clauses.append(text[last : match.start()])
+            last = match.end()
+    clauses.append(text[last:])
+    return clauses
 
 
 @dataclass(frozen=True)
@@ -96,7 +113,7 @@ def parse_where_clause(text: str) -> list[Predicate]:
     or type mismatches never raise — they simply apply no pruning.
     """
     predicates: list[Predicate] = []
-    for clause in _CLAUSE_SPLIT.split(text):
+    for clause in _split_and_clauses(text):
         if re.search(r"\s+OR\s+", clause, re.IGNORECASE) is not None:
             raise ValueError(f"OR is not supported; AND predicates only: {clause!r}")
         null_match = _NULL_CLAUSE.match(clause)
@@ -161,7 +178,10 @@ def _possible(group: RowGroupStats, predicate: Predicate) -> bool | None:
         return column.nulls < group.rows
     if predicate.op == "!=":
         if column.nulls > 0:
-            return True  # null rows satisfy `!= value`
+            # NULL rows satisfy neither `= value` nor `!= value` (SQL three-
+            # valued logic), so the group may still contain matching rows.
+            # Keeping it is the conservative, always-correct choice.
+            return True
         min_cmp = _compare(column.min, predicate.value)
         max_cmp = _compare(column.max, predicate.value)
         if min_cmp is None or max_cmp is None:
@@ -221,23 +241,33 @@ def plan_pruned_scan(
     tree_hash: str,
     prefix: str,
     predicates: Sequence[Predicate],
+    *,
+    footer_cache: FooterCache | None = None,
 ) -> Iterator[PrunedFileScan]:
     """Plan a pruned scan of *prefix* in *tree_hash*.
 
     For every parquet entry with captured footer stats, read the stats object
     (metadata-only — never data bytes) and report which row groups may match
-    *predicates*.  Entries without footer stats cannot be pruned and are
+    *predicates*. Entries without footer stats cannot be pruned and are
     omitted from the plan.
+
+    Pass a ``footer_cache`` to skip store reads (and parsing) for footers
+    already seen: content-addressed, so cached entries can never be stale.
     """
     for entry in store.iter_entries_for_prefix(tree_hash, prefix):
         if entry.footer is None:
             continue
-        payload = store.read_footer_bytes(entry.footer)
-        if payload is None:
-            continue
-        try:
-            stats = parse_footer_stats(payload)
-        except (ValueError, KeyError, TypeError):
+        if footer_cache is not None:
+            stats = footer_cache.get(store, entry.footer)
+        else:
+            payload = store.read_footer_bytes(entry.footer)
+            if payload is None:
+                continue
+            try:
+                stats = parse_footer_stats(payload)
+            except (ValueError, KeyError, TypeError):
+                continue
+        if stats is None:
             continue
         result = prune_row_groups(stats, predicates)
         yield PrunedFileScan(

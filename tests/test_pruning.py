@@ -58,6 +58,24 @@ def test_parse_where_clause_null_ops() -> None:
     ]
 
 
+def test_parse_where_clause_ignores_and_inside_string_literals() -> None:
+    predicates = parse_where_clause(
+        "name = 'research AND development' AND id > 5"
+    )
+    assert predicates == [
+        Predicate(column="name", op="=", value="research AND development"),
+        Predicate(column="id", op=">", value=5),
+    ]
+
+
+def test_parse_where_clause_respects_double_quotes_and_case() -> None:
+    predicates = parse_where_clause('label = "a and b" and flag = false')
+    assert predicates == [
+        Predicate(column="label", op="=", value="a and b"),
+        Predicate(column="flag", op="=", value=False),
+    ]
+
+
 def test_parse_where_clause_floats_and_neq() -> None:
     assert parse_where_clause("x <> 1.5") == [Predicate(column="x", op="!=", value=1.5)]
 

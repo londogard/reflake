@@ -1,7 +1,7 @@
 """Regression tests for the 2026-08 review findings.
 
 Covers the staged-overlay sort-order bug, merge-aware ancestry (is_ancestor,
-fast-forward, push after a 3-way merge), quote-safe manifest index parsing,
+fast-forward, push after a 3-way merge), quoted-filename serialization,
 streaming three-way merge output, S3 endpoint wiring, and the batch transfer
 backend API.
 """
@@ -15,8 +15,6 @@ from typing import Any
 from reflake import run_cli
 from reflake.core import create_repository, open_repository
 from reflake.core.domain import StageChange
-from reflake.core.entry_codec import Entry
-from reflake.core.manifest import ManifestWriter
 from reflake.core.objects.transfer import (
     S3BlobTransferBackend,
     S5CmdBlobTransferBackend,
@@ -142,8 +140,6 @@ def test_fast_forward_onto_merge_commit_after_merge(tmp_path: Path) -> None:
 def test_push_after_merge_transfers_merged_lineage(
     tmp_path: Path, fake_s3_installer
 ) -> None:
-    from reflake.core.repository_support import collect_ancestors
-
     fake_s3_installer({})
     remote = "s3://demo-bucket/repos/merge-push"
 
@@ -156,27 +152,15 @@ def test_push_after_merge_transfers_merged_lineage(
     assert result.updated
 
     remote_repo = open_repository(remote, worktree=repo.root)
-    for commit_id in collect_ancestors(merge_commit, read_commit=repo.read_commit):
-        assert remote_repo.store.object_exists("commit", commit_id), commit_id
+    # `log` walks the full parent DAG, so every merged ancestor must be
+    # present on the remote after the push.
+    for commit in repo.log("main"):
+        assert remote_repo.store.object_exists("commit", commit.id), commit.id
     remote_state = remote_repo.store.read_branch_ref("main")
     assert remote_state is not None and remote_state.commit_id == merge_commit
 
 
-# ── B4: quote-safe manifest index extraction ────────────────────────────────
-
-
-def test_manifest_index_extraction_handles_quoted_paths(tmp_path: Path) -> None:
-    weird = 'weird"name.txt'
-    writer = ManifestWriter(tmp_path / "derived.jsonl", block_entry_count=1)
-    written = writer.write_entries(
-        [
-            Entry(path=weird, kind="b", hash="0" * 64, size=1, mtime_ns=2),
-        ]
-    )
-    assert written == 1
-    index = writer.build_index()
-    assert index is not None
-    assert index.blocks[0].first_path == weird
+# ── Quoted filenames survive serialization and export ───────────────────────
 
 
 def test_staged_flow_with_quoted_filename(tmp_path: Path) -> None:
@@ -191,8 +175,9 @@ def test_staged_flow_with_quoted_filename(tmp_path: Path) -> None:
     tree_hash = repo.refs.read_commit(repo.head_commit()).tree
     exported = repo.tree_writer.export_derived_manifest(tree_hash)
     assert exported.exists()
-    entry = repo.tree_writer.lookup_derived_entry(tree_hash, weird)
-    assert entry is not None and entry.path == weird
+    assert repo.resolve_entry("main", weird) is not None
+    lines = exported.read_text(encoding="utf-8").splitlines()
+    assert any(json.loads(line)[1] == weird for line in lines)
 
 
 # ── Streaming three-way merge keeps global sort order ───────────────────────

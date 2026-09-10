@@ -31,11 +31,13 @@ class StagingArea:
         root: Path,
         store: QueryRefStore,
         refs: RefManager,
+        trust_mtime: bool = False,
     ) -> None:
         self.client_state = client_state
         self.root = root
         self.store = store
         self.refs = refs
+        self.trust_mtime = trust_mtime
 
     def load(self, branch: str) -> dict[str, StageChange]:
         stage_payload = self.client_state.read_staging_payload(branch)
@@ -82,7 +84,6 @@ class StagingArea:
             ref=branch,
             added=added,
             removed=removed,
-            modified=[],
             working_tree_added=wt_added,
             working_tree_removed=wt_removed,
             working_tree_modified=wt_modified,
@@ -269,6 +270,11 @@ class StagingArea:
             working_file = working_files[path]
             if working_file.size != manifest_entry.size:
                 modified_paths.append(path)
+                continue
+            if (
+                self.trust_mtime
+                and working_file.mtime_ns == manifest_entry.mtime_ns
+            ):
                 continue
             current_hash = blake3_digest_file(working_file.path)
             if current_hash != manifest_entry.hash:

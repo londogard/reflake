@@ -4,19 +4,31 @@
 parquet-footer scoping, conflict-retry in P0, restore/checkout materialization, `generation`
 semantics; rev. 3 ships the two remaining rollout items — the `repository_store/` + `storage/`
 → `objects/` store unification (§1/§12) and the footer-stats query pruning engine (§4)).
+**Rev. 4 (2026-09, post 0.2.0 review):** shard-aware parent merging in full commits (sharded
+directories must be expanded before merging — see `TreeWalker.expand_shards`); opening a
+repository is side-effect free (missing branch refs are "unborn", created by the first
+commit); `verify` is strictly read-only; path-prefix matching is component-aware
+everywhere (same rule as `rm`/`mv`); explicit download semantics are documented — `checkout` is a
+pointer switch only and never materializes a worktree (S3-first; `restore`/`pull`/`cat` are
+the data paths); transfer planning is adaptive (per-object probes below 64 candidates,
+inventory listings above); blob reads are hash-verified; merge is tree-level and
+O(changed directories) rather than O(files) (§9); the CLI groups the identity commands
+as `reflake identity verify` / `reflake identity promote`; the derived-manifest block index
+was deleted (only `export_derived_manifest` remains); `merge_sorted_streams`,
+`ManifestReader`/`Writer`, `LocalStorageBackend`, and the `StorageBackend` protocol were
+removed as dead code.
 **Post-review hardening (2026-08):** ancestry checks (`is_ancestor`, fast-forward pre-checks,
 merge-base, push/pull collection) now traverse the full parent DAG instead of first-parent
-chains; the staged overlay merges sorted streams so `commit --staged` is order-safe;
+chains; staged overlays are order-safe via path-splicing (`TreeWriter.splice_tree`);
 `ObjectStore` covers enumeration/deletion/paths so gc and sync are protocol-typed; local
 commits/refs/config writes are atomic.
 **Structural refactor (2026-08):** `ObjectStore` is split into composable capabilities
 (`ObjectIO`, `RefCas`, `TreeQuery`, `StoreInventory`) with consumers annotated against the
 narrow view they need; one key-space mapping (`layout.object_relative_key`) now defines
 physical locations for both adapters; client branch snapshots moved out of `refs/heads/`
-into `state/branch-snapshots/` (§5's filename-coupling fix); a canonical
-`merge_sorted_streams` helper owns the sorted-stream invariant used by staged overlays;
-leaf serialization/validation is unified in `core/entry_codec.py` as a single `Entry`
-record (replacing the former `LeafRecord`/`ManifestEntry`/`TreeEntry` trio);
+into `state/branch-snapshots/` (§5's filename-coupling fix); leaf serialization/validation is
+unified in `core/entry_codec.py` as a single `Entry` record (replacing the former
+`LeafRecord`/`ManifestEntry`/`TreeEntry` trio);
 `identity_value`/`blob_hash`/`identity_mode` derive from `kind` instead of being
 stored redundantly; the module-level repository facade functions are gone — the
 Python API is `open_repository()`/`init_repository()` + `ReflakeRepository` methods.
@@ -74,7 +86,7 @@ constraint we can:
 ```mermaid
 flowchart TB
     subgraph cli["reflake.cli (worktree-optional)"]
-        Init["init / checkout / restore / status (materialized)"]
+        Init["init / checkout (pointer switch) / restore / status (materialized)"]
         Virt["ls / cat / query / diff / log / branch / merge / push / pull (virtual)"]
     end
     subgraph core["reflake.core"]
@@ -152,7 +164,16 @@ flowchart LR
   entry count exceeds the bound splits into **name-range shard subtrees** (a `t` entry
   covering a contiguous name slice of the same directory). This preserves v1's
   block-index property for flat directories: 1M files in one directory → a small top node
-  of ~100 shard pointers + one shard fetch, depth 2–3.
+  of ~100 shard pointers + one shard fetch, depth 2–3. Shards never nest: a shard body
+  is written as one plain node (an overflowing range splits into two balanced sibling
+  shards instead), and the pointer name is always the first contained name, so ranges
+  stay binary-searchable.
+  **Shard locality** follows from that layout: a staged add/removal resolves the
+  touched names to shard indices via `bisect` and rewrites only those shard bodies;
+  removal pruning tests each removal prefix against the `[name_i, name_i+1)` ranges
+  before loading anything; and the worktree-commit builder passes each parent node's
+  subtree hashes as `skip_hashes`, so an untouched shard body (or an unchanged
+  directory node) is never re-PUT.
 - **footer** — compact parquet stats object (§4): schema hash + per-row-group column
   min/max/nulls. Referenced from `bp`/`mp` tree entries. Small, content-addressed,
   cacheable.
@@ -230,18 +251,19 @@ flowchart TB
   the prefix, stream entries. O(matches + depth), no index, no materialization. This is
   what `ls`, prefix `diff`, and `query` scans use. Bulk access is the normal access
   pattern; per-file exact lookups ride the same cached prefixes.
-- **Derived manifest (optional, per client):** materialize tree → JSONL manifest with
-  block offsets once per root-tree hash; cache in client state; **never written to the
-  shared store**. Gives v1-class point lookups (block binary search + 1 range read) for
-  latency-critical clients and for `export`. Built lazily; invalidated never (keyed by
-  root-tree hash).
+- **Derived manifest (optional, per client):** flatten a tree → plain JSONL once per
+  root-tree hash; cache in client state; **never written to the shared store**. A
+  readable/streamable view of a snapshot for humans and tooling (`TreeInspector.
+  export_derived_manifest`). Built lazily, keyed by root-tree hash so it can never go
+  stale. The block-offset index + binary-search point lookup from rev. 3 were deleted
+  in rev. 4: nothing consumed them, and exact lookups already run through the cached
+  tree walk.
 - **Targets** (to lock into the scale bench — `bench.txt` — not measurements):
   - exact-path, warm: **< 20 ms** (S3), **< 1 ms** local FS — 0–1 GET.
   - exact-path, cold worst: bounded by depth × small GET; **≤ ~200 ms** only when every
     level misses, typically 1–2 GETs. Depth is ≤ 4–5 at 100M entries (path depth +
     shard splits at 10k fanout).
   - prefix listing: O(matches + depth) — 200 files < 50 ms cold, 10k files < 300 ms cold.
-  - derived-manifest point lookup: **< 10 ms**.
 
 This deletes: `ManifestIndexStore`, `manifest_query` dual paths, `_cached_manifest_index_path`,
 `build_manifest_index_file`, the index/fallback decision tree, and `ManifestWriter.build_index`
@@ -273,12 +295,14 @@ plumbing. One lookup core + one optional materialization instead of three paths.
     `footers/<hash>` stats objects and reports the row groups that may match, with
     conservative keep-on-unknown handling. Predicates are AND-composed `= != < <= > >=
     IS NULL IS NOT NULL`; OR is rejected.
-- **Restore / checkout (materialization from trees):** walk the path chain to the requested
-  paths, read only the needed blobs (or source URIs), write to the working tree. No full
-  materialization for virtual ops.
-- **CLI splits into worktree-required vs virtual**: `init/checkout/restore/status` need a
-  working tree; `ls/cat/query/diff/log/branch/merge/push/pull` work on virtual refs with no
-  materialization.
+- **Restore (materialization from trees):** walk the path chain to the requested
+  paths (files or directory prefixes), read only the needed blobs (or source URIs),
+  write to the working tree. `checkout` is deliberately *not* a materializing
+  operation — it only switches the client's branch pointer (S3-first: downloads
+  happen when you ask for them). No full materialization for virtual ops.
+- **CLI splits into worktree-required vs virtual**: `init/restore/status` need a
+  working tree; `ls/cat/query/diff/log/checkout/branch/merge/push/pull` work on
+  virtual refs with no materialization.
 - The working tree remains an optional local optimization (dev/testing/small datasets), not
   the model's center.
 
@@ -345,20 +369,55 @@ v2:
 
 ---
 
-## 9. Merge semantics: design now, cheap later
+## 9. Merge semantics: tree-level 3-way merge
 
 - Commit object uses `parents: list[str]` (not `parent: str | None`); `generation =
-  1 + max(parent generations)`. Trivial change now, unlocks 3-way metadata merge later.
-- MVP stays fast-forward-only. With trees, a metadata-only 3-way merge is tractable:
-  compare subtrees, auto-merge non-conflicting subtrees, conflict = differing leaf
-  blob/footer hashes. That's the natural collaboration story for data (lakeFS/Dolt-style).
+  1 + max(parent generations)`.
+- The merge is **tree-level, not flattened**: `TreeWriter.three_way_merge` walks
+directory nodes and short-circuits on content-addressed hashes (`ours == theirs` →
+reuse; `ours == base` → take theirs; `theirs == base` → take ours). Only the
+directories that actually diverged are read or rebuilt, so a merge of two branches
+that each changed one file costs **O(changed directories + path depth)**, not
+O(files). Verified at 10k entries / 400 directories: 2 tree reads, 1 tree write.
+- **Sharded directories merge range-wise**: when base and both sides share shard
+boundaries (the normal case), shard pointers are compared pairwise and only ranges
+that both sides changed are descended into. Merging two branches that changed
+different ranges of a 1M-entry directory reads no shard bodies at all.
+- The merge base is the **nearest common ancestor** (generation-ordered frontier
+walk over both sides, first doubly-reachable commit wins), not the first-parent
+chain — otherwise a shared commit before the divergence turns into a false
+conflict for every file one side touched afterwards.
+- Rules per path: identical changes win; one-sided changes win; both sides changed
+differently (including delete/modify and file↔directory shape changes) conflict.
+Conflicts raise `MergeConflictError` with the offending logical paths.
+- The directory-level fast paths mean `iter_all_entries` is never called on any
+merge input, so blob bytes and leaf records are never touched.
+
+---
+
+## 9.1 Cost model for writes
+
+- Every node write is a content-addressed conditional PUT (`IfNoneMatch`); a rebuilt
+  node that is byte-identical to a known object is skipped before it hits the store
+  (`skip_hashes`). The frame builder seeds that set with the parent node **and its
+  subtree hashes**, so an unchanged directory — or an untouched shard inside a
+  changed one — costs zero PUTs (one changed file in a 50-directory repo: 2 PUTs).
+- New/changed worktree blobs are hashed in parallel (`ThreadPoolExecutor`, ≤ 8
+  workers; blake3 releases the GIL).
+- `trust_mtime` (off by default) reuses a content entry when size **and**
+  `mtime_ns` match, trading a (same-size, same-mtime) edit detection for hash-free
+  re-commits.
+- GC prunes in `DeleteObjects` batches (≤ 1000 keys/request) instead of one
+  request per object.
 
 ---
 
 ## 10. Identity modes
 
-- Keep `content` (default) and `pointer` (opt-in; unverifiable until `promote`).
-  `verify` is the read-only audit, `promote` the materializing commit.
+- Keep `content` (default) and `pointer` (opt-in; unverifiable until promotion).
+  The CLI groups both identity commands under `reflake identity`:
+  `identity verify` is the read-only audit, `identity promote` the materializing
+  commit (library: `repo.verify()` / `repo.promote()`).
 - New mode: **parquet-footer identity** — for parquet inputs, identity = hash of the
   compact footer stats object + schema, with **no blob read**; entries are `mp` (source
   pointer) unless a blob is also stored. Pruning works off the footer; fetching row
@@ -388,7 +447,7 @@ Covered in §1. Summary of renames:
 | `services/snapshot.py::SnapshotWriter` | `services/tree.py::TreeWriter` |
 | `index.py` (duckdb analytical index) | absorbed into `query/` |
 | `manifest_index.py` | removed (§3) |
-| `manifest.py` | tree entry serialization + derived-manifest export |
+| `manifest.py` | worktree walk + `FileEntry` only (manifests are gone; derived export lives in `services/tree_inspect.py`) |
 
 ---
 

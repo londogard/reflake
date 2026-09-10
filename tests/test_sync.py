@@ -176,7 +176,9 @@ def test_pull_with_no_remote_branch(
     capsys.readouterr()
 
     repo = create_repository(str(tmp_path))
-    with pytest.raises(ValueError, match="no commits"):
+    # The remote branch was never created: opening a remote no longer
+    # auto-creates refs, so this is an unknown ref rather than an empty one.
+    with pytest.raises(ValueError, match="Unknown branch or commit"):
         pull(repo, "s3://demo-bucket/repos/test")
 
 

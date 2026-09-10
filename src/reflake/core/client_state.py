@@ -7,7 +7,6 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .domain import BranchRefState
-from .objects.derived import DerivedIndex, load_derived_index
 
 HEAD_FILE = "HEAD"
 
@@ -68,21 +67,6 @@ class LocalClientState:
         to identical bytes (see docs/architecture.md §3).
         """
         return self.cache_dir / "derived" / f"{tree_hash}.jsonl"
-
-    def derived_index_path(self, tree_hash: str) -> Path:
-        return self.cache_dir / "derived" / f"{tree_hash}.idx"
-
-    def write_derived_index(self, tree_hash: str, index: DerivedIndex) -> None:
-        """Persist the derived-manifest block index (client-side only)."""
-        path = self.derived_index_path(tree_hash)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_write_text(path, index.serialize() + "\n")
-
-    def read_derived_index(self, tree_hash: str) -> DerivedIndex | None:
-        path = self.derived_index_path(tree_hash)
-        if not path.exists():
-            return None
-        return load_derived_index(json.loads(path.read_text(encoding="utf-8")))
 
     def ensure_current_branch(self, default_branch: str) -> None:
         if not self.head_path.exists():

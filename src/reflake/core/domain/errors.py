@@ -50,6 +50,18 @@ class ObjectMissingError(ReflakeError):
     """Raised by storage adapters when a requested object does not exist."""
 
 
+class BlobIntegrityError(ReflakeError):
+    """Raised when content does not match its content-addressed hash."""
+
+    def __init__(self, *, expected: str, actual: str, context: str = "") -> None:
+        prefix = f"{context}: " if context else ""
+        super().__init__(
+            f"{prefix}blob hash mismatch: expected {expected}, got {actual}"
+        )
+        self.expected = expected
+        self.actual = actual
+
+
 class PreconditionFailedError(OptimisticLockError):
     """Raised when an S3 write precondition (IfNoneMatch) fails.
 
@@ -59,6 +71,14 @@ class PreconditionFailedError(OptimisticLockError):
 
 class StorageUnavailableError(ReflakeError):
     """Raised by storage adapters for unrecoverable S3 transport failures."""
+
+
+class TransferEndpointError(ReflakeError):
+    """Raised when a sync operation's endpoints cannot be used.
+
+    Sync needs exactly one local endpoint and one remote endpoint; anything
+    else (S3→S3, local→local) is a user-facing error, not a crash.
+    """
 
 
 class MergeConflictError(ReflakeError):

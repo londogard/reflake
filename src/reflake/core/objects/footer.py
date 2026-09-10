@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import struct
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -180,22 +181,27 @@ def _read_list_header(reader: _Reader) -> tuple[int, int]:
 def _decode_min_max(raw: bytes | None, column_type: int) -> Any:
     if raw is None:
         return None
-    if column_type == 0:  # BOOLEAN
-        return bool(raw[0]) if raw else None
-    if column_type == 1:  # INT32
-        return struct.unpack("<i", raw[:4])[0] if len(raw) >= 4 else None
-    if column_type == 2:  # INT64
-        return struct.unpack("<q", raw[:8])[0] if len(raw) >= 8 else None
-    if column_type == 4:  # FLOAT
-        return struct.unpack("<f", raw[:4])[0] if len(raw) >= 4 else None
-    if column_type == 5:  # DOUBLE
-        return struct.unpack("<d", raw[:8])[0] if len(raw) >= 8 else None
-    if column_type in (6, 7):  # BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY
-        try:
-            return raw.decode("utf-8")
-        except UnicodeDecodeError:
-            return raw.hex()
-    return raw.hex()  # INT96 and anything else: opaque
+    match column_type:
+        case 0:  # BOOLEAN
+            return bool(raw[0]) if raw else None
+        case 1:  # INT32
+            return struct.unpack("<i", raw[:4])[0] if len(raw) >= 4 else None
+        case 2:  # INT64
+            return struct.unpack("<q", raw[:8])[0] if len(raw) >= 8 else None
+        case 4:  # FLOAT
+            return struct.unpack("<f", raw[:4])[0] if len(raw) >= 4 else None
+        case 5:  # DOUBLE
+            return struct.unpack("<d", raw[:8])[0] if len(raw) >= 8 else None
+        case 6 | 7:  # BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                # Opaque binary values have no usable bound in the string
+                # domain; returning None keeps pruning conservative.
+                return None
+        case _:
+            # INT96 (deprecated timestamps) and unknown types: no bound.
+            return None
 
 
 @dataclass(frozen=True)
@@ -536,3 +542,58 @@ def capture_footer_stats(store: ObjectIO, source: BinaryIO) -> str | None:
     finally:
         temp_path.unlink(missing_ok=True)
     return stats_hash
+
+
+class FooterCache:
+    """Client-local cache of footer stats, keyed by content hash.
+
+    Footers are content-addressed and immutable, so a cache entry can never
+    be stale — same argument as the tree cache. Repeated ``query prune`` runs
+    over a large prefix then cost O(misses) store reads instead of one read
+    per file, and never re-parse a footer they have already seen.
+    """
+
+    def __init__(self, root: str | Path, maxsize: int = 4096) -> None:
+        self._dir = Path(root)
+        self._memory: OrderedDict[str, FooterStats] = OrderedDict()
+        self._maxsize = maxsize
+
+    def get(
+        self, store: ObjectIO, footer_hash: str
+    ) -> FooterStats | None:
+        """Return parsed stats for *footer_hash*, reading the store on a miss."""
+        cached = self._memory.get(footer_hash)
+        if cached is not None:
+            self._memory.move_to_end(footer_hash)
+            return cached
+
+        payload: bytes | None = None
+        cache_path = self._dir / footer_hash
+        if cache_path.exists():
+            try:
+                payload = cache_path.read_bytes()
+            except OSError:
+                payload = None
+        if payload is None:
+            payload = store.read_footer_bytes(footer_hash)
+            if payload is None:
+                return None
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with NamedTemporaryFile(
+                    mode="wb", dir=cache_path.parent, delete=False
+                ) as temp:
+                    temp_path = Path(temp.name)
+                    temp.write(payload)
+                temp_path.replace(cache_path)
+            except OSError:
+                pass  # cache is an optimization; failures are not fatal
+
+        try:
+            stats = parse_footer_stats(payload)
+        except (ValueError, KeyError, TypeError):
+            return None
+        self._memory[footer_hash] = stats
+        if len(self._memory) > self._maxsize:
+            self._memory.popitem(last=False)
+        return stats

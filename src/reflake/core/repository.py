@@ -9,6 +9,7 @@ from blake3 import blake3
 from .client_state import LocalClientState
 from .config import BaseConfig, S3Config
 from .domain import (
+    BlobIntegrityError,
     CommitObject,
     DiffEntry,
     EmptyBranchError,
@@ -59,10 +60,12 @@ class ReflakeRepository:
             self.store.transfer_backend = blob_transfer
         self.client_state = client_state or self._default_client_state()
         self.refs = RefManager(store=self.store, client_state=self.client_state)
+        trust_mtime = bool(config.trust_mtime) if config else False
         self.tree_writer = TreeWriter(
             store=self.store,
             refs=self.refs,
             client_state=self.client_state,
+            trust_mtime=trust_mtime,
         )
         self.entries = EntryFactory(
             root=self.layout.root,
@@ -74,6 +77,7 @@ class ReflakeRepository:
             root=self.layout.root,
             store=self.store,
             refs=self.refs,
+            trust_mtime=trust_mtime,
         )
 
     def _default_client_state(self) -> LocalClientState:
@@ -243,8 +247,9 @@ class ReflakeRepository:
             # snapshot as the expected state. If another client advanced
             # the branch since our last interaction, the stale snapshot
             # causes a RefConflictError, and staged commits re-apply onto
-            # the new parent and retry.
-            branch_state = self.refs.require_branch_state(branch)
+            # the new parent and retry. An unborn branch (no ref yet) has
+            # expected state "must not exist" and is created by this commit.
+            branch_state = self.refs.require_branch_state(branch, allow_unborn=True)
             parent_commit = branch_state.commit_id
 
             parent_tree: str | None = None
@@ -383,92 +388,36 @@ class ReflakeRepository:
         return self.refs.read_commit(commit_id)
 
     def log(self, ref: str) -> Iterator[CommitObject]:
+        """Yield every commit reachable from *ref*, newest first.
+
+        Traverses the full parent DAG (merge commits expose both sides), and
+        orders deterministically by ``generation`` descending — the DAG-depth
+        perf hint stored on every commit — with the commit id as tie-break.
+        """
         try:
             commit_id = self.refs.resolve_ref(ref)
         except EmptyBranchError:
             return
 
-        while commit_id:
-            commit = self.refs.read_commit(commit_id)
-            yield commit
-            commit_id = commit.first_parent
+        commits: list[CommitObject] = []
+        seen: set[str] = set()
+        stack = [commit_id]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            commit = self.refs.read_commit(current)
+            commits.append(commit)
+            stack.extend(commit.parents)
+        commits.sort(key=lambda commit: (-commit.generation, commit.id))
+        yield from commits
 
     def diff(self, from_ref: str, to_ref: str) -> list[DiffEntry]:
+        """Structural diff between two refs (only differing directories read)."""
         from_commit = self.refs.read_commit(self.refs.resolve_ref(from_ref))
         to_commit = self.refs.read_commit(self.refs.resolve_ref(to_ref))
-
-        from_iter = self.store.iter_all_entries(from_commit.tree)
-        to_iter = self.store.iter_all_entries(to_commit.tree)
-
-        changes: list[DiffEntry] = []
-        from_entry = next(from_iter, None)
-        to_entry = next(to_iter, None)
-
-        while from_entry is not None or to_entry is not None:
-            if from_entry is None:
-                changes.append(
-                    DiffEntry(
-                        path=to_entry.path,  # type: ignore[union-attr]
-                        change="added",
-                        before_hash=None,
-                        after_hash=to_entry.hash,  # type: ignore[union-attr]
-                        before_size=None,
-                        after_size=to_entry.size,  # type: ignore[union-attr]
-                    )
-                )
-                to_entry = next(to_iter, None)
-            elif to_entry is None:
-                changes.append(
-                    DiffEntry(
-                        path=from_entry.path,
-                        change="removed",
-                        before_hash=from_entry.hash,
-                        after_hash=None,
-                        before_size=from_entry.size,
-                        after_size=None,
-                    )
-                )
-                from_entry = next(from_iter, None)
-            elif from_entry.path == to_entry.path:
-                if from_entry.hash != to_entry.hash or from_entry.size != to_entry.size:
-                    changes.append(
-                        DiffEntry(
-                            path=from_entry.path,
-                            change="modified",
-                            before_hash=from_entry.hash,
-                            after_hash=to_entry.hash,
-                            before_size=from_entry.size,
-                            after_size=to_entry.size,
-                        )
-                    )
-                from_entry = next(from_iter, None)
-                to_entry = next(to_iter, None)
-            elif from_entry.path < to_entry.path:
-                changes.append(
-                    DiffEntry(
-                        path=from_entry.path,
-                        change="removed",
-                        before_hash=from_entry.hash,
-                        after_hash=None,
-                        before_size=from_entry.size,
-                        after_size=None,
-                    )
-                )
-                from_entry = next(from_iter, None)
-            else:
-                changes.append(
-                    DiffEntry(
-                        path=to_entry.path,
-                        change="added",
-                        before_hash=None,
-                        after_hash=to_entry.hash,
-                        before_size=None,
-                        after_size=to_entry.size,
-                    )
-                )
-                to_entry = next(to_iter, None)
-
-        return changes
+        return self.tree_writer.diff_trees(from_commit.tree, to_commit.tree)
 
     def verify(
         self,
@@ -588,7 +537,24 @@ class ReflakeRepository:
         return self.store.lookup_entry(commit.tree, normalized_path)
 
     def read_blob(self, blob_hash: str) -> bytes:
-        return self.store.read_blob_bytes(blob_hash)
+        """Read a canonical blob, verifying it against its content hash.
+
+        Content addressing is only a guarantee if reads are checked; corrupt
+        or misplaced bytes must surface as an error, not as data. Streaming
+        reads (``open_blob_stream``) cannot be verified without buffering and
+        are documented as unverified.
+        """
+        from blake3 import blake3 as _blake3
+
+        payload = self.store.read_blob_bytes(blob_hash)
+        actual = _blake3(payload).hexdigest()
+        if actual != blob_hash:
+            raise BlobIntegrityError(
+                expected=blob_hash,
+                actual=actual,
+                context="read_blob",
+            )
+        return payload
 
     def open_blob_stream(self, blob_hash: str) -> BinaryIO:
         return self.store.open_blob(blob_hash)
@@ -641,13 +607,10 @@ class ReflakeRepository:
             state = self.store.read_branch_ref(branch)
             if state and state.commit_id:
                 pending.append(state.commit_id)
-        # Global memo so shared subtrees are walked once across commits.
-        # NOTE: only iter_tree_hashes shares the memo — iter_leaf_refs
-        # gets a fresh walk per commit because sharing the same set
-        # would skip leaves of already-listed trees (blobs/footers would
-        # go missing from the reachable set). Re-yielded blob hashes are
-        # deduplicated by the reachable_* sets.
+        # Shared memos across commits: the tree DAG and each tree's leaf
+        # references are walked once no matter how many commits share them.
         seen_trees: set[str] = set()
+        leaf_refs_memo: dict[str, tuple[tuple[str | None, str | None], ...]] = {}
         while pending:
             commit_id = pending.pop()
             if commit_id in reachable_commits:
@@ -658,7 +621,9 @@ class ReflakeRepository:
                 commit.tree, _seen=seen_trees
             ):
                 reachable_trees.add(tree_hash)
-            for blob_hash, footer_hash in self.tree_writer.iter_leaf_refs(commit.tree):
+            for blob_hash, footer_hash in self.tree_writer.iter_leaf_refs(
+                commit.tree, memo=leaf_refs_memo
+            ):
                 if blob_hash:
                     reachable_blobs.add(blob_hash)
                 if footer_hash:
@@ -678,8 +643,7 @@ class ReflakeRepository:
             counts[kind] = (len(stored), len(orphans))
             if not dry_run and orphans:
                 pruned_any = True
-                for object_id in orphans:
-                    self.store.delete_object(kind, object_id)
+                self.store.delete_objects(kind, sorted(orphans))
 
         return GcResult(
             reachable_commits=len(reachable_commits),

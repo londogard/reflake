@@ -50,6 +50,8 @@ class FakeS3Client:
     def __init__(self, objects: dict[str, dict[str, Any]]) -> None:
         self._objects = objects
         self.fixed_etag: str | None = None
+        #: Sizes of every ``delete_objects`` batch received, in order.
+        self.delete_calls: list[int] = []
 
     def get_paginator(self, operation_name: str) -> FakeS3Paginator:
         assert operation_name == "list_objects_v2"
@@ -125,6 +127,20 @@ class FakeS3Client:
     def delete_object(self, *, Bucket: str, Key: str) -> dict[str, object]:
         assert Bucket == "demo-bucket"
         self._objects.pop(Key, None)
+        return {}
+
+    def delete_objects(
+        self, *, Bucket: str, Delete: dict[str, object]
+    ) -> dict[str, object]:
+        assert Bucket == "demo-bucket"
+        objects = Delete["Objects"]
+        assert isinstance(objects, list)
+        # Mirrors the real API's hard limit.
+        assert len(objects) <= 1000, f"DeleteObjects got {len(objects)} keys"
+        self.delete_calls.append(len(objects))
+        for item in objects:
+            assert isinstance(item, dict)
+            self._objects.pop(item["Key"], None)
         return {}
 
     def _etag(self, payload: bytes) -> str:

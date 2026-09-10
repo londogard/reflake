@@ -17,10 +17,8 @@ import boto3  # noqa: F401  – kept for monkeypatching in tests
 from ..domain import BranchRefState  # noqa: F401 – re-exported for callers
 from .backends import (
     BlobTransferBackend,
-    LocalStorageBackend,
     S3ObjectMetadata,
     SourceObjectMetadata,
-    StorageBackend,
     TransferDirection,
     TransferItem,
     TransferPlan,
@@ -41,7 +39,6 @@ from .base import (
 from .local import LocalObjectStore
 from .s3 import S3ObjectStore
 from .source import (
-    S3StorageBackend,
     _s3_is_404,
     _s3_is_precondition_failed,
     build_s3_client,
@@ -63,7 +60,6 @@ __all__ = [
     "HasLocalPath",
     "HasRemoteURI",
     "LocalObjectStore",
-    "LocalStorageBackend",
     "ObjectIO",
     "ObjectStore",
     "QueryRefStore",
@@ -73,10 +69,8 @@ __all__ = [
     "S3BlobTransferBackend",
     "S3ObjectMetadata",
     "S3ObjectStore",
-    "S3StorageBackend",
     "S5CmdBlobTransferBackend",
     "SourceObjectMetadata",
-    "StorageBackend",
     "StoreInventory",
     "TransferDirection",
     "TransferItem",

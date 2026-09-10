@@ -1,6 +1,7 @@
 from .client_state import LocalClientState
 from .config import BaseConfig, LocalConfig, ReflakeConfig, S3Config, init_config
 from .domain import (
+    BlobIntegrityError,
     BranchRefState,
     CommitObject,
     DiffEntry,
@@ -24,6 +25,7 @@ from .domain import (
     StageChange,
     StageStatus,
     StorageUnavailableError,
+    TransferEndpointError,
     UnknownCommitError,
     UnknownRefError,
     VerifyResult,
@@ -31,26 +33,17 @@ from .domain import (
 from .entry_codec import CorruptEntryError, Entry
 from .hashing import DEFAULT_CHUNK_SIZE, blake3_digest_file, blake3_digest_stream
 from .layout import ReflakeLayout, blob_relpath, initialize_reflake_layout
-from .manifest import (
-    FileEntry,
-    ManifestReader,
-    ManifestWriter,
-    build_manifest_entries,
-    walk_files,
-)
+from .manifest import FileEntry, walk_files
 from .objects import (
     BlobTransferBackend,
     LocalObjectStore,
-    LocalStorageBackend,
     ObjectIO,
     ObjectStore,
     RefCas,
     S3BlobTransferBackend,
     S3ObjectMetadata,
     S3ObjectStore,
-    S3StorageBackend,
     S5CmdBlobTransferBackend,
-    StorageBackend,
     StoreInventory,
     TreeQuery,
     build_blob_transfer_backend,
@@ -113,11 +106,10 @@ __all__ = [
     "FileEntry",
     "BranchRefState",
     "LocalObjectStore",
-    "LocalStorageBackend",
+    "BlobIntegrityError",
+    "TransferEndpointError",
     "CorruptEntryError",
     "Entry",
-    "ManifestReader",
-    "ManifestWriter",
     "ObjectIO",
     "OptimisticLockError",
     "PreconditionFailedError",
@@ -127,9 +119,7 @@ __all__ = [
     "PruneResult",
     "RefCas",
     "S3ObjectStore",
-    "S3StorageBackend",
     "StorageUnavailableError",
-    "StorageBackend",
     "StoreInventory",
     "TreeQuery",
     "UnknownCommitError",
@@ -143,7 +133,6 @@ __all__ = [
     "blake3_digest_stream",
     "build_blob_transfer_backend",
     "blob_relpath",
-    "build_manifest_entries",
     "initialize_reflake_layout",
     "FetchResult",
     "GcResult",

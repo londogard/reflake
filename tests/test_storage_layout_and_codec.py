@@ -1,5 +1,5 @@
-"""Tests for the structural refactors: key-space unification, protocol split,
-sorted-stream merging, and branch-snapshot relocation."""
+"""Tests for storage refactors: key-space unification, entry codec, staged
+overlay replacement, and branch-snapshot relocation."""
 
 from __future__ import annotations
 
@@ -15,14 +15,9 @@ from reflake.core.entry_codec import (
 )
 from reflake.core.layout import object_relative_key
 from reflake.core.objects.tree import parse_tree_object
-from reflake.core.repository_support import merge_sorted_streams
 
 DIGEST = "a" * 64
 FOOTER = "b" * 64
-
-
-def _entry(path: str) -> Entry:
-    return Entry(path=path, kind="b", hash="0" * 64, size=1, mtime_ns=2)
 
 
 def _make_commit(repo, name: str, message: str) -> str:
@@ -162,24 +157,7 @@ def test_local_store_paths_derive_from_key_space(tmp_path: Path) -> None:
     )
 
 
-# ── Sorted-stream merging ────────────────────────────────────────────────────
-
-
-def test_merge_sorted_streams_interleaves_and_stabilizes_ties() -> None:
-    left = [_entry("a"), _entry("m"), _entry("z")]
-    right = [_entry("b"), _entry("m"), _entry("n")]
-
-    merged = list(merge_sorted_streams(iter(left), iter(right)))
-    assert [entry.path for entry in merged] == ["a", "b", "m", "m", "n", "z"]
-    # Stable: the tie keeps the earlier stream's entry first.
-    assert merged[2] is left[1]
-
-
-def test_merge_sorted_streams_handles_empty_streams() -> None:
-    only_left = list(merge_sorted_streams([_entry("a")], iter(())))
-    assert [entry.path for entry in only_left] == ["a"]
-    only_right = list(merge_sorted_streams(iter(()), [_entry("z")]))
-    assert [entry.path for entry in only_right] == ["z"]
+# ── Staged overlay replaces entries in place ────────────────────────────────
 
 
 def test_overlay_staged_uses_stream_merge_for_replacement(tmp_path: Path) -> None:

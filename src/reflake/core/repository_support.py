@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import heapq
-from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import PurePosixPath
 
@@ -14,42 +13,9 @@ from .entry_codec import Entry
 CommitReader = Callable[[str], CommitObject]
 
 
-def merge_sorted_streams(
-    *streams: Iterable[Entry],
-) -> Iterator[Entry]:
-    """Stable k-way merge of path-sorted manifest-entry streams.
-
-    Tree entries and manifests are ordered by logical path; every operation
-    that combines streams (staged overlays, imports, metadata rewrites) must
-    merge rather than concatenate, or the sorted invariant breaks downstream.
-    Ties keep the earlier stream's entry first.
-    """
-    return heapq.merge(*streams, key=lambda entry: entry.path)
-
-
 def metadata_identity(relative_path: str, size: int) -> str:
     payload = f"{relative_path}\n{size}".encode()
     return blake3(payload).hexdigest()
-
-
-def iter_reachable_commits(
-    start: str, *, read_commit: CommitReader
-) -> Iterator[str]:
-    """Yield every commit id reachable from *start* across all parent edges."""
-    seen: set[str] = set()
-    queue: deque[str] = deque([start])
-    while queue:
-        commit_id = queue.popleft()
-        if commit_id in seen:
-            continue
-        seen.add(commit_id)
-        yield commit_id
-        queue.extend(read_commit(commit_id).parents)
-
-
-def collect_ancestors(start: str, *, read_commit: CommitReader) -> set[str]:
-    """Set of commits reachable from *start*, including *start* itself."""
-    return set(iter_reachable_commits(start, read_commit=read_commit))
 
 
 def is_ancestor_commit(
@@ -92,16 +58,40 @@ def is_ancestor_commit(
 def merge_base_commit(
     commit_a: str, commit_b: str, *, read_commit: CommitReader
 ) -> CommitObject | None:
-    """Common ancestor with the highest generation, or ``None`` if unrelated."""
-    ancestors_a = collect_ancestors(commit_a, read_commit=read_commit)
-    best: CommitObject | None = None
-    for commit_id in collect_ancestors(commit_b, read_commit=read_commit):
-        if commit_id not in ancestors_a:
-            continue
-        commit = read_commit(commit_id)
-        if best is None or commit.generation > best.generation:
-            best = commit
-    return best
+    """Best common ancestor of two commits (highest generation), or ``None``.
+
+    Generation-ordered frontier walk: both sides expand from the highest
+    generation down, marking each commit with the side(s) that reach it. The
+    first commit marked from *both* sides is a common ancestor of maximal
+    generation, and the walk stops there — cost is O(distance since
+    divergence), not O(full history), and only the frontier is held in memory.
+    """
+    if commit_a == commit_b:
+        return read_commit(commit_a)
+
+    flag_a, flag_b = 1, 2
+    marked: dict[str, int] = {}
+    heap: list[tuple[int, str]] = []
+
+    def visit(commit_id: str, flag: int) -> None:
+        previous = marked.get(commit_id, 0)
+        combined = previous | flag
+        if combined == previous:
+            return
+        marked[commit_id] = combined
+        heapq.heappush(heap, (-read_commit(commit_id).generation, commit_id))
+
+    visit(commit_a, flag_a)
+    visit(commit_b, flag_b)
+
+    while heap:
+        _, commit_id = heapq.heappop(heap)
+        side = marked[commit_id]
+        if side == flag_a | flag_b:
+            return read_commit(commit_id)
+        for parent_id in read_commit(commit_id).parents:
+            visit(parent_id, side)
+    return None
 
 
 def normalize_repository_path(path: str) -> str:
@@ -153,12 +143,6 @@ def normalize_logical_paths(paths: list[str]) -> list[str]:
 
 def matches_logical_path(entry_path: str, logical_path: str) -> bool:
     return entry_path == logical_path or entry_path.startswith(f"{logical_path}/")
-
-
-def matches_any_logical_path(entry_path: str, logical_paths: list[str]) -> bool:
-    return any(
-        matches_logical_path(entry_path, logical_path) for logical_path in logical_paths
-    )
 
 
 def move_logical_path(

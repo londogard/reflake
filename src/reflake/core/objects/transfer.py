@@ -5,6 +5,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from ..domain import BlobIntegrityError, ObjectMissingError, StorageUnavailableError
+from ..hashing import blake3_digest_file
 from .backends import S3ObjectMetadata, TransferPlan
 from .source import S3StorageBackend, _mtime_ns, build_s3_client, parse_s3_uri
 
@@ -128,7 +130,32 @@ class S5CmdBlobTransferBackend:
                 Path(item.local_path).parent.mkdir(parents=True, exist_ok=True)
                 lines.append(f"cp {item.remote_uri} {item.local_path}")
         self._run(["run"], input_data="\n".join(lines) + "\n")
+        if plan.direction == "download":
+            self._verify_downloaded_blobs(plan)
         return len(plan.items)
+
+    @staticmethod
+    def _verify_downloaded_blobs(plan: TransferPlan) -> None:
+        """Check downloaded blobs against their content-addressed ids.
+
+        s5cmd transfers bytes without parsing them; a silent mismatch would
+        poison the local object store, so every blob is re-hashed once.
+        """
+        for item in plan.items:
+            if item.kind != "blob":
+                continue
+            local_path = Path(item.local_path)
+            if not local_path.exists():
+                raise ObjectMissingError(
+                    f"Blob download missing after transfer: {item.remote_uri}"
+                )
+            digest = blake3_digest_file(local_path)
+            if digest != item.object_id:
+                raise BlobIntegrityError(
+                    expected=item.object_id,
+                    actual=digest,
+                    context="s5cmd download",
+                )
 
     def _run(
         self,
@@ -139,13 +166,24 @@ class S5CmdBlobTransferBackend:
         if self._endpoint:
             cmd.extend(["--endpoint-url", self._endpoint])
         cmd.extend(args)
-        return subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            input=input_data,
-            check=True,
-        )
+        try:
+            return subprocess.run(
+                cmd,
+                text=True,
+                capture_output=True,
+                input=input_data,
+                check=True,
+            )
+        except FileNotFoundError as error:
+            raise StorageUnavailableError(
+                f"s5cmd executable not found: {self._s5cmd_path}"
+            ) from error
+        except subprocess.CalledProcessError as error:
+            detail = (error.stderr or error.stdout or "").strip().splitlines()
+            tail = detail[-1] if detail else f"exit code {error.returncode}"
+            raise StorageUnavailableError(
+                f"s5cmd {' '.join(args)} failed: {tail}"
+            ) from error
 
     def upload(
         self,
@@ -196,11 +234,12 @@ class S5CmdBlobTransferBackend:
         self._run(["rm", remote_uri])
 
     def exists(self, remote_uri: str) -> bool:
+        """True when *remote_uri* is listable; command failures mean "no"."""
         try:
             result = self._run(["ls", remote_uri])
-            return bool(result.stdout.strip())
-        except subprocess.CalledProcessError:
+        except StorageUnavailableError:
             return False
+        return bool(result.stdout.strip())
 
 
 def build_blob_transfer_backend(

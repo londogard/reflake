@@ -6,6 +6,125 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
 
 ## Unreleased
 
+### Fixed
+
+- **`identity promote` keeps parquet footer stats.** Promotion rewrote
+  pointer entries with the plain-blob kind, so an `mp` entry (stats attached)
+  became `b` and every promoted file silently lost its row-group statistics —
+  pruning stopped working on exactly the files that had been prepared for it.
+- **Nested shards can no longer be written.** Rebuilding a shard body through
+  the general builder re-sharded it once the range held `MAX_TREE_ENTRIES + 1`
+  entries, producing shard pointers inside a shard; later operations then saw
+  duplicate/misplaced names. Shard bodies are now written as plain nodes, and
+  an overflowing range splits into two balanced sibling shards.
+- **A staged file can replace a directory (and vice versa) in one splice.**
+  The splice loop kept the existing subtree and then appended the new leaf,
+  writing a node with two identical names (unparseable tree stream).
+- **Sharded directories no longer corrupt full commits.** A directory with
+  more than 10k entries is stored as name-range shard subtrees; the full
+  commit path merged parent *shard pointers* as if they were named children.
+  Depending on which file changed, this either silently dropped parent-only
+  entries or produced duplicate paths and an unsorted tree stream (breaking
+  `verify`, `promote`, and analytical indexing). Parent-directory resolution
+  now expands shards to real children, and `_prune_tree` tests removal
+  prefixes against real names. Regression suite: `tests/test_sharded_directories.py`.
+- **Opening a repository no longer mutates it.** `RefManager` used to write
+  an empty ref for the default branch, which also "created" nonexistent S3
+  prefixes on open. Missing branches are now *unborn*: staging works, the ref
+  is created by the first commit (CAS `expected=None`).
+- **`verify` is strictly read-only.** Dry-run audits no longer build or write
+  tree objects; only `promote` materializes and commits.
+- **Path-prefix matching is component-aware everywhere.** Tree walks, VFS
+  listings, and staged overlays now use the same rule as `rm`/`mv`
+  (`a/b` matches `a/b` and `a/b/…`, never `a/bc`), so staged and committed
+  paths can no longer disagree.
+- **CLI usage errors exit 1**, not 2 (2 is reserved for retryable conflicts).
+  Sync endpoint misuse raises `TransferEndpointError` instead of `TypeError`.
+- **`log` shows the full parent DAG** (merged-in commits are no longer
+  hidden by a first-parent-only walk).
+- **`restore --path <dir>` restores directory prefixes**, and unknown paths
+  fail with exit 3 instead of silently restoring nothing.
+- **Blob reads are hash-verified** (`read_blob`/`cat`/`restore`), and s5cmd
+  batch downloads re-hash blobs after transfer; s5cmd failures surface as
+  `StorageUnavailableError` (never `CalledProcessError`).
+- **Pruning parser**: `AND` inside quoted literals is no longer a clause
+  separator, and binary/INT96 min-max bounds are dropped instead of compared
+  in the wrong domain (pruning stays conservative).
+- **GC walks shared subtrees once** (per-tree leaf-reference memo) instead of
+  re-walking the tree DAG per commit.
+- **Tree cache eviction** no longer stops at the first pinned entry.
+- **Merge base is the nearest common ancestor.** `merge` used to walk the
+  first-parent chain, so merging after a shared commit could report false
+  conflicts for files that only one side had touched since the divergence.
+  The new walk is generation-ordered over both frontiers and stops at the
+  first commit reachable from both sides.
+
+### Changed
+
+- **Commits, splices, merges, diffs and prunes touch O(changed paths).**
+  - Unchanged directory nodes (and, in sharded directories, unchanged shard
+    bodies) are detected by content hash and never written: committing one
+    changed file in a 50-directory repository now PUTs 2 tree nodes instead
+    of 51. Full commits that change nothing PUT none.
+  - Staged adds/removals in a sharded directory rewrite only the shard whose
+    name range contains the touched paths (binary search per name), and
+    removal pruning tests removal prefixes against shard ranges before
+    loading anything.
+  - Merging branches that changed different ranges of the same huge
+    directory compares shard pointers pairwise and reads no shard bodies at
+    all; only ranges that both sides changed are descended into.
+  - `identity promote` splices materialized entries into the existing tree
+    instead of rebuilding it from a flattened walk.
+- **New or changed worktree files are hashed in parallel** (up to 8 workers;
+  blake3 releases the GIL), measured at ~2.5x on a 20k-file ingest.
+- **`trust_mtime` config key** (off by default): reuse a content entry whose
+  size *and* `mtime_ns` match the worktree file without re-hashing it. Trade
+  -off: a same-size, same-mtime edit is not detected.
+- **`query prune` accepts a footer cache.** Footer stats are
+  content-addressed, so repeat scans of the same revision read no footers at
+  all.
+- **GC deletes in batches** (`DeleteObjects`, up to 1000 keys per request)
+  instead of one request per object.
+- **Analytical index keeps its CSV ingestion.** Benchmarked: 50k rows take
+  ~0.3s via the manifest CSV but ~46s via parametrized `INSERT`s (even in 10k
+  batches) on the pinned DuckDB, so the intermediate CSV is the fast path,
+  not a shortcut.
+
+- **`merge` is tree-level and O(changed directories).** It compares
+  content-addressed subtree hashes and short-circuits whenever a directory is
+  unchanged on one side, so the tree is never flattened: merging two branches
+  that each changed one file in a 10k-entry / 400-directory repository costs
+  2 tree reads and 1 tree write (previously every directory was re-walked and
+  re-materialized). Conflict rules are unchanged: one-sided changes win,
+  delete/modify and file↔directory shape changes conflict with the offending
+  paths, and identical add/add is accepted.
+- **`verify`/`promote` are now nested under `reflake identity`** (breaking CLI
+  change): `reflake identity verify` (read-only audit; exit 1 while
+  unverifiable entries remain) and `reflake identity promote` (materialize
+  blobs + promotion commit). The library methods `repo.verify()` /
+  `repo.promote()` are unchanged, and the JSON payloads keep their fields.
+- **Transfer planning is adaptive**: small plans probe object existence
+  per object; plans above 64 candidates list the destination inventory once
+  per object kind (one paginated listing instead of N HEAD requests). Commit
+  collection uses the same strategy.
+- **`commit` warns about unverifiable revisions when staged pointer entries
+  are committed**, not only when the repository default identity is `pointer`.
+- **Benchmarks are excluded from the default test run** (`pytest -m benchmark`
+  to run them); CI runs `-m "not integration and not benchmark"`.
+
+### Removed
+
+- Top-level `reflake verify` / `reflake promote` (moved under `identity`).
+- Dead v1-era surface: `ManifestReader`/`ManifestWriter`/`build_manifest_entries`,
+  `LocalStorageBackend`/`StorageBackend`, the derived-manifest block index
+  (`derived.py`, `lookup_derived_entry`), `merge_sorted_streams`,
+  `Entry.from_dict`, `SUPPORTED_IDENTITY_MODES`, `StageStatus.modified`, and
+  `TreeCache.pin`/`unpin`.
+- `PLAN_PROGRESS.md` (stale duplicate of `docs/architecture.md`).
+- Stale v1-era `.reflake/` state that had been committed into the source tree
+  (`config.json`, refs, staging leftovers). `.reflake/` is now git-ignored:
+  runtime state must never be committed.
+
 ## [0.2.0] - 2026-09-08
 
 ### Breaking pre-1.0 cleanup

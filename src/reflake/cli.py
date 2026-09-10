@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import sys
 from dataclasses import asdict, dataclass
@@ -136,6 +137,11 @@ class ListArgs:
         positional=True,
         nargs="?",
         help="Logical path or prefix to list (default: root)",
+    )
+    ref: str | None = field(
+        default=None,
+        alias="--ref",
+        help="Ref (branch or commit) to list (default: current branch)",
     )
 
 
@@ -348,7 +354,7 @@ class MergeArgs:
 
 
 @dataclass
-class VerifyArgs:
+class IdentityVerifyArgs:
     path: list[str] = field(
         default_factory=list,
         alias="--path",
@@ -358,12 +364,24 @@ class VerifyArgs:
 
 
 @dataclass
-class PromoteArgs:
+class IdentityPromoteArgs:
     path: list[str] = field(
         default_factory=list,
         alias="--path",
         action="append",
         help="Optional path/prefix filter (repeatable)",
+    )
+
+
+@dataclass
+class IdentityArgs:
+    """Entry-identity commands: audit unverifiable entries, then materialize."""
+
+    command: IdentityVerifyArgs | IdentityPromoteArgs = subparsers(
+        {
+            "verify": IdentityVerifyArgs,
+            "promote": IdentityPromoteArgs,
+        }
     )
 
 
@@ -420,8 +438,7 @@ class ReflakeCLI:
         | BranchArgs
         | DiffArgs
         | MergeArgs
-        | VerifyArgs
-        | PromoteArgs
+        | IdentityArgs
         | GcArgs
         | QueryArgs
         | LogArgs
@@ -447,8 +464,7 @@ class ReflakeCLI:
             "branch": BranchArgs,
             "diff": DiffArgs,
             "merge": MergeArgs,
-            "verify": VerifyArgs,
-            "promote": PromoteArgs,
+            "identity": IdentityArgs,
             "gc": GcArgs,
             "query": QueryArgs,
             "log": LogArgs,
@@ -500,16 +516,21 @@ def build_parser() -> _CleanParser:
 class _CleanParser(ArgumentParser):
     """ArgumentParser that suppresses simple-parsing internal group headers."""
 
-    def format_help(self):
-        import re
+    _INTERNAL_GROUP = re.compile(r"^\w+ \['cli(?:\.\w+)*'\]:$")
 
-        text = super().format_help()
-        text = re.sub(
-            r"ReflakeCLI \['cli'\]:\n  ReflakeCLI\(command: '[^)]+'\)\n?",
-            "",
-            text,
-        )
-        return text
+    def format_help(self) -> str:
+        cleaned: list[str] = []
+        skipping = False
+        for line in super().format_help().splitlines():
+            if self._INTERNAL_GROUP.match(line):
+                skipping = True
+                continue
+            if skipping:
+                if line.startswith("  ") or not line.strip():
+                    continue
+                skipping = False
+            cleaned.append(line)
+        return "\n".join(cleaned).rstrip("\n") + "\n"
 
 
 def _print_status(stage: StageStatus) -> None:
@@ -549,7 +570,6 @@ def _stage_payload(stage: StageStatus) -> dict[str, object]:
         "ref": stage.ref,
         "added": stage.added,
         "removed": stage.removed,
-        "modified": stage.modified,
         "working_tree_added": stage.working_tree_added,
         "working_tree_removed": stage.working_tree_removed,
         "working_tree_modified": stage.working_tree_modified,
@@ -603,6 +623,13 @@ def _config_set_value(config: ReflakeConfig, key: str, value: str) -> ReflakeCon
             config.parquet_footer = False
         else:
             raise ValueError(f"parquet_footer must be a boolean, got: {value}")
+    elif key == "trust_mtime":
+        if value.strip().lower() in ("true", "1", "yes", "on"):
+            config.trust_mtime = True
+        elif value.strip().lower() in ("false", "0", "no", "off"):
+            config.trust_mtime = False
+        else:
+            raise ValueError(f"trust_mtime must be a boolean, got: {value}")
     elif key == "s3.bucket":
         if isinstance(config, LocalConfig):
             return S3Config(
@@ -641,10 +668,10 @@ def _command_name(command: object) -> str:
         return "diff"
     if isinstance(command, MergeArgs):
         return "merge"
-    if isinstance(command, VerifyArgs):
-        return "verify"
-    if isinstance(command, PromoteArgs):
-        return "promote"
+    if isinstance(command, IdentityArgs):
+        if isinstance(command.command, IdentityPromoteArgs):
+            return "identity promote"
+        return "identity verify"
     if isinstance(command, LogArgs):
         return "log"
     if isinstance(command, ListArgs):
@@ -701,7 +728,9 @@ def run_cli(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv).cli
     except SystemExit as exc:
-        return exc.code if isinstance(exc.code, int) else 2
+        # argparse exits 2 for usage errors, but the CLI contract reserves
+        # exit 2 for retryable conflicts — usage/validation is 1.
+        return 0 if not exc.code else 1
     command = args.command
     command_name = _command_name(command)
     repo_root = args.root
@@ -709,7 +738,14 @@ def run_cli(argv: list[str] | None = None) -> int:
 
     try:
         if isinstance(command, CommitArgs):
-            commit_id = open_repository(repo_root).commit(
+            repo = open_repository(repo_root)
+            staged_pointer_entries = False
+            if command.staged_only:
+                staged = repo.staging.load(repo.current_branch())
+                staged_pointer_entries = any(
+                    change.identity_mode == "pointer" for change in staged.values()
+                )
+            commit_id = repo.commit(
                 command.message,
                 staged_only=command.staged_only,
             )
@@ -718,7 +754,10 @@ def run_cli(argv: list[str] | None = None) -> int:
             else:
                 print(commit_id)
             config = BaseConfig.load(repo_root)
-            if config is not None and config.identity == "pointer":
+            pointer_commit = staged_pointer_entries or (
+                config is not None and config.identity == "pointer"
+            )
+            if pointer_commit:
                 print(
                     "⚠  Metadata-only identity: this revision is unverifiable "
                     "until `reflake promote` is run. "
@@ -833,43 +872,45 @@ def run_cli(argv: list[str] | None = None) -> int:
                     )
             return 0
 
-        if isinstance(command, VerifyArgs):
-            result = open_repository(repo_root).verify(
-                path_prefixes=_flatten_option_values(command.path),
-            )
-            remaining = result.candidate_entries - result.verified_entries
-            if as_json:
-                print(
-                    json.dumps(
-                        {
-                            "commit_id": result.commit_id,
-                            "verified_entries": result.verified_entries,
-                            "candidate_entries": result.candidate_entries,
-                            "total_entries": result.total_entries,
-                            "unverifiable_entries": remaining,
-                        },
-                        indent=2,
-                    )
+        if isinstance(command, IdentityArgs):
+            identity_command = command.command
+            if isinstance(identity_command, IdentityVerifyArgs):
+                result = open_repository(repo_root).verify(
+                    path_prefixes=_flatten_option_values(identity_command.path),
                 )
-            else:
-                print(
-                    f"Verified {result.verified_entries}/"
-                    f"{result.candidate_entries} entries "
-                    f"(total: {result.total_entries})"
-                )
-                if remaining > 0:
+                remaining = result.candidate_entries - result.verified_entries
+                if as_json:
                     print(
-                        f"⚠  {remaining} unverifiable entries remain "
-                        f"(source objects must be retained; "
-                        f"run `reflake promote` to materialize them).",
-                        file=sys.stderr,
+                        json.dumps(
+                            {
+                                "commit_id": result.commit_id,
+                                "verified_entries": result.verified_entries,
+                                "candidate_entries": result.candidate_entries,
+                                "total_entries": result.total_entries,
+                                "unverifiable_entries": remaining,
+                            },
+                            indent=2,
+                        )
                     )
-            # Read-only audit: non-zero while pointer entries remain.
-            return 1 if remaining > 0 else 0
+                else:
+                    print(
+                        f"Verified {result.verified_entries}/"
+                        f"{result.candidate_entries} entries "
+                        f"(total: {result.total_entries})"
+                    )
+                    if remaining > 0:
+                        print(
+                            f"⚠  {remaining} unverifiable entries remain "
+                            f"(source objects must be retained; "
+                            f"run `reflake identity promote` to materialize "
+                            f"them).",
+                            file=sys.stderr,
+                        )
+                # Read-only audit: non-zero while pointer entries remain.
+                return 1 if remaining > 0 else 0
 
-        if isinstance(command, PromoteArgs):
             result = open_repository(repo_root).promote(
-                path_prefixes=_flatten_option_values(command.path),
+                path_prefixes=_flatten_option_values(identity_command.path),
             )
             if as_json:
                 print(
@@ -896,7 +937,8 @@ def run_cli(argv: list[str] | None = None) -> int:
                 if remaining > 0:
                     print(
                         f"⚠  {remaining} unverifiable entries remain "
-                        f"(source objects must be retained for future promotion).",
+                        f"(source objects must be retained for future "
+                        f"promotion).",
                         file=sys.stderr,
                     )
             return 0
@@ -933,6 +975,8 @@ def run_cli(argv: list[str] | None = None) -> int:
                 )
                 if result.pruned:
                     print("Pruned orphaned objects.")
+                elif command.prune:
+                    print("No orphaned objects to prune.")
                 else:
                     print("Dry run — nothing deleted. Re-run with --prune to delete.")
             return 0
@@ -944,8 +988,17 @@ def run_cli(argv: list[str] | None = None) -> int:
                 commit_id = repo.resolve_ref(cmd.ref)
                 commit_obj = repo.read_commit(commit_id)
                 predicates = parse_where_clause(cmd.where)
+                from .core.objects.footer import FooterCache
+
+                footer_cache = FooterCache(repo.client_state.cache_dir / "footers")
                 scans = list(
-                    plan_pruned_scan(repo.store, commit_obj.tree, cmd.path, predicates)
+                    plan_pruned_scan(
+                        repo.store,
+                        commit_obj.tree,
+                        cmd.path,
+                        predicates,
+                        footer_cache=footer_cache,
+                    )
                 )
                 if as_json:
                     print(
@@ -1042,7 +1095,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         if isinstance(command, ListArgs):
             repo = open_repository(repo_root)
             entries = repo.resolve_entries_for_prefix(
-                repo.current_branch(),
+                command.ref or repo.current_branch(),
                 command.path,
             )
             if as_json:

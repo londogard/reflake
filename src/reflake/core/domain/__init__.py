@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .errors import (
+    BlobIntegrityError,
     EmptyBranchError,
     MergeConflictError,
     NonFastForwardError,
@@ -11,6 +12,7 @@ from .errors import (
     RefConflictError,
     ReflakeError,
     StorageUnavailableError,
+    TransferEndpointError,
     UnknownCommitError,
     UnknownRefError,
 )
@@ -32,6 +34,7 @@ from .models import (
 )
 
 __all__ = [
+    "BlobIntegrityError",
     "BranchRefState",
     "CommitObject",
     "DiffEntry",
@@ -52,6 +55,7 @@ __all__ = [
     "RefConflictError",
     "RemoveResult",
     "StorageUnavailableError",
+    "TransferEndpointError",
     "RepositoryObjectKind",
     "StageChange",
     "StageStatus",

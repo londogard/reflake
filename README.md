@@ -53,14 +53,15 @@ Reflake separates data into three layers:
 
 | Area | Commands |
 |---|---|
-| Ingest | `init`, `add`, `commit [--staged]`, `verify` (audit), `promote` |
+| Ingest | `init`, `add`, `commit [--staged]` |
+| Identity | `identity verify` (read-only audit), `identity promote` (materialize) |
 | Inspect | `status`, `log`, `diff`, `list` (`ls`), `cat`, `branches`, `reflog` |
 | Branch | `branch`, `checkout`, `merge` (fast-forward + 3-way metadata merge) |
 | Mutate | `rm`, `mv`, `gc [--prune]`, `restore` |
 | Sync | `push`, `pull`, `fetch`, `transfer` |
 | Analyze | `query build` (DuckDB/Parquet), `query prune` (row-group pruning) |
 
-Exit codes: `0` ok · `1` usage/validation (including `verify` with remaining pointer entries) · `2` conflict, retryable (CAS race, non-fast-forward, merge conflict) · `3` missing ref/object.
+Exit codes: `0` ok · `1` usage/validation (including `identity verify` with remaining pointer entries) · `2` conflict, retryable (CAS race, non-fast-forward, merge conflict) · `3` missing ref/object.
 
 ## Guardrails (Strict)
 
@@ -106,8 +107,8 @@ uv run reflake --repo /tmp/reflake-demo commit -m "initial"
 # Stage an S3 prefix as pointer entries, then commit the staged additions
 uv run reflake --repo /tmp/reflake-demo add --identity pointer --as imports/bootstrap s3://my-bucket/bootstrap
 uv run reflake --repo /tmp/reflake-demo commit --staged -m "metadata import"
-uv run reflake --repo /tmp/reflake-demo verify
-uv run reflake --repo /tmp/reflake-demo promote
+uv run reflake --repo /tmp/reflake-demo identity verify
+uv run reflake --repo /tmp/reflake-demo identity promote
 
 # branch-scoped staged flow
 uv run reflake --repo /tmp/reflake-demo branch feature
@@ -169,21 +170,23 @@ This is useful for large bootstrap imports where strong content verification can
 
 Pointer (`pointer`) revisions are **unverifiable**: the entry's
 identity is derived from path and size, not from content bytes. Until you run
-`reflake promote`, Reflake cannot prove that the content at `source_uri` matches
-what was originally imported.
+`reflake identity promote`, Reflake cannot prove that the content at
+`source_uri` matches what was originally imported.
 
 **Warnings.** The CLI emits a warning to stderr whenever you stage with
 `--identity pointer` or commit a repository whose identity is configured to `pointer`,
-and `verify` reports how many unverifiable entries remain (exiting non-zero).
+and `identity verify` reports how many unverifiable entries remain (exiting
+non-zero).
 
 **Source-retention policy.** Because pointer entries have no canonical
 blob, you **must** retain the source objects at their original `source_uri`
-until the entry has been promoted via `reflake promote`. If a source object is
+until the entry has been promoted via `reflake identity promote`. If a source
+object is
 deleted, overwritten, or moved before promotion, the corresponding
 entry becomes irrecoverable — no content can be read and no hash can be
 validated.
 
-**Promotion to verifiable.** Run `reflake promote` to read every pointer
+**Promotion to verifiable.** Run `reflake identity promote` to read every pointer
 entry's source blob, compute a content hash, store the canonical blob,
 and rewrite the entry in `content` mode. After promotion the source
 retention requirement is lifted for those entries.
@@ -195,20 +198,26 @@ retention requirement is lifted for those entries.
 | Pointer | `pointer` | `null` | ✅ (from `source_uri`) | ❌ | ✅ |
 | Verified | `content` | hash | ✅ (from `blobs/`) | ✅ | ❌ |
 
-## Verify And Promote Commands
+## Identity: Audit And Promotion
 
-`reflake verify` is a read-only audit: it reports how many pointer entries of the current branch would be promoted, and exits non-zero while any remain:
+Entry identity has two modes (`content` / `pointer`), so both commands that
+reason about it live under `reflake identity`.
+
+`reflake identity verify` is a read-only audit: it reports how many pointer
+entries of the current branch would be promoted, and exits non-zero while any
+remain:
 
 ```bash
-uv run reflake --repo /tmp/reflake-demo verify
-uv run reflake --repo /tmp/reflake-demo verify --path images --path logs/2026
+uv run reflake --repo /tmp/reflake-demo identity verify
+uv run reflake --repo /tmp/reflake-demo identity verify --path images --path logs/2026
 ```
 
-`reflake promote` materializes canonical blobs and writes a promotion commit (only when at least one entry is promoted):
+`reflake identity promote` materializes canonical blobs and writes a promotion
+commit (only when at least one entry is promoted):
 
 ```bash
-uv run reflake --repo /tmp/reflake-demo promote
-uv run reflake --repo /tmp/reflake-demo promote --path images --path logs/2026
+uv run reflake --repo /tmp/reflake-demo identity promote
+uv run reflake --repo /tmp/reflake-demo identity promote --path images --path logs/2026
 ```
 
 - Both audit all entries by default (or selected path prefixes with `--path`).
@@ -223,12 +232,12 @@ uv run reflake --repo /tmp/reflake-demo add --as imports/new-batch /tmp/random/n
 uv run reflake --repo /tmp/reflake-demo add --identity pointer --as imports/bootstrap.csv s3://my-bucket/bootstrap.csv
 uv run reflake --repo /tmp/reflake-demo add --identity pointer --as imports/bootstrap s3://my-bucket/bootstrap
 uv run reflake --repo /tmp/reflake-demo commit --staged -m "add one file"
-uv run reflake --repo /tmp/reflake-demo promote --path images --path root.txt
+uv run reflake --repo /tmp/reflake-demo identity promote --path images --path root.txt
 ```
 
 - `add` + `commit --staged` preserves the current branch manifest and reads bytes only for staged additions.
 - `add` accepts repo-relative files, arbitrary local files, local directories, single S3 objects, and S3 prefixes; `--as` maps a single file/object to one logical path or remaps a directory/prefix under a destination prefix.
-- `promote` reads bytes only for selected pointer entries that still need canonical blobs.
+- `identity promote` reads bytes only for selected pointer entries that still need canonical blobs.
 - Existing entries are preserved without re-uploading unchanged blob content.
 
 ## Merge Command
@@ -259,6 +268,33 @@ uv run reflake --repo /tmp/reflake-demo commit --staged -m "remove old logs and 
 - `mv` accepts a file path or prefix and rewrites matching logical paths.
 - `reflake status` shows staged removals and renames before `reflake commit --staged`.
 
+## Commits, Deletions, And Branch Switching
+
+A full `commit` treats the working tree as an **overlay** on the committed tree:
+files present on disk join the commit, and committed entries stay in the
+commit even if the file is missing locally. Deletion is never inferred from
+the filesystem — it is an explicit metadata operation:
+
+```bash
+uv run reflake --repo /tmp/reflake-demo rm old-prefix      # stage the removal
+uv run reflake --repo /tmp/reflake-demo commit --staged -m "drop old-prefix"
+```
+
+This is deliberate (an S3-first engine cannot know whether a missing local
+file means "deleted" or "never materialized"), which is why `reflake status`
+compares the working tree against the committed tree: you see exactly what a
+commit would add or change, and stage removals for everything else.
+
+Symlinks are neither followed nor stored: the worktree walk skips them (it
+never escapes the repository root). Store the target's bytes, or stage the
+external file explicitly with `add --as`.
+
+`reflake checkout <branch>` only **points the client at another branch**
+(`refs/HEAD`); it never rewrites the working tree. Materializing data is an
+explicit, separate step: `restore <ref>` (optionally `--path <dir>`), `pull`,
+`cat`, or the read-only VFS. Files are only ever downloaded because you asked
+for them.
+
 ## Sync (push/pull/fetch)
 
 ```bash
@@ -268,6 +304,7 @@ uv run reflake --repo . fetch s3://my-bucket/datasets/demo
 ```
 
 - Objects transfer plan-first: the exact missing set (commits, trees, footers, blobs) is computed, then executed via `boto3` per-object or batched through [`s5cmd`](https://github.com/peak/s5cmd) when configured (`config set transfer_backend s5cmd`).
+- Planning is adaptive: small plans probe object existence one by one; plans over ~64 objects list the destination's object ids once per kind instead of issuing N HEAD requests.
 - Divergent history is rejected before any bytes move (`NonFastForwardError`); the final ref update is a CAS, so concurrent pushes surface conflicts instead of overwriting.
 - Push after a local merge transfers the entire merged lineage, including both parents' commits.
 - S3-compatible endpoints (MinIO, Ministack, …) configured via `reflake init --backend s3 --s3-endpoint …` (or `config set s3.endpoint_url …`) are honored for repository operations; direct `s3://` remotes use the ambient AWS configuration chain.
@@ -293,6 +330,33 @@ With `config set parquet_footer true`, parquet ingests also capture compact foot
 ```bash
 uv run reflake --repo /tmp/reflake-demo query prune <ref> images/ --where "id >= 100 AND active = true"
 ```
+
+`query prune` reuses a footer cache inside the index directory: footers are
+content-addressed, so scanning the same revision twice reads nothing further.
+Stats survive `identity promote` — promoting an `mp` entry yields `bp`, never a
+statless plain blob.
+
+## Commit Cost Model
+
+Commits, splices, merges, diffs and prunes are proportional to what changed,
+not to the size of the tree:
+
+- Tree nodes are content-addressed and written with `IfNoneMatch`: unchanged
+  directories (and, inside sharded directories, unchanged shard bodies) are
+  detected by hash and never re-written. Committing one changed file in a
+  50-directory repository puts 2 tree objects; a full commit that changes
+  nothing puts none.
+- Directories above 10k entries are stored as name-range shards. A staged
+  add or removal rewrites only the shard whose range contains the touched
+  paths (binary search per name), and merges compare shard pointers pairwise,
+  reading shard bodies only where both sides changed the same range.
+- New or changed worktree files are hashed in parallel (up to 8 workers;
+  blake3 releases the GIL).
+- With `config set trust_mtime true`, a worktree file whose size *and*
+  `mtime_ns` match the committed entry is reused without hashing. Trade-off:
+  a same-size, same-mtime edit is not detected — off by default.
+- GC issues batched `DeleteObjects` calls (up to 1000 keys each) instead of
+  one request per object.
 
 ## `fsspec` URI Example
 
@@ -320,8 +384,8 @@ repo = open_repository("/tmp/reflake-demo")  # fails unless initialized
 repo = open_repository("s3://my-bucket/datasets/demo")  # remote (lazy)
 
 commit_id = repo.commit("snapshot")
-repo.verify()  # read-only audit of pointer entries
-repo.promote()  # materialize blobs + commit
+repo.verify()  # read-only audit of pointer entries (CLI: identity verify)
+repo.promote()  # materialize blobs + commit (CLI: identity promote)
 repo.merge("feature", "main")
 ```
 
@@ -332,7 +396,8 @@ Public, stable surface (everything else is internal and may change):
 - reads: `ReflakeFileSystem`, `ReflakeURI`
 - sync: `push`, `pull`, `fetch`
 - errors: `ReflakeError` and subclasses (`RefConflictError`,
-  `NonFastForwardError`, `UnknownRefError`, …)
+  `NonFastForwardError`, `UnknownRefError`, `BlobIntegrityError`,
+  `TransferEndpointError`, …)
 
 `core.services`, `core.objects`, `core.query` internals and the store
 protocols are not covered by stability guarantees. Read paths (`diff`,
@@ -360,23 +425,27 @@ guaranteed to stay in sync because both derive from that single mapping.
 
 There are no locks. Every shared mutation goes through compare-and-swap:
 
-- Local repos use version tokens (mtime+size) checked before writing.
+- Local repos serialise CAS through an OS file lock (`flock`/`msvcrt`) and write atomically (temp file + rename).
 - S3 repos use conditional `PutObject` (`IfMatch`/`IfNoneMatch`) so the check-and-write is atomic server-side.
 - `commit --staged` re-applies its overlay onto the new parent and retries on conflict; other mutations surface `RefConflictError` with both commit ids.
+- Opening a repository never mutates it: a branch with no ref yet is *unborn* (staging works, the first `commit` creates the ref).
 
 ## Mandatory Validation Coverage
 
 Current tests cover required invariants:
 
-- Metadata-only diff reads no blob payloads.
-- Manifest generation for 100k entries stays under RAM cap.
+- Metadata-only diff, remove, and move read no blob payloads; `identity verify` (dry run) writes no objects at all.
+- Sharded directories (>10k entries) survive full commits without duplicate or lost entries.
+- Build a 100k-entry tree under a RAM cap (benchmark, see below).
 - `reflake://my_data@main/test.csv` resolves and returns expected bytes.
-- Staged commits stay correct regardless of path sort order; merged lineages survive push/pull.
+- Staged commits stay correct regardless of path sort order; merged lineages survive push/pull; blob reads are hash-verified.
 
-Run test suite:
+Run the test suite:
 
 ```bash
-uv run pytest tests
+uv run pytest tests                      # fast suite (benchmarks excluded)
+uv run pytest tests -m benchmark         # wall-clock/memory benchmarks
+uv run pytest tests -m integration       # needs a real S3 endpoint (see below)
 ```
 
 ## S3 Integration Tests

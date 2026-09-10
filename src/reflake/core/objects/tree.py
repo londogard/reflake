@@ -24,8 +24,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from blake3 import blake3
-
 from ..entry_codec import (
     KIND_BLOB as KIND_BLOB,
 )
@@ -87,12 +85,3 @@ def parse_tree_object(payload: bytes) -> list[Entry]:
 def leaf_to_tree_entry(entry: Entry) -> Entry:
     """Convert a full-path leaf entry into a tree entry (name only)."""
     return replace(entry, path=entry.path.rsplit("/", 1)[-1])
-
-
-def name_from_payload(line: str | bytes) -> str:
-    """Extract the entry name without a full parse (for sort checks)."""
-    return Entry.path_from_payload(line)
-
-
-def tree_object_hash(payload: bytes) -> str:
-    return blake3(payload).hexdigest()

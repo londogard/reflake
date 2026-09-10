@@ -15,7 +15,7 @@ matches their role so accidental coupling shows up in the type checker.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import BinaryIO, Protocol
 
@@ -138,7 +138,16 @@ class StoreInventory(Protocol):
 
     def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]: ...
 
-    def delete_object(self, kind: RepositoryObjectKind, object_id: str) -> None: ...
+    def delete_objects(
+        self, kind: RepositoryObjectKind, object_ids: Iterable[str]
+    ) -> int:
+        """Delete many objects; returns the deleted count.
+
+        Adapters batch where the backend allows it (S3 ``DeleteObjects``
+        takes 1000 keys per request) so pruning 1M orphans is 1000 requests,
+        not 1M.
+        """
+        ...
 
 
 class HasLocalPath(Protocol):

@@ -73,10 +73,15 @@ Opening a repository is **side-effect free**: it never writes refs and never
 - Pointing at a typo'd prefix therefore fails loudly instead of silently creating an empty repo.
 
 `reflake identity verify` is a strictly read-only audit: it walks tree metadata
-and counts unverifiable (`pointer`) entries without writing any object. Only
+and counts unverifiable (`pointer`) entries without writing any object. With
+`--drift` it additionally compares each pointer entry's recorded source
+metadata (size/ETag/last-modified) against the source — one metadata request
+per entry, never a byte read — and exits non-zero on drift. Only
 `reflake identity promote` materializes blobs and commits. `reflake checkout`
 changes the client's branch pointer only — it never rewrites a working tree,
-by design (downloads are explicit: `restore`, `pull`, `cat`).
+by design (downloads are explicit: `restore`, `pull`, `cat`). `reflake reset
+<ref>` moves a branch pointer (undo/redo) with a CAS and writes a reflog entry;
+it never touches worktree files.
 
 ---
 
@@ -199,6 +204,13 @@ reflake --repo s3://my-bucket/my-prefix gc        # audit
 reflake --repo s3://my-bucket/my-prefix gc --prune # delete orphans
 ```
 
+**Prune is age-guarded.** A concurrent writer publishes immutable objects
+*before* it CASes its ref, so mark-and-sweep must not race that window:
+`--prune` never deletes objects younger than `gc_grace_seconds` (client
+config, default 24h; `--grace-seconds N` overrides). Objects with unknown
+ages are treated as young. The audit reports `skipped_young` so an operator
+can see what the window held back.
+
 - Run audit before every prune; prune only when no client is mid-push.
 - With bucket versioning, pruned objects remain recoverable as
   noncurrent versions until your lifecycle rule expires them.
@@ -263,7 +275,7 @@ corruption implies disk failure, not torn writes.
 
 **Resolution:**
 1. Restore from backup (see [Backups](#backups)).
-2. `reflake --repo <URI> verify` to confirm integrity.
+2. `reflake --repo <URI> identity verify` to confirm integrity.
 
 ---
 
@@ -271,9 +283,11 @@ corruption implies disk failure, not torn writes.
 
 | Task | Command |
 |------|---------|
-| Audit pointer entries | `reflake --repo <URI> verify` |
-| Promote pointers to blobs | `reflake --repo <URI> promote` |
-| Audit orphaned objects | `reflake --repo <URI> gc` (`--prune` deletes) |
+| Audit pointer entries | `reflake --repo <URI> identity verify` |
+| Audit source drift (metadata-only) | `reflake --repo <URI> identity verify --drift` |
+| Promote pointers to blobs | `reflake --repo <URI> identity promote` |
+| Undo/redo a branch pointer | `reflake --repo <URI> reset <ref>` |
+| Audit orphaned objects | `reflake --repo <URI> gc` (`--prune` deletes, age-guarded) |
 | List branches with heads | `reflake --repo <URI> branches` |
 | Branch history | `reflake --repo <URI> reflog` |
 | Row-group pruning check | `reflake --repo <URI> query prune <ref> <path> --where "..."` |

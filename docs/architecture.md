@@ -32,6 +32,16 @@ unified in `core/entry_codec.py` as a single `Entry` record (replacing the forme
 `identity_value`/`blob_hash`/`identity_mode` derive from `kind` instead of being
 stored redundantly; the module-level repository facade functions are gone — the
 Python API is `open_repository()`/`init_repository()` + `ReflakeRepository` methods.
+**Rev. 5 (2026-09, post 0.2.1 hardening):** tree nodes are structurally validated before
+publication (I11 — the second shard-class corruption bug is now impossible to commit);
+`reset` gives branch-pointer undo/redo through the same CAS; worktree walks honor
+`.reflakeignore` plus built-in `.reflake/`/`.git/`; `gc --prune` is guarded by a grace
+window (`gc_grace_seconds`, default 24h) so mark-and-sweep cannot race a writer that has
+published objects but not yet CAS'd its ref; blobs stream (multipart upload above 64 MiB,
+streamed verified downloads/restores); pointer entries carry an optional source ETag so
+`identity verify --drift` is metadata-only; refs are allowed hierarchical names
+(`feature/x`) with encoded client-state filenames; and the package root exports only the
+documented stable surface.
 **P0 shipped:** tree objects (`core/objects/tree.py`), tree-walk lookups with a client-side
 prefix cache (`core/objects/query.py`), `TreeWriter` (`core/services/tree.py`), `commit → tree`
 with `{tree, parents}`, staged-overlay commits with CAS retry, derived manifests
@@ -194,7 +204,9 @@ manifest lines, relabeled):
 ["b", name, hash, size, mtime_ns]              # blob-backed file
 ["m", name, hash, size, mtime_ns, source_uri]  # source pointer (unverifiable)
 ["bp", name, hash, size, mtime_ns, footer]     # parquet, blob-backed, + footer stats
-["mp", name, hash, size, mtime_ns, source_uri, footer]  # parquet, source pointer, + footer stats
+["mp", name, hash, size, mtime_ns, source_uri, footer, source_etag?]
+# `m`/`mp` may carry one optional trailing field: the source object's
+# ETag/version marker, which makes `identity verify --drift` metadata-only.
 ```
 
 Entry validation on read stays — the v1 entry validation contract survives as

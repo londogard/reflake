@@ -54,14 +54,20 @@ Reflake separates data into three layers:
 | Area | Commands |
 |---|---|
 | Ingest | `init`, `add`, `commit [--staged]` |
-| Identity | `identity verify` (read-only audit), `identity promote` (materialize) |
+| Identity | `identity verify [--drift] [--ref]` (read-only audit), `identity promote [--ref]` (materialize) |
 | Inspect | `status`, `log`, `diff`, `list` (`ls`), `cat`, `branches`, `reflog` |
-| Branch | `branch`, `checkout`, `merge` (fast-forward + 3-way metadata merge) |
-| Mutate | `rm`, `mv`, `gc [--prune]`, `restore` |
+| Branch | `branch [-d]`, `checkout`, `merge` (fast-forward + 3-way metadata merge), `reset` (undo/redo) |
+| Mutate | `rm`, `mv`, `gc [--prune] [--grace-seconds N]`, `restore` |
 | Sync | `push`, `pull`, `fetch`, `transfer` |
 | Analyze | `query build` (DuckDB/Parquet), `query prune` (row-group pruning) |
 
-Exit codes: `0` ok · `1` usage/validation (including `identity verify` with remaining pointer entries) · `2` conflict, retryable (CAS race, non-fast-forward, merge conflict) · `3` missing ref/object.
+Worktree walks honor `.reflakeignore` (plus built-in `.reflake/` and `.git/`)
+unless a path is named explicitly.
+
+Exit codes: `0` ok · `1` usage/validation (unknown/missing **source** inputs,
+`identity verify` with remaining pointer entries or detected drift) · `2`
+conflict, retryable (CAS race, non-fast-forward, merge conflict) · `3` missing
+repository ref/object. Every command with structured output honors `--json`.
 
 ## Guardrails (Strict)
 
@@ -198,6 +204,24 @@ retention requirement is lifted for those entries.
 | Pointer | `pointer` | `null` | ✅ (from `source_uri`) | ❌ | ✅ |
 | Verified | `content` | hash | ✅ (from `blobs/`) | ✅ | ❌ |
 
+### Drift detection (metadata-only)
+
+Pointer entries imported from S3 record the source object's size,
+last-modified time, and ETag (the optional trailing field on `m`/`mp` tree
+lines). `reflake identity verify --drift` then compares those recorded values
+against the source with **one metadata request per entry — never a byte
+read**, and exits non-zero when a source was overwritten, resized, or
+deleted:
+
+```bash
+uv run reflake --repo s3://my-bucket/datasets/demo identity verify --drift
+```
+
+Drift detection is a best-effort metadata comparison (local-file sources have
+no ETag, so size + mtime are used there); it proves *change*, not content
+equality. `identity promote` remains the only way to make a pointer entry
+verifiable.
+
 ## Identity: Audit And Promotion
 
 Entry identity has two modes (`content` / `pointer`), so both commands that
@@ -210,6 +234,7 @@ remain:
 ```bash
 uv run reflake --repo /tmp/reflake-demo identity verify
 uv run reflake --repo /tmp/reflake-demo identity verify --path images --path logs/2026
+uv run reflake --repo /tmp/reflake-demo identity verify --ref feature --drift
 ```
 
 `reflake identity promote` materializes canonical blobs and writes a promotion
@@ -220,7 +245,8 @@ uv run reflake --repo /tmp/reflake-demo identity promote
 uv run reflake --repo /tmp/reflake-demo identity promote --path images --path logs/2026
 ```
 
-- Both audit all entries by default (or selected path prefixes with `--path`).
+- Both commands accept `--ref <branch>` (default: current branch) and audit all
+  entries by default (or selected path prefixes with `--path`).
 - Promotion reads bytes from each entry's `source_uri`, computes the content hash, and stores canonical blob content.
 
 ## Incremental Ingress
@@ -289,11 +315,61 @@ Symlinks are neither followed nor stored: the worktree walk skips them (it
 never escapes the repository root). Store the target's bytes, or stage the
 external file explicitly with `add --as`.
 
-`reflake checkout <branch>` only **points the client at another branch**
-(`refs/HEAD`); it never rewrites the working tree. Materializing data is an
-explicit, separate step: `restore <ref>` (optionally `--path <dir>`), `pull`,
-`cat`, or the read-only VFS. Files are only ever downloaded because you asked
-for them.
+`reflake checkout <branch>` only **points the client at another branch** (a
+client-local symbolic ref); it never rewrites the working tree. Materializing
+data is an explicit, separate step: `restore <ref>` (optionally `--path <dir>`),
+`pull`, `cat`, or the read-only VFS. Files are only ever downloaded because you
+asked for them.
+
+### Staging semantics: a recipe, not a snapshot
+
+`add` records a *recipe* (logical path + source), not frozen bytes: content is
+read when you commit. If a staged source changes in between, the commit
+contains the bytes **at commit time** — the CLI warns loudly (`Staged
+source(s) changed since \`add\``) rather than committing silently.
+
+### Branch names, and deleting branches
+
+Branch names may be hierarchical (`feature/nightly-ingest`). `reflake branch
+draft -d` deletes a branch by CAS-ing its ref to *unborn* — a concurrent
+advance surfaces as a conflict instead of losing an update, and the name can
+be re-created with `reflake branch draft`.
+
+## Ignore Rules
+
+Worktree walks (`commit`, `status`, `add <dir>`) skip:
+
+- `.reflake/` and `.git/` (built-in, so a dataset repository never swallows
+  git's metadata);
+- anything matched by `.reflakeignore` in the tree root (the file itself is
+  tracked);
+- a path named explicitly on the command line is always staged — explicit
+  wins.
+
+`.reflakeignore` syntax: one glob per line, `#` comments, `!` to re-include,
+trailing `/` for directories, `*`/`?` don't cross `/`, `**` does, and a
+pattern containing `/` is anchored to the tree root.
+
+```gitignore
+scratch/
+*.tmp
+**/*.parquet.bak
+!important.tmp
+```
+
+## Undo: `reset`
+
+`reset` moves a branch pointer to any existing commit or ref (backwards or
+forwards) with a CAS, without touching the worktree:
+
+```bash
+uv run reflake --repo /tmp/reflake-demo log            # find the commit you want
+uv run reflake --repo /tmp/reflake-demo reset <commit>
+uv run reflake --repo /tmp/reflake-demo reset main     # also accepts refs
+```
+
+Staged changes are kept (a warning reminds you that `commit --staged` will now
+apply them onto the new parent). Every move is recorded in `reflake reflog`.
 
 ## Sync (push/pull/fetch)
 
@@ -307,7 +383,8 @@ uv run reflake --repo . fetch s3://my-bucket/datasets/demo
 - Planning is adaptive: small plans probe object existence one by one; plans over ~64 objects list the destination's object ids once per kind instead of issuing N HEAD requests.
 - Divergent history is rejected before any bytes move (`NonFastForwardError`); the final ref update is a CAS, so concurrent pushes surface conflicts instead of overwriting.
 - Push after a local merge transfers the entire merged lineage, including both parents' commits.
-- S3-compatible endpoints (MinIO, Ministack, …) configured via `reflake init --backend s3 --s3-endpoint …` (or `config set s3.endpoint_url …`) are honored for repository operations; direct `s3://` remotes use the ambient AWS configuration chain.
+- Large blobs stream: uploads above 64 MiB use multipart (never a single 5 GiB-capped PUT, never a whole file in memory), downloads stream to disk, and `restore` verifies hashes while streaming into a temp file before renaming it into place.
+- S3-compatible endpoints (MinIO, Ministack, …) configured via `reflake init --backend s3 --s3-endpoint …` (or `config set s3.endpoint_url …`) are honored for repository operations **and** for `add s3://…` source access on S3-backed repositories.
 
 ## Analytical Index (Derived, Disposable)
 
@@ -412,14 +489,25 @@ Reflake creates `.reflake/` under each dataset root:
 - `trees/` - Merkle tree nodes (sorted JSONL, content-addressed)
 - `footers/` - parquet footer-stats objects (when enabled)
 - `commits/` - commit metadata objects
-- `refs/heads/` - branch pointers only (CAS-updated)
-- `refs/HEAD` - symbolic active branch reference (default `main`)
+- `refs/heads/` - branch pointers only (CAS-updated, `feature/x` allowed)
+- `refs/HEAD` - **client-local** symbolic active branch reference (never shared)
 - `state/` - client-local branch snapshots (never shared, never a ref)
 - `staging/`, `cache/`, `index/`, `reflog/` - client-local state
 
 Every object kind has exactly one physical location, defined by
 `layout.object_relative_key()` — the local filesystem and the S3 key space are
 guaranteed to stay in sync because both derive from that single mapping.
+Client-state filenames encode branch names (`feature/x` → `feature%2Fx`), so
+hierarchical branches can never collide with each other on disk.
+
+## Garbage Collection Safety
+
+`reflake gc` is audit-only by default. `--prune` never deletes objects younger
+than a grace window (`gc_grace_seconds`, default 24h; override with
+`--grace-seconds N`), because a concurrent writer publishes immutable objects
+*before* it CASes its ref: without the window, mark-and-sweep would race that
+window and delete live data. Unknown object ages are treated as young. Run
+`gc` (audit) before pruning in a shared repository, as always.
 
 ## Concurrency Model
 

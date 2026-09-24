@@ -1,274 +1,80 @@
 # Reflake Roadmap
 
-## Product Direction
-
-Reflake should remain client-driven while supporting a shared repository stored in object storage.
-
-Target operating modes:
-
-- Local repository backend for development, testing, and small datasets.
-- S3 repository backend for shared collaborative datasets.
-
-The CLI and repository model should stay unified across both modes. The user should interact with one repository concept, with the backend selected by repository URI or path.
-
-Recommended long-term shape:
-
-- Shared remote repository state in S3.
-- Local client state for staging, current branch preference, caches, and temp files.
-- Metadata-first operations for branching, diffing, merging, removing, and renaming.
-- Content reads only when a command truly needs object bytes.
-
-## Decisions
-
-### Keep Both Local And S3
-
-Keep both backends.
-
-- Local remains useful for tests, development, offline workflows, and small datasets.
-- S3 becomes the primary collaboration backend.
-- The user-facing abstraction should be one repository concept, not two separate products.
-
-### Keep Both Identity Modes
-
-Keep both `content` and `pointer`.
-
-- `content` stays the default and durable canonical mode.
-- `pointer` stays the cheap bootstrap/import mode.
-- `promote` remains the promotion path from pointer entries to canonical blob-backed entries (`verify` is the read-only audit).
-
-To reduce complexity, `pointer` should primarily be used for import/bootstrap flows rather than expanded into every workflow.
-
-## Architectural Goal
-
-Move Reflake from a local-working-tree-first design to a manifest-first repository design.
-
-For large datasets, operations such as these must not require downloading or rewriting the full dataset:
-
-- add 3 files
-- remove 5 files
-- rename `image.jpg` to `image.jpeg`
-- merge a fast-forward branch
-- bulk path rewrites
-
-These should become metadata transformations over manifests and refs, plus selective uploads only for genuinely new content.
-
-## Phase 1: Repository Store Abstraction
-
-Goal: separate shared repository data from local client state.
-
-Introduce a repository store abstraction that owns:
-
-- blobs
-- manifests
-- commits
-- refs
-
-Operations needed:
-
-- read commit object
-- write commit object
-- stream manifest reads
-- stream manifest writes
-- read branch ref
-- compare-and-set branch ref
-- read blob bytes
-- write blob if missing
-- check object existence
-- compare-and-set branch refs on the commit id (local lock, S3 conditional write)
-
-Deliverables:
-
-- `LocalRepositoryStore`
-- `S3RepositoryStore`
-- refactor repository code to stop reading and writing repository state directly with `Path`
-
-Acceptance criteria:
-
-- Existing local tests still pass.
-- Repository mutations no longer depend on direct local `.reflake` path writes.
-
-## Phase 2: Local Client State
-
-Goal: keep user-specific mutable state local even when the repo is remote.
-
-Keep these local only:
-
-- active branch preference
-- staging state
-- temp files
-- caches
-
-Important decision:
-
-- Do not keep shared remote `HEAD`.
-- Shared truth is branch refs under `refs/heads/*`.
-- Current branch selection is a client preference.
-
-Deliverables:
-
-- local client-state abstraction
-- branch preference handling decoupled from shared repo refs
-- local staging store independent of repository backend
-
-Acceptance criteria:
-
-- Multiple users can share the same S3-backed repo without clobbering each other's active branch preference.
-
-## Phase 3: Safe Ref Updates On S3
-
-Goal: make commits and merges safe for concurrent clients.
-
-Implement optimistic concurrency for branch refs:
-
-- read the current commit id
-- update the ref only if it still matches the expected commit id
-- fail clearly on write conflicts
-
-Deliverables:
-
-- compare-and-set branch updates in the repository store
-- conflict errors surfaced clearly from commit and merge flows
-
-Concurrency is CAS-only with no lock objects: a client that dies mid-update
-leaves no state behind, so no stale-lock recovery exists (or is needed).
-
-Acceptance criteria:
-
-- Concurrent updates do not silently overwrite each other.
-- Fast-forward merge remains safe under concurrent clients.
-
-## Phase 4: Repo URI Support
-
-Goal: unify local and remote repositories behind one CLI and Python API.
-
-Introduce a repository argument that can be either:
-
-- local path
-- `s3://bucket/prefix`
-
-Examples:
-
-```bash
-uv run reflake --repo /tmp/demo commit -m "local commit"
-uv run reflake --repo s3://my-bucket/datasets/demo branch feature
-```
-
-Deliverables:
-
-- repository URI parsing
-- backend selection based on repo location
-- migration of existing commands to repository-aware `--repo` semantics
-
-Acceptance criteria:
-
-- Same command set works for both local and S3-backed repositories.
-
-## Phase 5: Remote-Native Metadata Operations
-
-Goal: support metadata changes without local checkout.
-
-Prioritized commands:
-
-- `branch`
-- `diff`
-- `merge`
-- `rm`
-- `mv` or rename
-
-These operations should:
-
-- load manifest metadata only
-- transform logical paths or membership
-- write a new manifest and commit
-- update the target branch ref
-
-They should not:
-
-- download unchanged blobs
-- reupload unchanged blobs
-- depend on a full local working tree
-
-Acceptance criteria:
-
-- Removing and renaming paths in a large S3-backed repo can complete without reading full object payloads.
-
-## Phase 6: Content Ingress Paths
-
-Goal: support adding new content efficiently without forcing full dataset materialization.
-
-Supported ingress modes:
-
-- local file add
-- S3 import
-- promote selected pointer entries into canonical blobs
-
-Rules:
-
-- only read bytes for newly added or verified objects
-- preserve existing manifest entries without rewriting blob content
-
-Acceptance criteria:
-
-- adding a small number of files to a large repo only uploads those new files and metadata
-
-## Phase 7: S3-Native Integration Tests
-
-Goal: validate shared-object-store behavior against a real S3-compatible service.
-
-Preferred test target:
-
-- Ministack
-
-Coverage:
-
-- branch creation
-- commit updates
-- fast-forward merge
-- metadata import
-- selective promote
-- metadata-only remove and rename
-- optimistic concurrency conflicts
-
-Testing strategy:
-
-- keep current fake-client tests as fast unit coverage
-- add integration-marked tests for real object storage behavior using Ministack
-
-Acceptance criteria:
-
-- Core repo flows succeed against a real S3-compatible API, not just mocked boto calls.
-
-## Phase 8: Optional Path Ergonomics
-
-Goal: improve URI and path handling without weakening backend correctness.
-
-`cloudpathlib.AnyPath` may be used as a convenience layer for path or URI ergonomics, but it should not replace the repository store abstraction.
-
-Reason:
-
-- Reflake still needs explicit backend semantics for optimistic locking, conditional writes, and streaming control.
-
-Recommendation:
-
-- keep `StorageBackend` or `RepositoryStore` as the core contract
-- optionally use `AnyPath` at the edges for parsing and convenience
-
-## Initial Execution Order
-
-Recommended implementation order:
-
-1. Repository store abstraction
-2. Local client state split
-3. Safe S3 ref updates
-4. Repo URI support
-5. Remote-native `rm`
-6. Remote-native `mv`
-7. Ministack integration tests
-
-## Explicit Non-Goals For Now
-
-- write-capable `fsspec` interface
-- non-fast-forward merge support
-- server or daemon architecture
-- central database
-- remote sync commands as a substitute for repository-native S3 support
+**Status (2026-09).** The v2 Merkle-tree model is the design of record and is
+shipped: tree objects with shard locality and the write-skip cost model,
+virtual-first CLI + VFS + DuckDB query, parquet footer capture and pruning,
+CAS-only refs (local lock / S3 conditional writes), plan-then-batch sync,
+identity audit/promote with metadata-only drift checks, tree-level 3-way
+merge, reflog/branches, `reset`, ignore rules, GC grace window, multipart
+streaming, and write-time tree validation.
+
+See [`docs/architecture.md`](docs/architecture.md) for the model and
+[`docs/vision.md`](docs/vision.md) for the vision and the full generation
+spec. The v1 plan below the fold (repository-store abstraction,
+manifest-first design) was completed and then **superseded** by the tree
+model — the CHANGELOG has the history.
+
+## Direction
+
+Reflake stays client-driven with a shared object-storage repository:
+
+- One repository concept; local path or `s3://bucket/prefix`.
+- Metadata-first operations (branch/diff/merge/rm/mv/prune) that never read
+  blob payloads.
+- Content reads only when a command asks for bytes; the working tree is an
+  optional cache, not the source of truth.
+- CAS-only concurrency; per-client branch preference, staging, and caches.
+
+## Now (v0.3 candidates)
+
+1. **Docs split** — architecture (current model), roadmap (this file), ADRs
+   for past decisions; README stays user-facing.
+2. **Pruned scans that execute** — read only the row groups `query prune`
+   keeps (Arrow table / DuckDB integration), so footer statistics produce
+   bytes saved, not just a report.
+3. **Tags/releases** — immutable named refs (`refs/tags/*`) so "dataset
+   v1.2" can be pinned; the ref model already supports them.
+4. **Provenance** — record the committing client/actor (and optional tags) in
+   commit metadata, so a shared repository answers "who committed this?".
+5. **`export`** — first-class snapshot export (tree + blobs → directory or
+   tar) instead of VFS loops, for handoff to non-Reflake consumers.
+6. **Reproducible scale harness** — commit the 1M-file/S3 benchmark scripts
+   and publish numbers alongside the cost model.
+
+## Later
+
+- Shared repository config/description (schema notes, owners, landing paths)
+  designed so ingest-shaping flags can travel with the repository instead of
+  each client.
+- A remote-native snapshot command for S3 prefixes (CLI surface over the
+  library's `import_s3`).
+- Optional content-defined chunking for large files/delta space (needs a
+  design pass; blob storage is deliberately simple today).
+- Point-in-time / row-group-aware reads over `mp` entries (remote stats).
+
+## Non-Goals
+
+- Server, daemon, coordination service, or central database.
+- History rewriting (rebase/amend/cherry-pick); `reset` is the undo primitive.
+- Write-capable fsspec; the VFS is read-only by design.
+- ML-throughput blob reorg (tarballs/sharded blob layers).
+- Backwards compatibility for on-disk formats before 1.0.
+
+
+## Closed v1 phases (history)
+
+These were completed before the tree model replaced them; kept here so old
+references resolve:
+
+- repository-store / storage-backend split (now one `objects/` package with
+  capability-split protocols),
+- local client state (`state/`, `staging/`, `reflog/`, caches),
+- CAS-only ref updates with `RefConflictError`,
+- unified `--repo` CLI + Python API,
+- metadata-only `rm` / `mv` / `diff` / `merge`,
+- content ingress (`add`, `import_s3`, `identity promote`),
+- Ministack integration tests,
+- path/URI ergonomics (no `cloudpathlib` dependency; URI parsing is internal
+  and type-checked).
+
+Still-open backlog items live under "Now" and "Later" above, not as phases.

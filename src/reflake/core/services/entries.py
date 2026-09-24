@@ -14,7 +14,7 @@ from tempfile import NamedTemporaryFile
 
 from blake3 import blake3
 
-from ..domain import StageChange
+from ..domain import SourceNotFoundError, StageChange
 from ..entry_codec import Entry
 from ..hashing import DEFAULT_CHUNK_SIZE, blake3_digest_file
 from ..objects import (
@@ -23,6 +23,7 @@ from ..objects import (
     iter_s3_objects,
     open_source_uri,
     parse_s3_uri,
+    source_client,
 )
 from ..repository_support import (
     matches_import_patterns,
@@ -51,7 +52,9 @@ class EntryFactory:
         from ..objects.footer import capture_footer_stats
 
         try:
-            with open_source_uri(source_uri) as handle:
+            with open_source_uri(
+                source_uri, client=source_client(self.store)
+            ) as handle:
                 return capture_footer_stats(self.store, handle)
         except (OSError, ValueError):
             return None
@@ -66,7 +69,9 @@ class EntryFactory:
         _, prefix = parse_s3_uri(source_uri)
         normalized_prefix = prefix.strip("/")
         normalized_patterns = normalize_import_patterns(path_patterns)
-        for obj in iter_s3_objects(source_uri):
+        for obj in iter_s3_objects(
+            source_uri, client=source_client(self.store)
+        ):
             relative_path = normalize_s3_import_path(
                 key=obj.key,
                 prefix=normalized_prefix,
@@ -89,6 +94,7 @@ class EntryFactory:
                 obj.mtime_ns,
                 identity_mode,
                 source_uri=obj.source_uri,
+                source_etag=obj.etag,
             )
 
     def entry_from_working_path(
@@ -100,7 +106,7 @@ class EntryFactory:
     ) -> Entry:
         source_path = self.root / relative_path
         if not source_path.exists() or not source_path.is_file():
-            raise FileNotFoundError(f"Cannot stage missing file: {relative_path}")
+            raise SourceNotFoundError(f"Cannot stage missing file: {relative_path}")
         stat = source_path.stat()
         source_uri = source_path.as_uri()
         footer = self._capture_footer(source_uri)
@@ -151,7 +157,7 @@ class EntryFactory:
                 0,
                 "content",
             )
-        raise FileNotFoundError(f"Cannot stage missing file: {change.path}")
+        raise SourceNotFoundError(f"Cannot stage missing file: {change.path}")
 
     def entry_from_source_uri(
         self,
@@ -161,7 +167,9 @@ class EntryFactory:
         identity_mode: str,
         store_blob: bool,
     ) -> Entry:
-        metadata = describe_source_uri(source_uri)
+        metadata = describe_source_uri(
+            source_uri, client=source_client(self.store)
+        )
         footer = self._capture_footer(source_uri)
         if identity_mode == "content":
             identity_value = self.store_blob_from_source_uri(source_uri)
@@ -177,6 +185,7 @@ class EntryFactory:
             identity_mode,
             source_uri=metadata.source_uri if identity_mode == "pointer" else None,
             footer=footer,
+            source_etag=metadata.etag if identity_mode == "pointer" else None,
         )
 
     def store_blob(self, source_file: Path, content_hash: str) -> None:
@@ -188,7 +197,9 @@ class EntryFactory:
             with NamedTemporaryFile(mode="wb", delete=False) as temp:
                 temp_path = Path(temp.name)
                 hasher = blake3()
-                with open_source_uri(source_uri) as source:
+                with open_source_uri(
+                    source_uri, client=source_client(self.store)
+                ) as source:
                     while True:
                         chunk = source.read(DEFAULT_CHUNK_SIZE)
                         if not chunk:

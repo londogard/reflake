@@ -118,6 +118,12 @@ class StatusArgs:
 @dataclass
 class BranchArgs:
     name: str = field(positional=True, help="Branch name")
+    delete: bool = flag(  # type: ignore[no-matching-overload]
+        False,
+        alias=["-d", "--delete"],
+        action="store_true",
+        help="Delete the branch (CAS to unborn; re-create it with `branch`)",
+    )
 
 
 @dataclass
@@ -196,6 +202,19 @@ class RestoreArgs:
         False,
         alias="--force",
         help="Allow overwriting existing files",
+    )
+
+
+@dataclass
+class ResetArgs:
+    ref: str = field(
+        positional=True,
+        help="Commit or ref to point the branch at",
+    )
+    branch: str | None = field(
+        default=None,
+        alias="--branch",
+        help="Branch to move (default: current branch)",
     )
 
 
@@ -355,16 +374,34 @@ class MergeArgs:
 
 @dataclass
 class IdentityVerifyArgs:
+    ref: str | None = field(
+        default=None,
+        alias="--ref",
+        help="Ref (branch or commit) to audit (default: current branch)",
+    )
     path: list[str] = field(
         default_factory=list,
         alias="--path",
         action="append",
         help="Optional path/prefix filter (repeatable)",
     )
+    drift: bool = flag(
+        False,
+        alias="--drift",
+        help=(
+            "Also report pointer entries whose source metadata changed "
+            "(metadata-only: one HEAD per entry, no source byte reads)"
+        ),
+    )
 
 
 @dataclass
 class IdentityPromoteArgs:
+    ref: str | None = field(
+        default=None,
+        alias="--ref",
+        help="Branch to promote (default: current branch)",
+    )
     path: list[str] = field(
         default_factory=list,
         alias="--path",
@@ -391,6 +428,14 @@ class GcArgs:
         False,
         alias="--prune",
         help="Delete orphaned objects (default: audit-only dry run)",
+    )
+    grace_seconds: int | None = field(
+        default=None,
+        alias="--grace-seconds",
+        help=(
+            "Never prune objects younger than this many seconds "
+            "(default: config gc_grace_seconds, 86400)"
+        ),
     )
 
 
@@ -448,6 +493,7 @@ class ReflakeCLI:
         | BranchesArgs
         | CheckoutArgs
         | RestoreArgs
+        | ResetArgs
         | InitArgs
         | ConfigArgs
         | PushArgs
@@ -475,6 +521,7 @@ class ReflakeCLI:
             "branches": BranchesArgs,
             "checkout": CheckoutArgs,
             "restore": RestoreArgs,
+            "reset": ResetArgs,
             "init": InitArgs,
             "config": ConfigArgs,
             "push": PushArgs,
@@ -576,6 +623,34 @@ def _stage_payload(stage: StageStatus) -> dict[str, object]:
     }
 
 
+def _staged_source_drift(staged: dict[str, Any]) -> list[str]:
+    """Staged adds whose local source changed since `add` (recipe drift).
+
+    Staging stores a recipe, not a frozen snapshot: commit reads the content
+    at commit time.  Surface that loudly instead of committing different
+    bytes than the user saw when staging.
+    """
+    from pathlib import Path
+    from urllib.parse import unquote, urlparse
+
+    drifted: list[str] = []
+    for change in staged.values():
+        if change.action != "add":
+            continue
+        source_uri = change.source_uri
+        if not source_uri or not source_uri.startswith("file:"):
+            continue
+        if change.size is None or change.mtime_ns is None:
+            continue
+        try:
+            stat = Path(unquote(urlparse(source_uri).path)).stat()
+        except OSError:
+            continue  # missing sources fail loudly at commit time
+        if stat.st_size != change.size or stat.st_mtime_ns != change.mtime_ns:
+            drifted.append(change.path)
+    return sorted(drifted)
+
+
 def _flatten_option_values(values: list[Any]) -> list[str]:
     flattened: list[str] = []
     for value in values:
@@ -630,6 +705,16 @@ def _config_set_value(config: ReflakeConfig, key: str, value: str) -> ReflakeCon
             config.trust_mtime = False
         else:
             raise ValueError(f"trust_mtime must be a boolean, got: {value}")
+    elif key == "gc_grace_seconds":
+        try:
+            parsed = int(value)
+        except ValueError as error:
+            raise ValueError(
+                f"gc_grace_seconds must be an integer, got: {value}"
+            ) from error
+        if parsed < 0:
+            raise ValueError("gc_grace_seconds cannot be negative")
+        config.gc_grace_seconds = parsed
     elif key == "s3.bucket":
         if isinstance(config, LocalConfig):
             return S3Config(
@@ -686,6 +771,8 @@ def _command_name(command: object) -> str:
         return "checkout"
     if isinstance(command, RestoreArgs):
         return "restore"
+    if isinstance(command, ResetArgs):
+        return "reset"
     if isinstance(command, InitArgs):
         return "init"
     if isinstance(command, QueryArgs):
@@ -739,12 +826,20 @@ def run_cli(argv: list[str] | None = None) -> int:
     try:
         if isinstance(command, CommitArgs):
             repo = open_repository(repo_root)
-            staged_pointer_entries = False
-            if command.staged_only:
-                staged = repo.staging.load(repo.current_branch())
-                staged_pointer_entries = any(
-                    change.identity_mode == "pointer" for change in staged.values()
+            staged = repo.staging.load(repo.current_branch())
+            drifted = _staged_source_drift(staged)
+            if drifted:
+                shown = "\n".join(f"  changed: {path}" for path in drifted[:10])
+                extra = f"\n  … ({len(drifted)} total)" if len(drifted) > 10 else ""
+                print(
+                    "⚠  Staged source(s) changed since `add`; committing "
+                    "current content:"
+                    f"\n{shown}{extra}",
+                    file=sys.stderr,
                 )
+            staged_pointer_entries = any(
+                change.identity_mode == "pointer" for change in staged.values()
+            )
             commit_id = repo.commit(
                 command.message,
                 staged_only=command.staged_only,
@@ -760,7 +855,7 @@ def run_cli(argv: list[str] | None = None) -> int:
             if pointer_commit:
                 print(
                     "⚠  Metadata-only identity: this revision is unverifiable "
-                    "until `reflake promote` is run. "
+                    "until `reflake identity promote` is run. "
                     "You must retain source objects for future verification.",
                     file=sys.stderr,
                 )
@@ -779,7 +874,7 @@ def run_cli(argv: list[str] | None = None) -> int:
             if command.identity == "pointer":
                 print(
                     "⚠  Metadata-only identity: revisions are unverifiable "
-                    "until `reflake promote` is run. "
+                    "until `reflake identity promote` is run. "
                     "You must retain source objects for future verification.",
                     file=sys.stderr,
                 )
@@ -815,8 +910,29 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, BranchArgs):
-            open_repository(repo_root).branch(command.name)
-            print(f"Created branch '{command.name}'")
+            repo = open_repository(repo_root)
+            if command.delete:
+                name = repo.delete_branch(command.name)
+                if as_json:
+                    print(json.dumps({"deleted": name}, indent=2))
+                else:
+                    print(f"Deleted branch '{name}'")
+                return 0
+            repo.branch(command.name)
+            if as_json:
+                print(
+                    json.dumps(
+                        {
+                            "branch": command.name,
+                            "commit_id": repo.refs.branch_head_commit(
+                                command.name
+                            ),
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Created branch '{command.name}'")
             return 0
 
         if isinstance(command, DiffArgs):
@@ -876,7 +992,9 @@ def run_cli(argv: list[str] | None = None) -> int:
             identity_command = command.command
             if isinstance(identity_command, IdentityVerifyArgs):
                 result = open_repository(repo_root).verify(
+                    ref=identity_command.ref,
                     path_prefixes=_flatten_option_values(identity_command.path),
+                    drift_check=identity_command.drift,
                 )
                 remaining = result.candidate_entries - result.verified_entries
                 if as_json:
@@ -888,6 +1006,7 @@ def run_cli(argv: list[str] | None = None) -> int:
                                 "candidate_entries": result.candidate_entries,
                                 "total_entries": result.total_entries,
                                 "unverifiable_entries": remaining,
+                                "drifted_paths": result.drifted_paths,
                             },
                             indent=2,
                         )
@@ -898,6 +1017,21 @@ def run_cli(argv: list[str] | None = None) -> int:
                         f"{result.candidate_entries} entries "
                         f"(total: {result.total_entries})"
                     )
+                    if result.drifted_paths:
+                        drift_lines = "\n".join(
+                            f"  drifted: {path}" for path in result.drifted_paths[:20]
+                        )
+                        extra = (
+                            f"\n  … ({len(result.drifted_paths)} total)"
+                            if len(result.drifted_paths) > 20
+                            else ""
+                        )
+                        print(
+                            f"⚠  {len(result.drifted_paths)} pointer entry(ies) "
+                            "no longer match their source metadata:"
+                            f"\n{drift_lines}{extra}",
+                            file=sys.stderr,
+                        )
                     if remaining > 0:
                         print(
                             f"⚠  {remaining} unverifiable entries remain "
@@ -906,10 +1040,12 @@ def run_cli(argv: list[str] | None = None) -> int:
                             f"them).",
                             file=sys.stderr,
                         )
-                # Read-only audit: non-zero while pointer entries remain.
-                return 1 if remaining > 0 else 0
+                # Read-only audit: non-zero while pointer entries remain
+                # or source drift was detected.
+                return 1 if remaining > 0 or result.drifted_paths else 0
 
             result = open_repository(repo_root).promote(
+                ref=identity_command.ref,
                 path_prefixes=_flatten_option_values(identity_command.path),
             )
             if as_json:
@@ -944,7 +1080,10 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
 
         if isinstance(command, GcArgs):
-            result = open_repository(repo_root).gc(dry_run=not command.prune)
+            result = open_repository(repo_root).gc(
+                dry_run=not command.prune,
+                grace_seconds=command.grace_seconds,
+            )
             if as_json:
                 print(
                     json.dumps(
@@ -958,6 +1097,7 @@ def run_cli(argv: list[str] | None = None) -> int:
                             "orphan_blobs": result.orphan_blobs,
                             "orphan_footers": result.orphan_footers,
                             "pruned": result.pruned,
+                            "skipped_young": result.skipped_young,
                         },
                         indent=2,
                     )
@@ -973,6 +1113,11 @@ def run_cli(argv: list[str] | None = None) -> int:
                     f"{result.orphan_trees} trees, {result.orphan_blobs} blobs, "
                     f"{result.orphan_footers} footers"
                 )
+                if result.skipped_young:
+                    print(
+                        f"Skipped:   {result.skipped_young} orphan(s) younger "
+                        "than the grace window (may belong to a concurrent writer)"
+                    )
                 if result.pruned:
                     print("Pruned orphaned objects.")
                 elif command.prune:
@@ -1171,7 +1316,10 @@ def run_cli(argv: list[str] | None = None) -> int:
                     s3_endpoint_url=config_command.s3_endpoint,
                 )
                 path = config.save(repo_root)
-                print(f"Config initialized: {path}")
+                if as_json:
+                    print(json.dumps({"config_path": str(path)}, indent=2))
+                else:
+                    print(f"Config initialized: {path}")
                 return 0
             if isinstance(config_command, ConfigSetArgs):
                 config = BaseConfig.load(repo_root)
@@ -1185,7 +1333,19 @@ def run_cli(argv: list[str] | None = None) -> int:
                     config, config_command.key, config_command.value
                 )
                 path = config.save(repo_root)
-                print(f"Updated: {config_command.key}={config_command.value}")
+                if as_json:
+                    print(
+                        json.dumps(
+                            {
+                                "key": config_command.key,
+                                "value": config_command.value,
+                                "config_path": str(path),
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    print(f"Updated: {config_command.key}={config_command.value}")
                 return 0
             if isinstance(config_command, ConfigListArgs):
                 config = BaseConfig.load(repo_root)
@@ -1195,13 +1355,27 @@ def run_cli(argv: list[str] | None = None) -> int:
                         file=sys.stderr,
                     )
                     return 1
-                raw = msgspec.json.format(msgspec.json.encode(config).decode("utf-8"))
-                print(raw)
+                if as_json:
+                    print(
+                        json.dumps(
+                            msgspec.json.decode(msgspec.json.encode(config)),
+                            indent=2,
+                        )
+                    )
+                else:
+                    raw = msgspec.json.format(
+                        msgspec.json.encode(config).decode("utf-8")
+                    )
+                    print(raw)
                 return 0
 
         if isinstance(command, CheckoutArgs):
-            open_repository(repo_root).set_current_branch(command.name)
-            print(f"Switched to branch '{command.name}'")
+            repo = open_repository(repo_root)
+            repo.set_current_branch(command.name)
+            if as_json:
+                print(json.dumps({"branch": command.name}, indent=2))
+            else:
+                print(f"Switched to branch '{command.name}'")
             return 0
 
         if isinstance(command, RestoreArgs):
@@ -1210,7 +1384,9 @@ def run_cli(argv: list[str] | None = None) -> int:
                 paths=_flatten_option_values(command.path) or None,
                 force=command.force,
             )
-            if not restored:
+            if as_json:
+                print(json.dumps({"restored": restored}, indent=2))
+            elif not restored:
                 print("Nothing to restore")
             else:
                 rel_paths = "\n".join(f"  restored: {p}" for p in restored)
@@ -1220,6 +1396,35 @@ def run_cli(argv: list[str] | None = None) -> int:
                 )
             return 0
 
+        if isinstance(command, ResetArgs):
+            repo = open_repository(repo_root)
+            branch_name = command.branch or repo.current_branch()
+            staged = repo.staging.load(branch_name)
+            result = repo.reset(command.ref, branch=command.branch)
+            if staged:
+                print(
+                    f"⚠  Branch '{result.ref}' still has staged changes; "
+                    "`commit --staged` will apply them onto the new parent.",
+                    file=sys.stderr,
+                )
+            if as_json:
+                print(
+                    json.dumps(
+                        {
+                            "ref": result.ref,
+                            "commit_id": result.commit_id,
+                            "previous_commit_id": result.previous_commit_id,
+                            "updated": result.updated,
+                        },
+                        indent=2,
+                    )
+                )
+            elif result.updated:
+                print(f"Moved '{result.ref}' to {result.commit_id}")
+            else:
+                print(f"'{result.ref}' is already at {result.commit_id}")
+            return 0
+
         if isinstance(command, InitArgs):
             if command.backend == "local":
                 from .core.repository import init_repository
@@ -1227,7 +1432,18 @@ def run_cli(argv: list[str] | None = None) -> int:
                 repo_root = init_repository(
                     repo_root, default_branch=command.default_branch
                 )
-                print(f"Repository initialized: {repo_root / '.reflake'}")
+                if as_json:
+                    print(
+                        json.dumps(
+                            {
+                                "repository": str(repo_root / ".reflake"),
+                                "backend": "local",
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    print(f"Repository initialized: {repo_root / '.reflake'}")
                 return 0
             config = init_config(
                 repo_root,
@@ -1238,7 +1454,15 @@ def run_cli(argv: list[str] | None = None) -> int:
                 s3_endpoint_url=command.s3_endpoint,
             )
             path = config.save(repo_root)
-            print(f"Repository initialized: {path}")
+            if as_json:
+                print(
+                    json.dumps(
+                        {"config_path": str(path), "backend": command.backend},
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Repository initialized: {path}")
             return 0
 
         if isinstance(command, PushArgs):
@@ -1313,14 +1537,21 @@ def run_cli(argv: list[str] | None = None) -> int:
                 mode=command.direction,
                 include_metadata=True,
             )
-            if as_json:
-                print(json.dumps(cmds, indent=2))
-            elif command.execute:
+            executed = 0
+            if command.execute:
                 import subprocess
 
                 for cmd in cmds:
                     subprocess.run(shlex.split(cmd), check=True)
-                print(f"Executed {len(cmds)} transfer commands")
+                executed = len(cmds)
+            if as_json:
+                print(
+                    json.dumps(
+                        {"commands": cmds, "executed": executed}, indent=2
+                    )
+                )
+            elif command.execute:
+                print(f"Executed {executed} transfer commands")
             else:
                 for cmd in cmds:
                     print(cmd)

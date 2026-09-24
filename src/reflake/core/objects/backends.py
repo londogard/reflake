@@ -18,6 +18,7 @@ class S3ObjectMetadata:
     key: str
     size: int
     mtime_ns: int
+    etag: str | None = None
 
     @property
     def source_uri(self) -> str:
@@ -29,6 +30,7 @@ class SourceObjectMetadata:
     source_uri: str
     size: int
     mtime_ns: int
+    etag: str | None = None
 
 
 TransferDirection = Literal["upload", "download"]

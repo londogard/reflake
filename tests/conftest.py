@@ -41,6 +41,7 @@ class FakeS3Paginator:
                     "Key": key,
                     "Size": len(metadata["Body"]),
                     "LastModified": metadata["LastModified"],
+                    "ETag": metadata.get("ETag"),
                 }
             )
         return [{"Contents": contents}]
@@ -52,6 +53,9 @@ class FakeS3Client:
         self.fixed_etag: str | None = None
         #: Sizes of every ``delete_objects`` batch received, in order.
         self.delete_calls: list[int] = []
+        #: Multipart lifecycle events, in order: (operation, key).
+        self.multipart_calls: list[tuple[str, str]] = []
+        self._uploads: dict[tuple[str, str], dict[int, bytes]] = {}
 
     def get_paginator(self, operation_name: str) -> FakeS3Paginator:
         assert operation_name == "list_objects_v2"
@@ -141,6 +145,62 @@ class FakeS3Client:
         for item in objects:
             assert isinstance(item, dict)
             self._objects.pop(item["Key"], None)
+        return {}
+
+    # ── Multipart uploads ────────────────────────────────────────────
+
+    def create_multipart_upload(self, *, Bucket: str, Key: str) -> dict[str, object]:
+        assert Bucket == "demo-bucket"
+        self.multipart_calls.append(("create", Key))
+        upload_id = f"upload-{len(self._uploads)}"
+        self._uploads[(Key, upload_id)] = {}
+        return {"UploadId": upload_id}
+
+    def upload_part(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        UploadId: str,
+        PartNumber: int,
+        Body: object,
+    ) -> dict[str, object]:
+        assert Bucket == "demo-bucket"
+        self.multipart_calls.append(("part", Key))
+        payload = Body.read() if hasattr(Body, "read") else Body
+        assert isinstance(payload, bytes)
+        if len(payload) < 5 * 1024 * 1024:
+            # Real S3 requires all parts except the last to be ≥5 MiB; the
+            # fake cannot know which is last, so only record the size.
+            pass
+        self._uploads[(Key, UploadId)][PartNumber] = payload
+        return {"ETag": self._etag(payload)}
+
+    def complete_multipart_upload(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        UploadId: str,
+        MultipartUpload: dict[str, object],
+    ) -> dict[str, object]:
+        assert Bucket == "demo-bucket"
+        self.multipart_calls.append(("complete", Key))
+        parts = self._uploads.pop((Key, UploadId))
+        payload = b"".join(parts[number] for number in sorted(parts))
+        self._objects[Key] = {
+            "Body": payload,
+            "LastModified": datetime.now(UTC),
+            "ETag": self._etag(payload),
+        }
+        return {"ETag": self._objects[Key]["ETag"]}
+
+    def abort_multipart_upload(
+        self, *, Bucket: str, Key: str, UploadId: str
+    ) -> dict[str, object]:
+        assert Bucket == "demo-bucket"
+        self.multipart_calls.append(("abort", Key))
+        self._uploads.pop((Key, UploadId), None)
         return {}
 
     def _etag(self, payload: bytes) -> str:

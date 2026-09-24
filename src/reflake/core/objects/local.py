@@ -271,9 +271,11 @@ class LocalObjectStore:
     # ── Enumeration (GC) ────────────────────────────────────────────────
 
     def iter_branches(self) -> Iterator[str]:
-        for path in self.layout.heads_dir.iterdir():
+        # Nested branch names (feature/x) are directories under heads/: walk
+        # the whole tree and ignore atomic-write temp files (leading dot).
+        for path in sorted(self.layout.heads_dir.rglob("*")):
             if path.is_file() and not path.name.startswith("."):
-                yield path.name
+                yield path.relative_to(self.layout.heads_dir).as_posix()
 
     def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]:
         if kind == "blob":
@@ -289,6 +291,16 @@ class LocalObjectStore:
             )
         elif kind == "commit":
             yield from (p.stem for p in self.layout.commits_dir.glob("*.json"))
+
+    def iter_object_ids_with_mtimes(
+        self, kind: RepositoryObjectKind
+    ) -> Iterator[tuple[str, int]]:
+        for object_id in self.iter_object_ids(kind):
+            try:
+                mtime_ns = self._path_for(kind, object_id).stat().st_mtime_ns
+            except OSError:
+                mtime_ns = 0
+            yield object_id, mtime_ns
 
     def delete_objects(
         self, kind: RepositoryObjectKind, object_ids: Iterable[str]

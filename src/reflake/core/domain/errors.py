@@ -50,6 +50,14 @@ class ObjectMissingError(ReflakeError):
     """Raised by storage adapters when a requested object does not exist."""
 
 
+class SourceNotFoundError(ReflakeError):
+    """Raised when a staged or referenced external source does not exist.
+
+    Distinct from a missing repository ref/object: a missing source is user
+    input (or user data) that must be fixed, so it exits 1, not 3.
+    """
+
+
 class BlobIntegrityError(ReflakeError):
     """Raised when content does not match its content-addressed hash."""
 
@@ -121,3 +129,12 @@ class UnknownCommitError(ReflakeError):
     def __init__(self, commit_id: str) -> None:
         self.commit_id = commit_id
         super().__init__(f"Unknown commit: {commit_id}")
+
+
+class CorruptCommitError(ReflakeError):
+    """Raised when a stored commit object cannot be parsed."""
+
+    def __init__(self, commit_id: str, detail: str = "") -> None:
+        self.commit_id = commit_id
+        suffix = f": {detail}" if detail else ""
+        super().__init__(f"Corrupt commit object {commit_id}{suffix}")

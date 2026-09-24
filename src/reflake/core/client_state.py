@@ -5,10 +5,20 @@ from collections.abc import Iterator
 from datetime import UTC
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from urllib.parse import quote
 
 from .domain import BranchRefState
 
 HEAD_FILE = "HEAD"
+
+
+def encode_branch_name(branch: str) -> str:
+    """Filesystem-safe key for a branch name (hierarchical names allowed).
+
+    ``feature/x`` becomes ``feature%2Fx`` so per-branch staging, snapshots
+    and reflogs stay single flat files with no directory collisions.
+    """
+    return quote(branch, safe="")
 
 
 class LocalClientState:
@@ -44,7 +54,7 @@ class LocalClientState:
         """Record a ref update (client-side reflog, one line per entry)."""
         from datetime import datetime
 
-        path = self.reflog_dir / f"{branch}.log"
+        path = self.reflog_dir / f"{encode_branch_name(branch)}.log"
         timestamp = datetime.now(UTC).isoformat()
         old = old_commit or "0" * 64
         new = new_commit or "0" * 64
@@ -53,7 +63,7 @@ class LocalClientState:
             handle.write(line)
 
     def iter_reflog(self, branch: str) -> Iterator[str]:
-        path = self.reflog_dir / f"{branch}.log"
+        path = self.reflog_dir / f"{encode_branch_name(branch)}.log"
         if not path.exists():
             return
         for raw in reversed(path.read_text(encoding="utf-8").splitlines()):
@@ -122,10 +132,10 @@ class LocalClientState:
         Snapshots live under ``state/branch-snapshots/`` so they can never be
         mistaken for branch pointers by shared-store enumeration.
         """
-        return self.branch_state_dir / f"{branch}.json"
+        return self.branch_state_dir / f"{encode_branch_name(branch)}.json"
 
     def stage_path(self, branch: str) -> Path:
-        return self.staging_dir / f"{branch}.json"
+        return self.staging_dir / f"{encode_branch_name(branch)}.json"
 
     def _atomic_write_text(self, path: Path, payload: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

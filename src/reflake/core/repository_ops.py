@@ -29,7 +29,42 @@ from .repository_support import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .repository import ReflakeRepository
+
+
+def _reject_conflicting_adds(staged: dict[str, StageChange]) -> None:
+    """Reject staged adds where one path is an ancestor of another.
+
+    ``a`` and ``a/b`` cannot both be files; allowing them would make the
+    overlay splice build a node with two entries named ``a``. Paths are
+    sorted, so descendants sit directly after their ancestor.
+    """
+    add_paths = sorted(
+        path for path, change in staged.items() if change.action == "add"
+    )
+    for index, path in enumerate(add_paths[:-1]):
+        following = add_paths[index + 1]
+        if following.startswith(f"{path}/"):
+            raise ValueError(
+                f"Conflicting staged additions: '{path}' and '{following}' "
+                "cannot both be files"
+            )
+
+
+def _source_stat(source_uri: str | None) -> tuple[int | None, int | None]:
+    """Best-effort size/mtime for a local source URI (None for remote)."""
+    if not source_uri or not source_uri.startswith("file:"):
+        return None, None
+    from pathlib import Path
+    from urllib.parse import unquote, urlparse
+
+    try:
+        stat = Path(unquote(urlparse(source_uri).path)).stat()
+    except OSError:
+        return None, None
+    return stat.st_size, stat.st_mtime_ns
 
 
 def repo_add(
@@ -52,12 +87,16 @@ def repo_add(
             raw_source,
             destination_path=destination_path,
         ):
+            size, mtime_ns = _source_stat(source_uri)
             staged[logical_path] = StageChange(
                 path=logical_path,
                 action="add",
                 identity_mode=identity_mode,
                 source_uri=source_uri,
+                size=size,
+                mtime_ns=mtime_ns,
             )
+    _reject_conflicting_adds(staged)
     repo.staging.save(branch, staged)
     return repo.status(ref=branch)
 
@@ -171,6 +210,26 @@ def repo_remove_paths(
     )
 
 
+def _require_directory_destination(
+    repo: ReflakeRepository, base_tree: str, destination: str
+) -> None:
+    """Reject a destination whose ancestor path is an existing file.
+
+    ``mv a.txt b/moved.txt`` where ``b`` is a file must fail loudly: the
+    alternative is replacing the committed leaf with a directory, which
+    silently drops an entry the user never asked to remove.
+    """
+    parts = destination.split("/")
+    prefix = ""
+    for part in parts[:-1]:
+        prefix = f"{prefix}/{part}" if prefix else part
+        entry = repo.store.lookup_entry(base_tree, prefix)
+        if entry is not None and not entry.is_subtree:
+            raise ValueError(
+                f"Destination parent is a file: '{prefix}'; remove or move it first"
+            )
+
+
 def repo_move(
     repo: ReflakeRepository,
     source_path: str,
@@ -191,6 +250,7 @@ def repo_move(
         raise ValueError("Source and destination paths must differ")
     if destination.startswith(f"{source}/"):
         raise ValueError("Cannot move a path into itself")
+    _require_directory_destination(repo, base_commit.tree, destination)
 
     source_entries: list[Entry] = []
     exact_source = repo.store.lookup_entry(base_commit.tree, source)
@@ -265,8 +325,11 @@ def repo_move_staged(
 
     if source == destination:
         raise ValueError("Source and destination paths must differ")
+    if destination.startswith(f"{source}/"):
+        raise ValueError("Cannot move a path into itself")
 
     base_commit = repo.read_commit(repo.resolve_ref(branch))
+    _require_directory_destination(repo, base_commit.tree, destination)
     moved_count = 0
 
     for entry in repo.store.iter_all_entries(base_commit.tree):
@@ -302,17 +365,46 @@ def repo_move_staged(
     return repo.status(ref=branch)
 
 
+def _pointer_drifted(entry: Entry, client: object) -> bool:
+    """True when a pointer entry's source no longer matches what was imported.
+
+    Metadata-only: one HEAD (or stat) per entry, never a source byte read.
+    Comparison order: size, then ETag when both sides have one, otherwise
+    last-modified; a missing source is drift too.
+    """
+    from .domain import SourceNotFoundError
+    from .objects import describe_source_uri
+
+    if not entry.source_uri:
+        return True
+    try:
+        metadata = describe_source_uri(entry.source_uri, client=client)
+    except (SourceNotFoundError, ValueError, OSError):
+        return True
+    if metadata.size != entry.size:
+        return True
+    if entry.source_etag and metadata.etag:
+        return metadata.etag != entry.source_etag
+    if entry.mtime_ns and metadata.mtime_ns:
+        return metadata.mtime_ns != entry.mtime_ns
+    return False
+
+
 def repo_verify(
     repo: ReflakeRepository,
     ref: str | None = None,
     path_prefixes: list[str] | None = None,
     *,
     dry_run: bool = False,
+    drift_check: bool = False,
 ) -> VerifyResult:
     """Audit pointer entries, optionally promoting them to canonical blobs.
 
     ``dry_run=True`` is strictly read-only: it walks tree metadata, counts
     candidate entries, and writes nothing (no tree objects, no commit).
+    ``drift_check=True`` additionally compares each pointer entry's stored
+    source metadata (size, ETag, last-modified) against the source object
+    via one metadata request per entry — never reading source bytes.
 
     Promotion path-splices the promoted leaves into the parent tree
     (``TreeWriter.splice_tree``), so only directories containing promoted
@@ -322,6 +414,14 @@ def repo_verify(
     """
     if ref is None:
         ref = repo.current_branch()
+
+    if not dry_run and repo.store.read_branch_ref(ref) is None:
+        raise ValueError(
+            f"Promotion needs a branch ref to advance; '{ref}' is not a branch. "
+            "Use --ref <branch> or check out the branch first."
+        )
+
+    from .objects import source_client
 
     base_commit_id = repo.resolve_ref(ref)
     base_commit = repo.read_commit(base_commit_id)
@@ -346,10 +446,14 @@ def repo_verify(
     if dry_run:
         total_entries = 0
         candidate_entries = 0
+        drifted: list[str] = []
+        client = source_client(repo.store) if drift_check else None
         for entry in iter_scope():
             total_entries += 1
             if entry.blob_hash is None:
                 candidate_entries += 1
+                if drift_check and _pointer_drifted(entry, client):
+                    drifted.append(entry.path)
         return VerifyResult(
             commit_id=base_commit_id,
             verified_entries=0,
@@ -357,6 +461,7 @@ def repo_verify(
             total_entries=total_entries,
             created_commit=False,
             dry_run=True,
+            drifted_paths=sorted(drifted),
         )
 
     total_entries = 0
@@ -417,6 +522,63 @@ def repo_verify(
     )
 
 
+def _write_entry_to_file(repo: ReflakeRepository, entry: Entry, target: Path) -> None:
+    """Stream one entry's content to *target* atomically, hash-verified.
+
+    Large blobs are never buffered whole in memory; a blob-backed entry is
+    hashed while streaming and renamed into place only when the digest
+    matches (a torn or corrupt download cannot land in the worktree).
+    """
+    import os
+    from contextlib import ExitStack, closing
+    from pathlib import Path
+    from tempfile import NamedTemporaryFile
+
+    from blake3 import blake3
+
+    from .domain import BlobIntegrityError
+    from .objects import open_source_uri, source_client
+
+    hasher = blake3() if entry.blob_hash else None
+    temp_path: Path | None = None
+    try:
+        with ExitStack() as stack:
+            if entry.blob_hash:
+                source = stack.enter_context(
+                    closing(repo.open_blob_stream(entry.blob_hash))
+                )
+            elif entry.source_uri:
+                source = stack.enter_context(
+                    open_source_uri(
+                        entry.source_uri, client=source_client(repo.store)
+                    )
+                )
+            else:
+                raise FileNotFoundError(
+                    f"Entry has no readable content: {entry.path}"
+                )
+            with NamedTemporaryFile(dir=target.parent, delete=False) as temp:
+                temp_path = Path(temp.name)
+                while chunk := source.read(1024 * 1024):
+                    if hasher is not None:
+                        hasher.update(chunk)
+                    temp.write(chunk)
+        if hasher is not None and entry.blob_hash is not None:
+            actual = hasher.hexdigest()
+            if actual != entry.blob_hash:
+                raise BlobIntegrityError(
+                    expected=entry.blob_hash,
+                    actual=actual,
+                    context="restore",
+                )
+        assert temp_path is not None
+        os.replace(temp_path, target)
+    except BaseException:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
 def repo_restore_files(
     repo: ReflakeRepository,
     ref: str,
@@ -459,14 +621,8 @@ def repo_restore_files(
         if target.exists() and not force:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        if entry.blob_hash:
-            target.write_bytes(repo.read_blob(entry.blob_hash))
-            restored.append(logical_path)
-        elif entry.source_uri:
-            from .objects import open_source_uri
-
-            with open_source_uri(entry.source_uri) as source_file:
-                target.write_bytes(source_file.read())
+        if entry.blob_hash or entry.source_uri:
+            _write_entry_to_file(repo, entry, target)
             restored.append(logical_path)
     return restored
 

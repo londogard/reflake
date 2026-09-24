@@ -21,7 +21,10 @@ class CommitObject:
     tree: str
     parents: tuple[str, ...] = ()
     created_at: str = ""
-    generation: int = 0
+    #: DAG-depth perf hint. ``None`` means the stored object predates the
+    #: field (legacy); the value is then derived from the parent DAG.  A root
+    #: commit legitimately has generation 0.
+    generation: int | None = None
 
     @property
     def first_parent(self) -> str | None:
@@ -49,6 +52,9 @@ class GcResult:
     orphan_blobs: int
     orphan_footers: int
     pruned: bool
+    #: Orphans skipped because they are younger than the grace window
+    #: (they may belong to a writer that has not CAS'd its ref yet).
+    skipped_young: int = 0
 
 
 @dataclass(frozen=True)
@@ -59,6 +65,9 @@ class VerifyResult:
     total_entries: int
     created_commit: bool
     dry_run: bool
+    #: Pointer entries whose source metadata no longer matches what was
+    #: imported (size / ETag / last-modified changed, or source missing).
+    drifted_paths: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,16 @@ class MergeResult:
     source_ref: str
     target_ref: str
     commit_id: str
+    updated: bool
+
+
+@dataclass(frozen=True)
+class ResetResult:
+    """Result of moving a branch pointer to an existing commit."""
+
+    ref: str
+    commit_id: str
+    previous_commit_id: str | None
     updated: bool
 
 
@@ -92,6 +111,11 @@ class StageChange(msgspec.Struct):
     source_uri: str | None = None
     blob_hash: str | None = None
     size: int | None = None
+    #: Source size/mtime observed when the change was staged. Staging is a
+    #: recipe (content is read at commit time); these let the CLI warn when
+    #: the recipe no longer matches the source instead of silently
+    #: committing different bytes.
+    mtime_ns: int | None = None
 
 
 @dataclass(frozen=True)

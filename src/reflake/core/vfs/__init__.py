@@ -9,7 +9,7 @@ import fsspec
 from fsspec.spec import AbstractFileSystem
 
 from ..entry_codec import Entry
-from ..objects import open_source_uri
+from ..objects import open_source_uri, source_client
 from ..repository import ReflakeRepository, open_repository
 from ..repository_support import _validate_no_binary, normalize_repository_path
 
@@ -62,7 +62,13 @@ class ReflakeFileSystem(AbstractFileSystem):
             repo = self._repository(resolved.root)
             return _BlobReadFile(repo.open_blob_stream(resolved.entry.blob_hash))  # type: ignore[bad-return]
         if resolved.entry.source_uri:
-            return _SourceURIFile(open_source_uri(resolved.entry.source_uri))  # type: ignore[bad-return]
+            repo = self._repository(resolved.root)
+            return _SourceURIFile(  # type: ignore[bad-return]
+                open_source_uri(
+                    resolved.entry.source_uri,
+                    client=source_client(repo.store),
+                )
+            )
         raise FileNotFoundError(
             "Entry has no canonical blob hash and no readable source URI"
         )

@@ -47,6 +47,7 @@ from ..objects.tree import (
     KIND_TREE,
     MAX_TREE_ENTRIES,
     leaf_to_tree_entry,
+    validate_tree_node,
 )
 from ..repository_support import metadata_identity
 from .refs import RefManager
@@ -72,10 +73,20 @@ def _parent_dir(path: str) -> str:
 
 
 def _path_is_removed(path: str, removed: set[str]) -> bool:
+    """True when *path* or any of its ancestors is in *removed*.
+
+    Checks the path's ancestor prefixes (O(path depth) set lookups) instead
+    of scanning every removal prefix (O(removals) string operations), so a
+    large ``rm`` set does not turn splicing into quadratic work.
+    """
+    if not removed:
+        return False
     if path in removed:
         return True
-    for prefix in removed:
-        if path.startswith(f"{prefix}/"):
+    prefix = ""
+    for part in path.split("/")[:-1]:
+        prefix = f"{prefix}/{part}" if prefix else part
+        if prefix in removed:
             return True
     return False
 
@@ -116,10 +127,14 @@ class TreeWriter:
         self.refs = refs
         self.client_state = client_state
         self.trust_mtime = trust_mtime
-        self._walker = TreeWalker(read_tree=store.read_tree_bytes)
+        # Share the store's content-addressed prefix cache: the same tree
+        # object must never be parsed and held twice per process.
+        tree_cache = getattr(store, "tree_cache", None)
+        self._walker = TreeWalker(read_tree=store.read_tree_bytes, cache=tree_cache)
         self.inspector = TreeInspector(
             read_tree=store.read_tree_bytes,
             client_state=client_state,
+            cache=tree_cache,
         )
 
     # ── Low-level tree object writing ────────────────────────────────────
@@ -130,6 +145,12 @@ class TreeWriter:
         *,
         skip_hashes: frozenset[str] | set[str] = frozenset(),
     ) -> str:
+        # Invariant guard (I11): never publish a node that would fail to
+        # re-parse.  Past corruption bugs (duplicate/unsorted names) reached
+        # the store because writes were unvalidated; the guard is cheap and
+        # runs before hashing/short-circuiting so it also covers skipped
+        # writes (defence in depth for the builder).
+        validate_tree_node(payload)
         tree_hash = blake3(payload).hexdigest()
         if tree_hash in skip_hashes:
             # Result is byte-identical to a known node (e.g. one merge side):
@@ -1042,6 +1063,13 @@ class TreeWriter:
         local_leaf_additions, child_additions = self._split_additions(
             dir_path, additions
         )
+        conflicts = set(local_leaf_additions) & set(child_additions)
+        if conflicts:
+            joined = ", ".join(sorted(conflicts))
+            raise ValueError(
+                "Conflicting staged additions (a path and a path below it): "
+                f"{joined}"
+            )
 
         if tree_hash is None:
             kept, changed = self._splice_children(
@@ -1245,12 +1273,49 @@ class TreeWriter:
                         new_leaf = local_leaf_additions[name]
                         kept.append((name, _entry_to_leaf_line(new_leaf)))
                         handled_leaf_additions.add(name)
+                    elif name in child_additions:
+                        # A staged directory replaces this committed leaf.
+                        # Without this branch the tail loop would append a
+                        # second entry with the same name and publish an
+                        # unparseable node.
+                        handled_child_dirs.add(name)
+                        new_sub_hash = self._splice_directory(
+                            dir_path=full,
+                            tree_hash=None,
+                            additions=child_additions[name],
+                            removed_prefixes=removed_prefixes,
+                        )
+                        if new_sub_hash is not None:
+                            kept.append(
+                                (name, _subtree_line(KIND_TREE, name, new_sub_hash))
+                            )
                     continue
 
                 if name in local_leaf_additions:
                     new_leaf = local_leaf_additions[name]
                     kept.append((name, _entry_to_leaf_line(new_leaf)))
                     handled_leaf_additions.add(name)
+                    # Conflicting nested adds would duplicate the name; the
+                    # shape conflict check in _splice_directory raises first,
+                    # this is defence in depth for hand-built callers.
+                    handled_child_dirs.add(name)
+                    changed = True
+                    continue
+
+                if name in child_additions:
+                    # Staged files land in a new directory at this name: the
+                    # leaf is replaced by a subtree (file -> directory).
+                    handled_child_dirs.add(name)
+                    new_sub_hash = self._splice_directory(
+                        dir_path=full,
+                        tree_hash=None,
+                        additions=child_additions[name],
+                        removed_prefixes=removed_prefixes,
+                    )
+                    if new_sub_hash is not None:
+                        kept.append(
+                            (name, _subtree_line(KIND_TREE, name, new_sub_hash))
+                        )
                     changed = True
                     continue
 
@@ -1268,6 +1333,7 @@ class TreeWriter:
                     new_leaf = local_leaf_additions[name]
                     kept.append((name, _entry_to_leaf_line(new_leaf)))
                     handled_leaf_additions.add(name)
+                    handled_child_dirs.add(name)
                     changed = True
                     continue
 
@@ -1373,7 +1439,7 @@ class TreeWriter:
         if parents:
             generation = (
                 max(
-                    self.refs.read_commit(parent_id).generation for parent_id in parents
+                    self.refs.generation_of(parent_id) for parent_id in parents
                 )
                 + 1
             )

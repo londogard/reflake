@@ -29,13 +29,16 @@ def is_ancestor_commit(
     ``read_commit`` may return ``None`` for unknown commits (e.g. checking a
     remote head against a partial local history).  Uses the ``generation``
     counter to prune branches that cannot reach the ancestor: a commit's
-    ancestors always have strictly smaller generations.
+    ancestors always have strictly smaller generations.  Commits without a
+    stored generation (pre-0.2 objects) get one computed from the DAG, so
+    legacy histories are not silently misclassified.
     """
     if ancestor == descendant:
         return True
+    generations = _GenerationProvider(read_commit)
     ancestor_commit = read_commit(ancestor)
     target_generation = (
-        ancestor_commit.generation if ancestor_commit is not None else -1
+        generations.of(ancestor) if ancestor_commit is not None else -1
     )
     seen = {descendant}
     stack = [descendant]
@@ -46,13 +49,44 @@ def is_ancestor_commit(
         commit = read_commit(commit_id)
         if commit is None:
             continue
-        if commit.generation <= target_generation:
+        generation = generations.of(commit_id)
+        if 0 < generation <= target_generation:
             continue
         for parent_id in commit.parents:
             if parent_id not in seen:
                 seen.add(parent_id)
                 stack.append(parent_id)
     return False
+
+
+class _GenerationProvider:
+    """Stored generations where available, DAG-derived ones when absent.
+
+    Root commits legitimately have generation 0, so ``None`` (missing field)
+    is the only "unknown" marker.  The derived rule matches the stored one:
+    a root is 0 and every child is ``1 + max(parent generations)``.
+    """
+
+    def __init__(
+        self, read_commit: Callable[[str], CommitObject | None]
+    ) -> None:
+        self._read = read_commit
+        self._memo: dict[str, int] = {}
+
+    def of(self, commit_id: str) -> int:
+        cached = self._memo.get(commit_id)
+        if cached is not None:
+            return cached
+        commit = self._read(commit_id)
+        if commit is None:
+            self._memo[commit_id] = 0
+            return 0
+        generation = commit.generation
+        if generation is None:
+            parent_generations = [self.of(parent) for parent in commit.parents]
+            generation = 1 + max(parent_generations) if parent_generations else 0
+        self._memo[commit_id] = generation
+        return generation
 
 
 def merge_base_commit(
@@ -72,6 +106,7 @@ def merge_base_commit(
     flag_a, flag_b = 1, 2
     marked: dict[str, int] = {}
     heap: list[tuple[int, str]] = []
+    generations = _GenerationProvider(read_commit)
 
     def visit(commit_id: str, flag: int) -> None:
         previous = marked.get(commit_id, 0)
@@ -79,7 +114,7 @@ def merge_base_commit(
         if combined == previous:
             return
         marked[commit_id] = combined
-        heapq.heappush(heap, (-read_commit(commit_id).generation, commit_id))
+        heapq.heappush(heap, (-generations.of(commit_id), commit_id))
 
     visit(commit_a, flag_a)
     visit(commit_b, flag_b)
@@ -96,6 +131,31 @@ def merge_base_commit(
 
 def normalize_repository_path(path: str) -> str:
     return _sanitize_path_component(path, "Path")
+
+
+def validate_branch_name(name: str) -> str:
+    """Validate a branch name, allowing hierarchical ``feature/x`` names."""
+    value = name.strip()
+    _validate_no_binary(value)
+    if not value:
+        raise ValueError("Branch name cannot be empty")
+    if value.startswith("/") or value.endswith("/"):
+        raise ValueError("Branch name cannot start or end with '/'")
+    parts = value.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("Branch name contains an invalid path segment")
+    if ".." in value:
+        raise ValueError("Branch name cannot contain consecutive dots")
+    if any(part.startswith(".") for part in parts):
+        raise ValueError("Branch name segments cannot start with '.'")
+    if any(part.startswith("-") for part in parts):
+        raise ValueError("Branch name segments cannot start with '-'")
+    forbidden = set('\\:*?"<>|')
+    if any(char in forbidden for char in value):
+        raise ValueError("Branch name contains an invalid character")
+    if value.endswith(".lock"):
+        raise ValueError("Branch name cannot end with '.lock'")
+    return value
 
 
 def _sanitize_path_component(value: str, context: str) -> str:

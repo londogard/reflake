@@ -46,6 +46,7 @@ from .source import (
     iter_s3_objects,
     open_source_uri,
     parse_s3_uri,
+    source_client,
 )
 from .transfer import (
     S3BlobTransferBackend,
@@ -82,6 +83,7 @@ __all__ = [
     "iter_s3_objects",
     "open_source_uri",
     "parse_s3_uri",
+    "source_client",
     # Private helpers re-exported for adapter compatibility
     "_s3_is_404",
     "_s3_is_precondition_failed",

@@ -19,6 +19,7 @@ from .domain import (
     NotARepositoryError,
     RefConflictError,
     RemoveResult,
+    ResetResult,
     StageChange,
     StageStatus,
     VerifyResult,
@@ -113,6 +114,10 @@ class ReflakeRepository:
     def branch(self, name: str) -> str:
         return self.refs.branch(name)
 
+    def delete_branch(self, name: str) -> str:
+        """Delete a branch by CAS-ing its ref to unborn (see RefManager)."""
+        return self.refs.delete_branch(name)
+
     def merge(self, source_ref: str, target_ref: str) -> MergeResult:
         if not source_ref:
             raise ValueError("Source ref cannot be empty")
@@ -175,6 +180,40 @@ class ReflakeRepository:
             source_ref=source_ref,
             target_ref=target_ref,
             commit_id=commit_id,
+            updated=True,
+        )
+
+    def reset(self, ref: str, *, branch: str | None = None) -> ResetResult:
+        """Move a branch pointer to an existing commit (undo / redo).
+
+        Nothing is materialized — like ``checkout``, this only moves shared
+        refs (and the client's snapshot/reflog), so it is the recovery path
+        for an unwanted or corrupting commit.  The expectation is read fresh
+        from the store (not from the client snapshot) and the update is a
+        CAS, so a concurrent writer surfaces as ``RefConflictError`` instead
+        of being silently overwritten.
+        """
+        target = self.refs.resolve_ref(ref)
+        branch_name = branch or self.current_branch()
+        current_state = self.store.read_branch_ref(branch_name)
+        current_commit = current_state.commit_id if current_state else None
+        if current_commit == target:
+            return ResetResult(
+                ref=branch_name,
+                commit_id=target,
+                previous_commit_id=current_commit,
+                updated=False,
+            )
+        self.refs.update_branch_ref(
+            branch=branch_name,
+            commit_id=target,
+            expected_commit_id=current_commit,
+            operation="reset",
+        )
+        return ResetResult(
+            ref=branch_name,
+            commit_id=target,
+            previous_commit_id=current_commit,
             updated=True,
         )
 
@@ -410,7 +449,9 @@ class ReflakeRepository:
             commit = self.refs.read_commit(current)
             commits.append(commit)
             stack.extend(commit.parents)
-        commits.sort(key=lambda commit: (-commit.generation, commit.id))
+        commits.sort(
+            key=lambda commit: (-self.refs.generation_of(commit.id), commit.id)
+        )
         yield from commits
 
     def diff(self, from_ref: str, to_ref: str) -> list[DiffEntry]:
@@ -423,15 +464,22 @@ class ReflakeRepository:
         self,
         ref: str | None = None,
         path_prefixes: list[str] | None = None,
+        *,
+        drift_check: bool = False,
     ) -> VerifyResult:
         """Audit pointer entries without writing anything (read-only).
 
         Returns the promotion report; ``created_commit`` is always False.
-        Use :meth:`promote` to materialize canonical blobs.
+        With ``drift_check=True`` it also compares each pointer entry's
+        stored source metadata against the source object (one metadata
+        request per entry) and reports drifted paths. Use :meth:`promote`
+        to materialize canonical blobs.
         """
         from .repository_ops import repo_verify
 
-        return repo_verify(self, ref, path_prefixes, dry_run=True)
+        return repo_verify(
+            self, ref, path_prefixes, dry_run=True, drift_check=drift_check
+        )
 
     def promote(
         self,
@@ -586,14 +634,27 @@ class ReflakeRepository:
             include_metadata=include_metadata,
         )
 
-    def gc(self, *, dry_run: bool = True) -> GcResult:
+    def gc(
+        self, *, dry_run: bool = True, grace_seconds: int | None = None
+    ) -> GcResult:
         """Compute reachable objects from all refs and report (or prune) orphans.
 
         Audit-only by default (docs/architecture.md §11): reachable set = the
         commit DAG from every branch head, their tree DAGs, and the blob and
         footer objects those trees reference.  ``dry_run=False`` deletes the
-        orphans.
+        orphans, but never objects younger than the grace window: a concurrent
+        writer publishes immutable objects *before* it CASes its ref, so a
+        mark-and-sweep that ignored age could delete live data.
         """
+        from time import time_ns
+
+        if grace_seconds is None:
+            config = BaseConfig.load(self.root)
+            grace_seconds = config.gc_grace_seconds if config else 86400
+        grace_ns = max(0, int(grace_seconds)) * 1_000_000_000
+        now_ns = time_ns()
+        young_cutoff = now_ns - grace_ns
+
         reachable_commits: set[str] = set()
         reachable_trees: set[str] = set()
         reachable_blobs: set[str] = set()
@@ -632,18 +693,28 @@ class ReflakeRepository:
 
         counts: dict[str, tuple[int, int]] = {}
         pruned_any = False
+        skipped_young = 0
         for kind, reachable in (
             ("commit", reachable_commits),
             ("tree", reachable_trees),
             ("blob", reachable_blobs),
             ("footer", reachable_footers),
         ):
-            stored = set(self.store.iter_object_ids(kind))
-            orphans = stored - reachable
+            stored = dict(self.store.iter_object_ids_with_mtimes(kind))
+            orphans = set(stored) - reachable
             counts[kind] = (len(stored), len(orphans))
-            if not dry_run and orphans:
+            if dry_run or not orphans:
+                continue
+            # mtime 0 means "unknown": treat as young, never delete.
+            deletable = sorted(
+                object_id
+                for object_id in orphans
+                if stored[object_id] != 0 and stored[object_id] < young_cutoff
+            )
+            skipped_young += len(orphans) - len(deletable)
+            if deletable:
                 pruned_any = True
-                self.store.delete_objects(kind, sorted(orphans))
+                self.store.delete_objects(kind, deletable)
 
         return GcResult(
             reachable_commits=len(reachable_commits),
@@ -655,6 +726,7 @@ class ReflakeRepository:
             orphan_blobs=counts["blob"][1],
             orphan_footers=counts["footer"][1],
             pruned=pruned_any,
+            skipped_young=skipped_young,
         )
 
     def cat(self, ref: str, path: str) -> bytes:
@@ -664,9 +736,11 @@ class ReflakeRepository:
         if entry.blob_hash:
             return self.read_blob(entry.blob_hash)
         if entry.source_uri:
-            from .objects import open_source_uri
+            from .objects import open_source_uri, source_client
 
-            with open_source_uri(entry.source_uri) as handle:
+            with open_source_uri(
+                entry.source_uri, client=source_client(self.store)
+            ) as handle:
                 return handle.read()
         raise FileNotFoundError(f"Entry has no readable content: {path}")
 

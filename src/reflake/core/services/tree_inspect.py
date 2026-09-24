@@ -19,7 +19,7 @@ from tempfile import NamedTemporaryFile
 from ..client_state import LocalClientState
 from ..domain import DiffEntry
 from ..entry_codec import Entry
-from ..objects.query import TreeWalker
+from ..objects.query import TreeCache, TreeWalker
 
 
 class TreeInspector:
@@ -30,8 +30,9 @@ class TreeInspector:
         *,
         read_tree: Callable[[str], bytes | None],
         client_state: LocalClientState | None = None,
+        cache: TreeCache | None = None,
     ) -> None:
-        self._walker = TreeWalker(read_tree=read_tree)
+        self._walker = TreeWalker(read_tree=read_tree, cache=cache)
         self.client_state = client_state
 
     # ── GC enumeration ───────────────────────────────────────────────

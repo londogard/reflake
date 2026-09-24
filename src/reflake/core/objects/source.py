@@ -27,8 +27,10 @@ from botocore.exceptions import ClientError
 from ..domain import (
     ObjectMissingError,
     PreconditionFailedError,
+    SourceNotFoundError,
     StorageUnavailableError,
 )
+from . import multipart
 from .backends import S3ObjectMetadata, SourceObjectMetadata
 
 
@@ -69,6 +71,23 @@ def _translate_s3_error(error: ClientError, operation: str) -> Exception:
     return StorageUnavailableError(f"{operation}: {error}")
 
 
+def source_client(store: object) -> Any | None:
+    """S3 client for external sources, derived from a repository store.
+
+    An S3-backed repository shares its configured client (endpoint, or a
+    test double) with source access; local repositories fall back to the
+    ambient AWS configuration chain.
+    """
+    return getattr(store, "client", None)
+
+
+def _clean_etag(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().strip('"')
+    return cleaned or None
+
+
 def _mtime_ns(value: object) -> int:
     if isinstance(value, datetime):
         timestamp = value
@@ -96,6 +115,7 @@ def iter_s3_objects(
                     key=key,
                     size=int(obj.get("Size", 0)),
                     mtime_ns=_mtime_ns(obj.get("LastModified")),
+                    etag=_clean_etag(obj.get("ETag")),
                 )
     except ClientError as error:
         raise _translate_s3_error(error, "list_objects") from error
@@ -115,7 +135,7 @@ def describe_source_uri(
             response = s3_client.head_object(Bucket=bucket, Key=key)
         except ClientError as error:
             if _s3_is_404(error):
-                raise FileNotFoundError(
+                raise SourceNotFoundError(
                     f"Cannot stage missing file: {source_uri}"
                 ) from error
             raise _translate_s3_error(error, "head_object") from error
@@ -123,6 +143,7 @@ def describe_source_uri(
             source_uri=source_uri,
             size=int(response.get("ContentLength", 0)),
             mtime_ns=_mtime_ns(response.get("LastModified")),
+            etag=_clean_etag(response.get("ETag")),
         )
 
     parsed = urlparse(source_uri)
@@ -131,7 +152,7 @@ def describe_source_uri(
     else:
         path = Path(source_uri).expanduser().resolve()
     if not path.exists() or not path.is_file():
-        raise FileNotFoundError(f"Cannot stage missing file: {path}")
+        raise SourceNotFoundError(f"Cannot stage missing file: {path}")
     stat = path.stat()
     return SourceObjectMetadata(
         source_uri=path.as_uri(),
@@ -217,6 +238,38 @@ class S3StorageBackend:
                     f"Path already exists: {relative_path}"
                 ) from error
             raise _translate_s3_error(error, "write_bytes") from error
+
+    def upload_file(
+        self,
+        relative_path: str,
+        local_path: str | Path,
+        *,
+        if_none_match: bool = False,
+    ) -> None:
+        """Stream a local file up (multipart above the size threshold)."""
+        try:
+            multipart.upload_file(
+                self.client,
+                self.bucket,
+                self._key(relative_path),
+                local_path,
+                if_none_match=if_none_match,
+            )
+        except ClientError as error:
+            if if_none_match and _s3_is_precondition_failed(error):
+                raise PreconditionFailedError(
+                    f"Path already exists: {relative_path}"
+                ) from error
+            raise _translate_s3_error(error, "upload_file") from error
+
+    def download_to_file(self, relative_path: str, local_path: str | Path) -> None:
+        """Stream an object down to *local_path* atomically."""
+        try:
+            multipart.download_to_file(
+                self.client, self.bucket, self._key(relative_path), local_path
+            )
+        except ClientError as error:
+            raise _translate_s3_error(error, "download_to_file") from error
 
     def exists(self, relative_path: str) -> bool:
         try:

@@ -65,15 +65,11 @@ class S3BlobTransferBackend:
         if_not_exists: bool = False,
     ) -> None:
         backend, key = self._backend(remote_uri)
-        backend.write_bytes(
-            key,
-            Path(local_path).read_bytes(),
-            if_none_match=if_not_exists,
-        )
+        backend.upload_file(key, local_path, if_none_match=if_not_exists)
 
     def download(self, remote_uri: str, local_path: str) -> None:
         backend, key = self._backend(remote_uri)
-        Path(local_path).write_bytes(backend.read_bytes(key))
+        backend.download_to_file(key, local_path)
 
     def list_objects(self, uri_prefix: str) -> Iterator[S3ObjectMetadata]:
         bucket, prefix = parse_s3_uri(uri_prefix)

@@ -245,7 +245,7 @@ def _collect_commits_to_push(
 
     missing = _missing_ids(dst_repo.store, "commit", reachable)
     commits = list(missing)
-    commits.sort(key=lambda cid: src_repo.read_commit(cid).generation)
+    commits.sort(key=lambda cid: src_repo.refs.generation_of(cid))
     return commits
 
 

@@ -11,11 +11,17 @@ from pathlib import Path, PurePosixPath
 import msgspec
 
 from ..client_state import LocalClientState
-from ..domain import StageChange, StageStatus
+from ..domain import SourceNotFoundError, StageChange, StageStatus
 from ..entry_codec import Entry
 from ..hashing import blake3_digest_file
+from ..ignore import IgnoreRules
 from ..manifest import FileEntry, walk_files
-from ..objects import QueryRefStore, iter_s3_objects, parse_s3_uri
+from ..objects import (
+    QueryRefStore,
+    iter_s3_objects,
+    parse_s3_uri,
+    source_client,
+)
 from ..repository_support import (
     normalize_repository_path,
     normalize_s3_import_path,
@@ -120,7 +126,7 @@ class StagingArea:
             else (self.root / raw_path).resolve()
         )
         if not source_path.exists():
-            raise FileNotFoundError(f"Cannot stage missing path: {raw_source}")
+            raise SourceNotFoundError(f"Cannot stage missing path: {raw_source}")
 
         if source_path.is_file():
             logical_path = self._single_local_logical_path(
@@ -130,7 +136,7 @@ class StagingArea:
             return [(logical_path, source_path.as_uri())]
 
         if not source_path.is_dir():
-            raise FileNotFoundError(f"Cannot stage unsupported path: {raw_source}")
+            raise SourceNotFoundError(f"Cannot stage unsupported path: {raw_source}")
 
         repo_relative_dir: str | None
         try:
@@ -147,7 +153,17 @@ class StagingArea:
         )
 
         staged_entries: list[tuple[str, str]] = []
-        for file_entry in walk_files(source_path):
+        # Repo-internal adds honor the repo's own ignore rules (including
+        # anchored patterns) even when only a subdirectory was named.
+        ignore_root = self.root
+        prefix = ""
+        try:
+            relative = source_path.relative_to(self.root)
+            prefix = "" if relative == Path(".") else relative.as_posix()
+        except ValueError:
+            ignore_root = source_path
+        rules = IgnoreRules.load(ignore_root)
+        for file_entry in walk_files(source_path, ignore=rules, rel_prefix=prefix):
             relative_suffix = file_entry.path.relative_to(source_path).as_posix()
             logical_path = normalize_repository_path(
                 PurePosixPath(destination_prefix, relative_suffix).as_posix()
@@ -155,7 +171,7 @@ class StagingArea:
             staged_entries.append((logical_path, file_entry.path.as_uri()))
 
         if not staged_entries:
-            raise FileNotFoundError(f"Cannot stage empty directory: {raw_source}")
+            raise SourceNotFoundError(f"Cannot stage empty directory: {raw_source}")
         return staged_entries
 
     def _single_local_logical_path(
@@ -184,9 +200,11 @@ class StagingArea:
         if not normalized_key:
             raise ValueError(f"S3 source cannot be bucket root: {raw_source}")
 
-        objects = list(iter_s3_objects(raw_source))
+        objects = list(
+            iter_s3_objects(raw_source, client=source_client(self.store))
+        )
         if not objects:
-            raise FileNotFoundError(f"Cannot stage missing S3 path: {raw_source}")
+            raise SourceNotFoundError(f"Cannot stage missing S3 path: {raw_source}")
 
         exact_object_uri = f"s3://{bucket}/{normalized_key}"
         exact_object_matches = [
@@ -231,7 +249,7 @@ class StagingArea:
             )
             return [(logical_path, exact_object_uri)]
         if not staged_entries:
-            raise FileNotFoundError(f"Cannot stage empty S3 prefix: {raw_source}")
+            raise SourceNotFoundError(f"Cannot stage empty S3 prefix: {raw_source}")
         return staged_entries
 
     def _compare_working_tree(

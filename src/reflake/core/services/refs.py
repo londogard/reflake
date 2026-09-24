@@ -14,6 +14,7 @@ from ..client_state import LocalClientState
 from ..domain import (
     BranchRefState,
     CommitObject,
+    CorruptCommitError,
     EmptyBranchError,
     NonFastForwardError,
     RefConflictError,
@@ -21,7 +22,7 @@ from ..domain import (
     UnknownRefError,
 )
 from ..objects import RefObjectStore
-from ..repository_support import is_ancestor_commit
+from ..repository_support import _GenerationProvider, is_ancestor_commit
 
 
 class _BoundedCache(OrderedDict[str, CommitObject]):
@@ -65,6 +66,7 @@ class RefManager:
         self.store = store
         self.client_state = client_state
         self._commit_cache = _BoundedCache()
+        self._generations = _GenerationProvider(self.read_commit)
         # Only client-local state is touched here: opening a repository must
         # never write to the shared store (no ref creation on open).
         self.client_state.ensure_current_branch(default_branch)
@@ -96,9 +98,12 @@ class RefManager:
         raise UnknownRefError(branch_or_commit)
 
     def branch(self, name: str) -> str:
-        if not name or "/" in name or name.startswith("."):
-            raise ValueError("Invalid branch name")
-        if self.store.read_branch_ref(name) is not None:
+        """Create a branch at the current head (idempotent over unborn refs)."""
+        from ..repository_support import validate_branch_name
+
+        name = validate_branch_name(name)
+        existing = self.store.read_branch_ref(name)
+        if existing is not None and existing.commit_id is not None:
             raise ValueError(f"Branch already exists: {name}")
         head_commit = self.head_commit()
         if not self.store.compare_and_set_branch_ref(
@@ -115,6 +120,28 @@ class RefManager:
             )
         return name
 
+    def delete_branch(self, name: str) -> str:
+        """Delete a branch by CAS-ing its ref to unborn (no commits).
+
+        Deleting is a compare-and-set on the current head, so a concurrent
+        writer surfaces as ``RefConflictError`` instead of losing an update.
+        The name can be re-created with :meth:`branch` afterwards.
+        """
+        if name == self.current_branch():
+            raise ValueError(
+                f"Cannot delete the current branch '{name}'; switch away first"
+            )
+        branch_state = self.store.read_branch_ref(name)
+        if branch_state is None or branch_state.commit_id is None:
+            raise UnknownRefError(name)
+        self.update_branch_ref(
+            branch=name,
+            commit_id=None,
+            expected_commit_id=branch_state.commit_id,
+            operation="branch delete",
+        )
+        return name
+
     def read_commit(self, commit_id: str) -> CommitObject:
         try:
             return self._commit_cache[commit_id]
@@ -123,18 +150,32 @@ class RefManager:
         commit_payload = self.store.read_commit_bytes(commit_id)
         if commit_payload is None:
             raise UnknownCommitError(commit_id)
-        data = msgspec.json.decode(commit_payload)
-        parents_raw = data.get("parents") or []
-        commit = CommitObject(
-            id=str(data["id"]),
-            message=str(data["message"]),
-            tree=str(data["tree"]),
-            parents=tuple(str(p) for p in parents_raw),
-            created_at=str(data["created_at"]),
-            generation=int(data.get("generation", 0)),
-        )
+        try:
+            data = msgspec.json.decode(commit_payload)
+            raw_generation = data.get("generation")
+            generation = None if raw_generation is None else int(raw_generation)
+            commit = CommitObject(
+                id=str(data["id"]),
+                message=str(data["message"]),
+                tree=str(data["tree"]),
+                parents=tuple(str(p) for p in (data.get("parents") or [])),
+                created_at=str(data["created_at"]),
+                generation=generation,
+            )
+        except (
+            msgspec.DecodeError,
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise CorruptCommitError(commit_id, str(error)) from error
         self._commit_cache[commit_id] = commit
         return commit
+
+    def generation_of(self, commit_id: str) -> int:
+        """DAG depth of *commit_id*: stored when present, derived otherwise."""
+        return self._generations.of(commit_id)
 
     def cache_commit(self, commit: CommitObject) -> None:
         """Insert a freshly created commit into the cache."""

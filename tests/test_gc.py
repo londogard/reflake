@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -50,6 +53,62 @@ def test_gc_prune_keeps_merged_second_parent_blobs(tmp_path: Path) -> None:
 
     # Feature content still readable after prune.
     assert repo.cat("main", "feature.txt") == b"feature-data"
+
+
+def test_gc_prune_skips_young_orphans(tmp_path: Path) -> None:
+    """A freshly published orphan may belong to a writer mid-commit: never pruned."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "a.txt").write_text("a")
+    repo = create_repository(str(repo_dir))
+    repo.commit("c1")
+
+    young = repo.tree_writer._write_tree_bytes(  # noqa: SLF001
+        ('["b","young","' + "a" * 64 + '",1,1]\n').encode()
+    )
+    old = repo.tree_writer._write_tree_bytes(  # noqa: SLF001
+        ('["b","old","' + "b" * 64 + '",1,1]\n').encode()
+    )
+    old_path = repo.store.tree_path(old)  # type: ignore[attr-defined]
+    past = time.time() - 3 * 86400
+    os.utime(old_path, (past, past))
+
+    result = repo.gc(dry_run=False, grace_seconds=86400)
+
+    remaining = set(repo.store.iter_object_ids("tree"))
+    assert old not in remaining
+    assert young in remaining
+    assert result.skipped_young == 1
+
+
+def test_gc_prune_skips_young_s3_orphans(
+    tmp_path: Path,
+    fake_s3_installer: pytest.MonkeyPatch,
+) -> None:
+    """S3 orphans use object LastModified for the grace window."""
+    del tmp_path
+    from reflake.core.repository import open_repository
+
+    client = fake_s3_installer({})
+    repo = open_repository(
+        "s3://demo-bucket/repos/gc-grace", s3_client=client
+    )
+    old_id, young_id = "c" * 64, "d" * 64
+    for index, object_id in enumerate((old_id, young_id)):
+        repo.store.write_tree_bytes(
+            object_id,
+            (f'["b","f{index}","' + "a" * 64 + '",1,1]\n').encode(),
+        )
+    client._objects[repo.store._key("tree", old_id)]["LastModified"] = datetime(  # noqa: SLF001
+        2020, 1, 1, tzinfo=UTC
+    )
+
+    result = repo.gc(dry_run=False, grace_seconds=86400)
+
+    remaining = set(repo.store.iter_object_ids("tree"))
+    assert old_id not in remaining
+    assert young_id in remaining
+    assert result.skipped_young == 1
 
 
 def test_s3_deletes_are_batched(

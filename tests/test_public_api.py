@@ -8,22 +8,45 @@ import pytest
 from reflake import (
     NotARepositoryError,
     ReflakeFileSystem,
-    S3ObjectStore,
     create_repository,
     open_repository,
     run_cli,
 )
+from reflake.core.objects import S3ObjectStore
 
 
-def test_top_level_exports_and_star_import() -> None:
+def test_top_level_exports_are_the_stable_surface() -> None:
     import reflake
 
-    assert hasattr(reflake, "parse_where_clause")
-    assert hasattr(reflake, "plan_pruned_scan")
-    assert hasattr(reflake, "prune_row_groups")
-    assert hasattr(reflake, "open_repository")
-    assert hasattr(reflake, "ReflakeRepository")
-    assert hasattr(reflake, "NotARepositoryError")
+    # Documented stable surface.
+    for name in (
+        "init_repository",
+        "create_repository",
+        "open_repository",
+        "ReflakeRepository",
+        "ReflakeFileSystem",
+        "ReflakeURI",
+        "push",
+        "pull",
+        "fetch",
+        "ReflakeError",
+        "NotARepositoryError",
+    ):
+        assert hasattr(reflake, name), name
+
+    # Internals stay in reflake.core and are deliberately not re-exported.
+    for internal in (
+        "S3ObjectStore",
+        "LocalObjectStore",
+        "ObjectStore",
+        "Entry",
+        "parse_where_clause",
+        "plan_pruned_scan",
+        "prune_row_groups",
+        "blake3_digest_file",
+        "init_config",
+    ):
+        assert not hasattr(reflake, internal), internal
 
 
 def test_s3_atomic_cas_conditional_write(fake_s3_installer) -> None:

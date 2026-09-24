@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from reflake.core import (
     ReflakeRepository,
 )
@@ -105,6 +107,94 @@ def test_splice_tree_removal_and_move_do_not_flatten_entire_tree(
 
     assert "archive" not in entries_3
     assert entries_3["keep"].hash == keep_hash_before
+
+
+def test_staged_directory_replaces_committed_leaf(tmp_path: Path) -> None:
+    """A staged directory may replace a committed leaf without corruption.
+
+    Regression: the splice used to append the new subtree while keeping the
+    leaf, publishing a node with two entries named ``data`` (unparseable).
+    """
+    repo = ReflakeRepository(tmp_path)
+    (tmp_path / "data").write_text("plain file")
+    repo.commit("initial")
+
+    outside = tmp_path.parent / f"{tmp_path.name}-incoming"
+    (outside / "pkg").mkdir(parents=True, exist_ok=True)
+    (outside / "pkg" / "x.txt").write_text("inside directory")
+
+    repo.add([str(outside / "pkg")], identity_mode="content", destination_path="data")
+    commit_id = repo.commit("directory replaces file", staged_only=True)
+    tree = repo.read_commit(commit_id).tree
+
+    paths = [entry.path for entry in repo.store.iter_all_entries(tree)]
+    assert paths == ["data/x.txt"]
+    root_entry = {
+        entry.path: entry
+        for entry in parse_tree_object(repo.store.read_tree_bytes(tree) or b"")
+    }["data"]
+    assert root_entry.is_subtree
+
+
+def test_move_under_a_file_parent_is_rejected(tmp_path: Path) -> None:
+    """``mv a b/moved`` must fail when ``b`` is a file, not silently replace it."""
+    repo = ReflakeRepository(tmp_path)
+    (tmp_path / "a.txt").write_text("A")
+    (tmp_path / "b").write_text("B")
+    repo.commit("initial")
+
+    with pytest.raises(ValueError, match="Destination parent is a file"):
+        repo.move("a.txt", "b/moved.txt", "move under a file")
+
+    # Nothing was committed and the branch still reads cleanly.
+    head = repo.head_commit()
+    assert head is not None
+    tree = repo.read_commit(head).tree
+    assert sorted(entry.path for entry in repo.store.iter_all_entries(tree)) == [
+        "a.txt",
+        "b",
+    ]
+
+
+def test_move_staged_into_itself_is_rejected(tmp_path: Path) -> None:
+    repo = ReflakeRepository(tmp_path)
+    (tmp_path / "a.txt").write_text("A")
+    repo.commit("initial")
+
+    with pytest.raises(ValueError, match="Cannot move a path into itself"):
+        repo.move_staged("a.txt", "a.txt/nested.txt")
+
+
+def test_conflicting_staged_additions_are_rejected(tmp_path: Path) -> None:
+    """Staging ``a`` and ``a/b`` would build a duplicate-name node: reject it."""
+    repo = ReflakeRepository(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed")
+    repo.commit("initial")
+
+    first = tmp_path.parent / f"{tmp_path.name}-one.txt"
+    second = tmp_path.parent / f"{tmp_path.name}-two.txt"
+    first.write_text("one")
+    second.write_text("two")
+
+    repo.add([str(first)], destination_path="a")
+    with pytest.raises(ValueError, match="Conflicting staged additions"):
+        repo.add([str(second)], destination_path="a/b")
+
+    # The failed add left staging untouched and the repo readable.
+    status = repo.status()
+    assert status.added == ["a"]
+
+
+def test_tree_writer_rejects_duplicate_names(tmp_path: Path) -> None:
+    """The write path must never publish a node that fails to re-parse."""
+    repo = ReflakeRepository(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed")
+    repo.commit("initial")
+
+    line = '["b","dup","' + "a" * 64 + '",1,1]'
+    payload = f"{line}\n{line}\n".encode()
+    with pytest.raises(ValueError, match="sorted by name"):
+        repo.tree_writer._write_tree_bytes(payload)  # noqa: SLF001
 
 
 def test_tree_entry_msgspec_serialization_roundtrip() -> None:

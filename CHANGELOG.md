@@ -6,6 +6,90 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
 
 ## Unreleased
 
+### Added
+
+- **`reflake reset <ref>`** — move a branch pointer to any existing commit or
+  ref (undo/redo) with a compare-and-set, without touching the worktree.
+  Staged changes survive (with a warning); every move lands in the reflog.
+  Library: `ReflakeRepository.reset()` returning `ResetResult`.
+- **`reflake branch -d/--delete <name>`** — delete a branch by CAS-ing its ref
+  to unborn; the name can be re-created afterwards. Deleting the current
+  branch is refused.
+- **Hierarchical branch names** (`feature/nightly-ingest`). Client-state
+  filenames encode the name (`feature%2Fx`), local ref listing recurses, and
+  the new validator rejects empty/`.`/`..`/leading-dot/consecutive-dot
+  segments.
+- **`identity verify --drift`** — metadata-only drift detection for pointer
+  entries: one HEAD per entry, never a source byte read. Pointer entries
+  imported from S3 now record the source ETag (optional trailing field on
+  `m`/`mp` tree lines), and drift compares size + ETag (or last-modified for
+  local-file sources).
+- **`--ref <branch>` for `identity verify` / `identity promote`**, so a shared
+  branch can be audited without changing the client's current branch.
+- **Ignore rules**: worktree walks skip `.reflake/` and `.git/` by default and
+  honor `.reflakeignore` (comments, `!` re-include, directory patterns,
+  `*`/`?`/`**`, anchored patterns). Explicitly named paths are always staged.
+- **GC grace window**: `gc --prune` never deletes objects younger than
+  `gc_grace_seconds` (config, default 24h; `--grace-seconds` overrides),
+  closing the mark-and-sweep race with a writer that has published objects
+  but not yet CAS'd its ref. Unknown ages are treated as young; the CLI and
+  JSON report `skipped_young`.
+- **Multipart uploads and streaming downloads** for large blobs (64 MiB
+  threshold): files are never buffered whole, the 5 GiB single-PUT ceiling is
+  gone, and stream uploads verify the content hash *before* completing the
+  upload (a mismatch aborts).
+- **`restore` streams and verifies**: blobs are hashed while streaming into a
+  temp file and renamed into place only when the digest matches.
+- `--json` support for `branch`, `checkout`, `init`, `config`, `restore`,
+  `reset`, and `transfer` (all structured commands are now covered).
+- New domain errors `SourceNotFoundError` (missing source input) and
+  `CorruptCommitError` (unparseable commit object).
+
+### Changed
+
+- **A missing *source* now exits 1 (validation), not 3** — exit 3 is reserved
+  for missing repository refs/objects; the runbook and README say so.
+- **Tree nodes are validated before they are written** (sorted, duplicate-free,
+  single-component names): an invalid node can no longer be published and
+  poisoned by a ref, the second shard-class corruption bug this guards
+  against.
+- `mv` refuses a destination whose parent path is a file, instead of
+  silently replacing that leaf; staging a path and a path below it (`a` and
+  `a/b`) is rejected at `add`.
+- Staged local sources record size + mtime; `commit` warns when a staged
+  source changed before the commit (staging is a recipe — the commit contains
+  commit-time bytes).
+- Ancestor checks, merge-base, `log` ordering and sync sorting derive
+  generations for commits that predate the `generation` field instead of
+  treating "missing" as zero.
+- S3 source access (`add s3://…`, pointer reads/promotes) reuses the S3-backed
+  repository's configured client/endpoint instead of building a default
+  client.
+- Tree caches are shared per store (one parsed copy per tree object per
+  process instead of four independent caches).
+- Interrupted multipart uploads are aborted (no orphaned parts).
+
+### Fixed
+
+- **Staged splice corruption (P0): a staged directory (or `mv`) landing on a
+  committed leaf wrote a node with two entries of the same name.** The commit
+  succeeded and the branch head became unparseable for every reader. Both
+  shape-change directions now replace correctly, and the new write-time
+  validation turns any future occurrence into a loud error before the ref
+  moves.
+- `S3ObjectStore.write_blob_file`/`write_blob_stream` no longer load whole
+  objects into memory (transfer backend `upload` used `Path.read_bytes()`).
+- `ReflakeRepository.log` still lists legacy histories after the generation
+  change (root commits legitimately have generation 0).
+
+### Removed
+
+- **The package root re-exports only the documented stable surface** (stores,
+  protocols, codec, pruning internals, config helpers); import internals from
+  `reflake.core` explicitly if you need them.
+- `write_branch_ref` is no longer part of the `RefCas` protocol — every ref
+  mutation must go through compare-and-set.
+
 ## [0.2.1] - 2026-09-10
 
 ### Deprecated

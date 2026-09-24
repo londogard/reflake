@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, BinaryIO
 
+from blake3 import blake3
 from botocore.exceptions import ClientError
 
 from ..domain import (
+    BlobIntegrityError,
     BranchRefState,
     ObjectMissingError,
     OptimisticLockError,
@@ -17,9 +20,15 @@ from ..domain import (
 )
 from ..entry_codec import Entry
 from ..layout import object_relative_key
+from . import multipart
 from .backends import BlobTransferBackend
 from .query import TreeCache, TreeWalker
-from .source import _s3_is_404, _s3_is_precondition_failed, build_s3_client
+from .source import (
+    _mtime_ns,
+    _s3_is_404,
+    _s3_is_precondition_failed,
+    build_s3_client,
+)
 
 
 class S3ObjectStore:
@@ -282,22 +291,28 @@ class S3ObjectStore:
             raise self._translate(error, "list_objects") from error
 
     def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]:
+        for object_id, _ in self.iter_object_ids_with_mtimes(kind):
+            yield object_id
+
+    def iter_object_ids_with_mtimes(
+        self, kind: RepositoryObjectKind
+    ) -> Iterator[tuple[str, int]]:
         if kind == "blob":
             prefix = self._key("blob", "")
-            for key in self._iter_keys(prefix):
+            for key, mtime_ns in self._iter_keys_with_mtimes(prefix):
                 relative = key[len(prefix) :] if key.startswith(prefix) else key
-                yield relative.replace("/", "")
+                yield relative.replace("/", ""), mtime_ns
         elif kind in ("tree", "footer"):
             prefix = self._key(kind, "")
-            for key in self._iter_keys(prefix):
+            for key, mtime_ns in self._iter_keys_with_mtimes(prefix):
                 relative = key[len(prefix) :] if key.startswith(prefix) else key
-                yield relative
+                yield relative, mtime_ns
         elif kind == "commit":
             prefix = self._key("commit", "")
-            for key in self._iter_keys(prefix):
+            for key, mtime_ns in self._iter_keys_with_mtimes(prefix):
                 name = key.rsplit("/", 1)[-1]
                 if name.endswith(".json"):
-                    yield name[: -len(".json")]
+                    yield name[: -len(".json")], mtime_ns
 
     #: S3 ``DeleteObjects`` accepts at most 1000 keys per request.
     _DELETE_BATCH_SIZE = 1000
@@ -331,6 +346,13 @@ class S3ObjectStore:
         for page in pages:
             for obj in page.get("Contents", []):
                 yield str(obj["Key"])
+
+    def _iter_keys_with_mtimes(self, prefix: str) -> Iterator[tuple[str, int]]:
+        paginator = self.client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+        for page in pages:
+            for obj in page.get("Contents", []):
+                yield str(obj["Key"]), _mtime_ns(obj.get("LastModified"))
 
     # ── Blob operations ───────────────────────────────────────────────────
 
@@ -378,18 +400,32 @@ class S3ObjectStore:
                 if_not_exists=if_missing,
             )
             return
-        with Path(source_path).open("rb") as handle:
+        # Multipart uploads cannot carry IfNoneMatch (S3 limitation): probe
+        # once for large deduplicated blobs so a pointless re-upload is
+        # skipped. Small files keep the conditional PUT below, so the common
+        # path issues no extra request. Re-uploading a duplicate multipart
+        # would be harmless anyway: the bytes are identical by construction.
+        if if_missing:
             try:
-                self._put_stream(
-                    key=self._key("blob", blob_hash),
-                    body=handle,
-                    if_missing=if_missing,
-                    error_message=f"Blob already exists: {blob_hash}",
-                )
-            except OptimisticLockError:
-                if if_missing:
+                if (
+                    os.stat(source_path).st_size > multipart.MULTIPART_THRESHOLD
+                    and self.object_exists("blob", blob_hash)
+                ):
                     return
-                raise
+            except OSError:
+                pass
+        try:
+            multipart.upload_file(
+                self.client,
+                self.bucket,
+                self._key("blob", blob_hash),
+                source_path,
+                if_none_match=if_missing,
+            )
+        except ClientError as error:
+            if if_missing and self._precondition_failed(error):
+                return
+            raise self._translate(error, "write_blob_file") from error
 
     def write_blob_stream(
         self,
@@ -401,16 +437,18 @@ class S3ObjectStore:
         if self._blob_transfer is not None:
             temp_path: Path | None = None
             try:
-                from blake3 import blake3 as _blake3
-
-                hasher = _blake3()
+                hasher = blake3()
                 with NamedTemporaryFile(delete=False) as temp:
                     temp_path = Path(temp.name)
                     while chunk := source.read(1024 * 1024):
                         hasher.update(chunk)
                         temp.write(chunk)
                 if hasher.hexdigest() != blob_hash:
-                    raise ValueError(f"Blob hash mismatch for {blob_hash}")
+                    raise BlobIntegrityError(
+                        expected=blob_hash,
+                        actual=hasher.hexdigest(),
+                        context="write_blob_stream",
+                    )
                 if if_missing and self.object_exists("blob", blob_hash):
                     return
                 assert temp_path is not None
@@ -423,17 +461,43 @@ class S3ObjectStore:
                 if temp_path is not None:
                     temp_path.unlink(missing_ok=True)
             return
+
+        # Stream and hash simultaneously; the hash is checked before the
+        # multipart upload is completed (so a mismatch aborts cleanly) and
+        # before a single PUT writes anything. Small streams keep the
+        # conditional-write guard; large ones skip it (S3 limitation) and
+        # rely on content addressing for idempotence.
+        hasher = blake3()
+
+        class _HashingReader:
+            def read(self, size: int | None = None, /) -> bytes:
+                chunk = source.read(size if size is not None else -1)
+                if chunk:
+                    hasher.update(chunk)
+                return chunk
+
+        def _verify() -> None:
+            actual = hasher.hexdigest()
+            if actual != blob_hash:
+                raise BlobIntegrityError(
+                    expected=blob_hash,
+                    actual=actual,
+                    context="write_blob_stream",
+                )
+
         try:
-            self._put_stream(
-                key=self._key("blob", blob_hash),
-                body=source,
-                if_missing=if_missing,
-                error_message=f"Blob already exists: {blob_hash}",
+            multipart.upload_stream(
+                self.client,
+                self.bucket,
+                self._key("blob", blob_hash),
+                _HashingReader(),
+                pre_complete=_verify,
+                if_none_match=if_missing,
             )
-        except OptimisticLockError:
-            if if_missing:
+        except ClientError as error:
+            if if_missing and self._precondition_failed(error):
                 return
-            raise
+            raise self._translate(error, "write_blob_stream") from error
 
     def object_exists(self, kind: RepositoryObjectKind, object_id: str) -> bool:
         if kind == "blob" and self._blob_transfer is not None:

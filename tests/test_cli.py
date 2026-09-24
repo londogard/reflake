@@ -214,7 +214,8 @@ def test_cli_add_reports_missing_source_cleanly(tmp_path: Path, capsys) -> None:
 
     assert run_cli(["--repo", str(repo_root), "init"]) == 0
     capsys.readouterr()
-    assert run_cli(["--repo", str(repo_root), "add", "missing.txt"]) == 3
+    # A missing source is user input: exit 1 (validation), not 3 (missing ref/object).
+    assert run_cli(["--repo", str(repo_root), "add", "missing.txt"]) == 1
     stderr = capsys.readouterr().err
     assert "add error: Cannot stage missing path: missing.txt" in stderr
 

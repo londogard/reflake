@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import msgspec
+
 from ..entry_codec import (
     KIND_BLOB as KIND_BLOB,
 )
@@ -85,3 +87,37 @@ def parse_tree_object(payload: bytes) -> list[Entry]:
 def leaf_to_tree_entry(entry: Entry) -> Entry:
     """Convert a full-path leaf entry into a tree entry (name only)."""
     return replace(entry, path=entry.path.rsplit("/", 1)[-1])
+
+
+def validate_tree_node(payload: bytes) -> None:
+    """Structural validation of a serialized node before it is published.
+
+    A node that fails re-parsing (duplicate names, unsorted names, invalid
+    components) is unrecoverable once a ref points at it, so every write
+    path must run this guard first.  Field-level validation still happens on
+    read via :func:`parse_tree_object`; this check is intentionally cheap
+    (one JSON decode per line, no ``Entry`` construction) because it runs on
+    the commit hot path.
+    """
+    previous_name: str | None = None
+    for raw_line in payload.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            decoded = msgspec.json.decode(line)
+        except (msgspec.DecodeError, ValueError) as error:
+            raise ValueError("Invalid tree node line") from error
+        if not isinstance(decoded, list) or len(decoded) < 3:
+            raise ValueError("Tree node line must be a JSON array of 3+ fields")
+        kind = str(decoded[0])
+        name = str(decoded[1])
+        if kind not in SUPPORTED_KINDS:
+            raise ValueError(f"Unsupported tree entry kind: {kind}")
+        _validate_component_name(name)
+        if previous_name is not None and name <= previous_name:
+            raise ValueError(
+                f"Tree entries must be sorted by name; {name!r} after "
+                f"{previous_name!r}"
+            )
+        previous_name = name

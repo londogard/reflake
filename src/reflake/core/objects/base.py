@@ -101,12 +101,12 @@ class RefCas(Protocol):
     A ref's content *is* its commit id, so the CAS expectation is the
     commit id itself: ``expected_commit_id=None`` means "must not exist"
     (branch creation). Adapters implement the check atomically (local
-    ``fcntl`` lock, S3 conditional ``PutObject``).
+    ``fcntl`` lock, S3 conditional ``PutObject``).  There is deliberately no
+    unconditional ``write_branch_ref`` here: every mutation must go through
+    the compare-and-set so it cannot bypass concurrency safety.
     """
 
     def read_branch_ref(self, branch: str) -> BranchRefState | None: ...
-
-    def write_branch_ref(self, branch: str, commit_id: str | None) -> None: ...
 
     def compare_and_set_branch_ref(
         self,
@@ -137,6 +137,18 @@ class StoreInventory(Protocol):
     def iter_branches(self) -> Iterator[str]: ...
 
     def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]: ...
+
+    def iter_object_ids_with_mtimes(
+        self, kind: RepositoryObjectKind
+    ) -> Iterator[tuple[str, int]]:
+        """Yield ``(object_id, mtime_ns)`` for stored objects of *kind*.
+
+        ``gc --prune`` uses modification times to skip objects younger than
+        its grace window, so a writer that published immutable objects but
+        has not updated its ref yet is never raced. ``0`` means unknown and
+        is treated as young (never pruned).
+        """
+        ...
 
     def delete_objects(
         self, kind: RepositoryObjectKind, object_ids: Iterable[str]

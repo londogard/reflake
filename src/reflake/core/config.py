@@ -27,6 +27,10 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
     #: commit proves the bytes it references (a same-size, same-mtime edit
     #: would go unnoticed). Off by default.
     trust_mtime: bool = False
+    #: ``gc --prune`` never deletes objects younger than this many seconds.
+    #: Protects objects a concurrent writer published between its object
+    #: writes and its ref CAS (mark-and-sweep races with no coordination).
+    gc_grace_seconds: int = 86400
 
     def __post_init__(self) -> None:
         if self.format_version not in SUPPORTED_FORMAT_VERSIONS:

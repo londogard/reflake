@@ -6,8 +6,19 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
 
 ## Unreleased
 
+## [0.3.0] - 2026-09-24
+
 ### Added
 
+- **Invariant fuzz test** (`tests/test_invariants.py`): randomized sequences of
+  commit / staged add / rm / mv / reset / branch / merge with tree sharding
+  forced on; after every step it asserts that every reachable commit and tree
+  parses, is duplicate-free, and references only existing objects. It found
+  the branch-namespace collision fixed below on its first run.
+- **`scripts/profile_gc.py`**: GC benchmark harness (orphan-heavy and
+  reachable-heavy modes, optional tracemalloc live/peak accounting).
+- **Nightly benchmark job** in CI (`schedule` + `workflow_dispatch`, excluded
+  from PR runs); the S3 integration job already runs on every push/PR.
 - **`reflake reset <ref>`** — move a branch pointer to any existing commit or
   ref (undo/redo) with a compare-and-set, without touching the worktree.
   Staged changes survive (with a warning); every move lands in the reflog.
@@ -47,6 +58,22 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
 
 ### Changed
 
+- **The GC sweep is streaming and bounded.** `gc` accepts an `inventory`
+  existence source (`ObjectInventory`, defaulting to the repository store —
+  the seam a future S3 Inventory adapter plugs into), tests membership
+  against the reachable sets *as it lists*, and deletes in ≤1000-key batches
+  on the way through. There is no `dict(stored)`/`set(stored)` copy and no
+  per-subtree leaf-ref memo any more: leaf references are harvested once per
+  unique tree node, so memory is proportional to the reachable sets, not to
+  the store listing or to `files × depth`.
+- Sweeps are idempotent and re-runnable: there is no cursor state to corrupt,
+  and an entry a crashed sweep skipped is found by the next one. Leaking
+  garbage is allowed; deleting live data never is.
+- Local blob shards are snapshotted per directory while listing so deleting
+  during iteration cannot skip siblings; emptied shard directories are
+  removed best-effort.
+- Sync planning (`push`/`pull`) walks the tree DAG once per unique node
+  (shared seen set) instead of re-walking it per commit.
 - **A missing *source* now exits 1 (validation), not 3** — exit 3 is reserved
   for missing repository refs/objects; the runbook and README say so.
 - **Tree nodes are validated before they are written** (sorted, duplicate-free,
@@ -77,6 +104,19 @@ The format is based on Keep a Changelog, and Reflake currently tracks changes be
   shape-change directions now replace correctly, and the new write-time
   validation turns any future occurrence into a loud error before the ref
   moves.
+- **S3 GC could never see blobs or commits.** Empty object ids built listing
+  prefixes through `blob_relpath()`/`""`, producing `blobs/.` and
+  `commits/.json` — prefixes that match nothing. `gc --prune` on S3 silently
+  reported zero blob/commit orphans, and large sync plans treated every
+  existing blob as missing (re-upload attempts that `IfNoneMatch` then
+  discarded). Empty ids now yield clean directory prefixes (`blobs/`,
+  `commits/`, …), with a regression test.
+- **Branch namespace collisions.** Creating `feature` next to `feature/x`
+  crashed with `IsADirectoryError` on local repositories (reading a ref path
+  that is a directory) and was silently permitted on S3, diverging the two
+  backends. Both orders are now rejected up front with a clear `ValueError`,
+  and `read_branch_ref` treats a directory entry as "no such ref" rather than
+  crashing.
 - `S3ObjectStore.write_blob_file`/`write_blob_stream` no longer load whole
   objects into memory (transfer backend `upload` used `Path.read_bytes()`).
 - `ReflakeRepository.log` still lists legacy histories after the generation

@@ -506,8 +506,15 @@ hierarchical branches can never collide with each other on disk.
 than a grace window (`gc_grace_seconds`, default 24h; override with
 `--grace-seconds N`), because a concurrent writer publishes immutable objects
 *before* it CASes its ref: without the window, mark-and-sweep would race that
-window and delete live data. Unknown object ages are treated as young. Run
-`gc` (audit) before pruning in a shared repository, as always.
+window and delete live data. Unknown object ages are treated as young.
+
+The sweep streams the store listing, tests reachability as it goes, and
+deletes in 1000-key batches, so memory stays proportional to the *reachable*
+object set rather than to the store size. The listing comes from a pluggable
+existence source (the seam a future S3 Inventory adapter plugs into). Sweeps
+are idempotent — re-run one instead of resuming it; an entry a crashed sweep
+missed is simply found next time. Run `gc` (audit) before pruning in a shared
+repository, as always.
 
 ## Concurrency Model
 

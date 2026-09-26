@@ -163,7 +163,9 @@ class LocalObjectStore:
 
     def read_branch_ref(self, branch: str) -> BranchRefState | None:
         branch_path = self._branch_path(branch)
-        if not branch_path.exists():
+        # A directory here is a *namespace* entry (some branch below it),
+        # not a ref: report "no such ref" instead of crashing on read_text.
+        if not branch_path.is_file():
             return None
         commit_id = branch_path.read_text(encoding="utf-8").strip() or None
         return BranchRefState(branch=branch, commit_id=commit_id)
@@ -295,20 +297,59 @@ class LocalObjectStore:
     def iter_object_ids_with_mtimes(
         self, kind: RepositoryObjectKind
     ) -> Iterator[tuple[str, int]]:
-        for object_id in self.iter_object_ids(kind):
+        """Yield ``(object_id, mtime_ns)`` for stored objects of *kind*.
+
+        Blob shards are snapshotted before their entries are yielded so a GC
+        sweep may delete objects while iterating without skipping siblings on
+        filesystems whose ``readdir`` is disturbed by concurrent unlinks.
+        (Each shard holds a bounded number of files.)  The flat tree/footer/
+        commit directories are streamed lazily: a skipped entry there is a
+        leftover, never a correctness problem, and the next sweep catches it.
+        """
+
+        def _mtime_ns(path: Path) -> int:
             try:
-                mtime_ns = self._path_for(kind, object_id).stat().st_mtime_ns
+                return path.stat().st_mtime_ns
             except OSError:
-                mtime_ns = 0
-            yield object_id, mtime_ns
+                return 0
+
+        if kind == "blob":
+            if not self.layout.blobs_dir.is_dir():
+                return
+            for shard in sorted(self.layout.blobs_dir.iterdir()):
+                if not shard.is_dir():
+                    continue
+                for path in sorted(shard.iterdir()):
+                    yield shard.name + path.name, _mtime_ns(path)
+        elif kind == "tree":
+            if self.layout.trees_dir.is_dir():
+                for path in self.layout.trees_dir.iterdir():
+                    yield path.name, _mtime_ns(path)
+        elif kind == "footer":
+            if self.layout.footers_dir.is_dir():
+                for path in self.layout.footers_dir.iterdir():
+                    yield path.name, _mtime_ns(path)
+        elif kind == "commit":
+            for path in self.layout.commits_dir.glob("*.json"):
+                yield path.stem, _mtime_ns(path)
 
     def delete_objects(
         self, kind: RepositoryObjectKind, object_ids: Iterable[str]
     ) -> int:
         deleted = 0
+        shard_dirs: set[Path] = set()
         for object_id in object_ids:
-            self._path_for(kind, object_id).unlink(missing_ok=True)
+            path = self._path_for(kind, object_id)
+            path.unlink(missing_ok=True)
+            if kind == "blob":
+                shard_dirs.add(path.parent)
             deleted += 1
+        # Tidy up emptied 2-hex blob shards (best effort; never fatal).
+        for shard_dir in shard_dirs:
+            try:
+                shard_dir.rmdir()
+            except OSError:
+                pass
         return deleted
 
     def object_path(self, kind: RepositoryObjectKind, object_id: str) -> Path:

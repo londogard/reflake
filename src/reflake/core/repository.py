@@ -19,6 +19,7 @@ from .domain import (
     NotARepositoryError,
     RefConflictError,
     RemoveResult,
+    RepositoryObjectKind,
     ResetResult,
     StageChange,
     StageStatus,
@@ -29,6 +30,7 @@ from .layout import initialize_reflake_layout
 from .objects import (
     BlobTransferBackend,
     LocalObjectStore,
+    ObjectInventory,
     RepositoryStore,
     S3ObjectStore,
     build_blob_transfer_backend,
@@ -635,7 +637,11 @@ class ReflakeRepository:
         )
 
     def gc(
-        self, *, dry_run: bool = True, grace_seconds: int | None = None
+        self,
+        *,
+        dry_run: bool = True,
+        grace_seconds: int | None = None,
+        inventory: ObjectInventory | None = None,
     ) -> GcResult:
         """Compute reachable objects from all refs and report (or prune) orphans.
 
@@ -645,6 +651,18 @@ class ReflakeRepository:
         orphans, but never objects younger than the grace window: a concurrent
         writer publishes immutable objects *before* it CASes its ref, so a
         mark-and-sweep that ignored age could delete live data.
+
+        The sweep streams the existence source (*inventory*, defaulting to
+        the repository store) and deletes as it goes, so peak memory is the
+        reachable sets plus one delete batch — never a second copy of the
+        store listing.  ``inventory`` is the pluggable seam: any object with
+        ``iter_object_ids_with_mtimes(kind)`` works (a future S3 Inventory
+        adapter, a test double, a narrower-scope listing).
+
+        Sweeps are idempotent and re-runnable: there is no cursor state to
+        corrupt, and an entry skipped by a crashed sweep is simply found by
+        the next one.  Leaking garbage is always allowed; deleting live data
+        never is.
         """
         from time import time_ns
 
@@ -654,6 +672,8 @@ class ReflakeRepository:
         grace_ns = max(0, int(grace_seconds)) * 1_000_000_000
         now_ns = time_ns()
         young_cutoff = now_ns - grace_ns
+        source: ObjectInventory = inventory if inventory is not None else self.store
+        inspector = self.tree_writer.inspector
 
         reachable_commits: set[str] = set()
         reachable_trees: set[str] = set()
@@ -661,35 +681,41 @@ class ReflakeRepository:
         reachable_footers: set[str] = set()
 
         # Collect the full commit DAG first (all parents — merge commits
-        # have two), then walk each unique tree once. The per-tree memo
-        # keeps GC O(T) instead of O(C·T) on shared subtrees.
+        # have two), then walk each unique tree once. The shared ``seen``
+        # set keeps the mark phase O(C + T) instead of O(C·T) on shared
+        # subtrees, and no per-subtree leaf memo is kept: leaf references
+        # are harvested from each unique tree node in the second pass, so
+        # memory stays proportional to the reachable *sets*, not to
+        # ``files × depth``.
         pending: list[str] = []
         for branch in self.store.iter_branches():
             state = self.store.read_branch_ref(branch)
             if state and state.commit_id:
                 pending.append(state.commit_id)
-        # Shared memos across commits: the tree DAG and each tree's leaf
-        # references are walked once no matter how many commits share them.
         seen_trees: set[str] = set()
-        leaf_refs_memo: dict[str, tuple[tuple[str | None, str | None], ...]] = {}
         while pending:
             commit_id = pending.pop()
             if commit_id in reachable_commits:
                 continue
             reachable_commits.add(commit_id)
             commit = self.refs.read_commit(commit_id)
-            for tree_hash in self.tree_writer.iter_tree_hashes(
+            for tree_hash in inspector.iter_tree_hashes(
                 commit.tree, _seen=seen_trees
             ):
                 reachable_trees.add(tree_hash)
-            for blob_hash, footer_hash in self.tree_writer.iter_leaf_refs(
-                commit.tree, memo=leaf_refs_memo
-            ):
-                if blob_hash:
-                    reachable_blobs.add(blob_hash)
-                if footer_hash:
-                    reachable_footers.add(footer_hash)
             pending.extend(commit.parents)
+
+        for tree_hash in reachable_trees:
+            entries = inspector.load_entries(tree_hash)
+            if entries is None:
+                continue
+            for entry in entries:
+                if entry.is_subtree:
+                    continue
+                if entry.blob_hash:
+                    reachable_blobs.add(entry.blob_hash)
+                if entry.footer:
+                    reachable_footers.add(entry.footer)
 
         counts: dict[str, tuple[int, int]] = {}
         pruned_any = False
@@ -700,21 +726,17 @@ class ReflakeRepository:
             ("blob", reachable_blobs),
             ("footer", reachable_footers),
         ):
-            stored = dict(self.store.iter_object_ids_with_mtimes(kind))
-            orphans = set(stored) - reachable
-            counts[kind] = (len(stored), len(orphans))
-            if dry_run or not orphans:
-                continue
-            # mtime 0 means "unknown": treat as young, never delete.
-            deletable = sorted(
-                object_id
-                for object_id in orphans
-                if stored[object_id] != 0 and stored[object_id] < young_cutoff
+            stored, orphans, skipped, deleted = self._sweep_kind(
+                kind,
+                reachable,
+                source,
+                dry_run=dry_run,
+                young_cutoff=young_cutoff,
             )
-            skipped_young += len(orphans) - len(deletable)
-            if deletable:
+            counts[kind] = (stored, orphans)
+            skipped_young += skipped
+            if deleted:
                 pruned_any = True
-                self.store.delete_objects(kind, deletable)
 
         return GcResult(
             reachable_commits=len(reachable_commits),
@@ -728,6 +750,44 @@ class ReflakeRepository:
             pruned=pruned_any,
             skipped_young=skipped_young,
         )
+
+    #: GC deletes in batches of this size: one S3 ``DeleteObjects`` request
+    #: per batch, and local unlinks are one syscall each either way.
+    _DELETE_BATCH_SIZE = 1000
+
+    def _sweep_kind(
+        self,
+        kind: RepositoryObjectKind,
+        reachable: set[str],
+        inventory: ObjectInventory,
+        *,
+        dry_run: bool,
+        young_cutoff: int,
+    ) -> tuple[int, int, int, int]:
+        """Stream one object kind; returns ``(stored, orphans, young, deleted)``."""
+        stored = 0
+        orphans = 0
+        skipped_young = 0
+        deleted = 0
+        batch: list[str] = []
+        for object_id, mtime_ns in inventory.iter_object_ids_with_mtimes(kind):
+            stored += 1
+            if object_id in reachable:
+                continue
+            orphans += 1
+            # mtime 0 means "unknown": treat as young, never delete.
+            if mtime_ns == 0 or mtime_ns >= young_cutoff:
+                skipped_young += 1
+                continue
+            if dry_run:
+                continue
+            batch.append(object_id)
+            if len(batch) >= self._DELETE_BATCH_SIZE:
+                deleted += self.store.delete_objects(kind, batch)
+                batch.clear()
+        if batch:
+            deleted += self.store.delete_objects(kind, batch)
+        return stored, orphans, skipped_young, deleted
 
     def cat(self, ref: str, path: str) -> bytes:
         entry = self.resolve_entry(ref, path)

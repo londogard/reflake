@@ -9,8 +9,80 @@ from pathlib import Path
 
 import pytest
 
-from reflake.core import create_repository
+from reflake.core import create_repository, open_repository
 from reflake.core.objects.s3 import S3ObjectStore
+
+
+class _RecordingInventory:
+    """Existence source that records which kinds were swept."""
+
+    def __init__(self, store) -> None:
+        self.store = store
+        self.kinds: list[str] = []
+
+    def iter_object_ids_with_mtimes(self, kind):
+        self.kinds.append(kind)
+        yield from self.store.iter_object_ids_with_mtimes(kind)
+
+
+def test_gc_uses_the_pluggable_existence_source(tmp_path: Path) -> None:
+    """The sweep must go through the injected inventory, not the store."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    repo = create_repository(str(repo_dir))
+    (repo_dir / "a.txt").write_text("a")
+    repo.commit("first")
+
+    default = repo.gc(dry_run=True)
+    inventory = _RecordingInventory(repo.store)
+    injected = repo.gc(dry_run=True, inventory=inventory)
+
+    assert sorted(set(inventory.kinds)) == ["blob", "commit", "footer", "tree"]
+    assert injected == default
+
+
+def test_gc_dry_run_reports_young_orphans(tmp_path: Path) -> None:
+    """A dry run reports what the grace window would hold back."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    repo = create_repository(str(repo_dir))
+    (repo_dir / "a.txt").write_text("a")
+    repo.commit("first")
+
+    # A freshly written blob is an orphan younger than the default window.
+    # (Written through the path API so the fake digest need not be real.)
+    orphan = "a" * 64
+    orphan_path = repo.store.blob_path(orphan)  # type: ignore[attr-defined]
+    orphan_path.parent.mkdir(parents=True, exist_ok=True)
+    orphan_path.write_bytes(b"orphan")
+
+    audit = repo.gc(dry_run=True)
+    assert audit.orphan_blobs == 1
+    assert audit.skipped_young == 1
+    assert audit.pruned is False
+
+    # With no window it becomes deletable; the audit then reports no skips.
+    zero_grace = repo.gc(dry_run=True, grace_seconds=0)
+    assert zero_grace.orphan_blobs == 1
+    assert zero_grace.skipped_young == 0
+
+
+def test_gc_prune_batches_deletes_on_s3(fake_s3_installer) -> None:
+    """The streaming sweep issues one DeleteObjects per 1000-key batch."""
+    repo_uri = "s3://demo-bucket/repos/gc-batch"
+    objects = {}
+    for index in range(2500):
+        object_id = f"{index:064x}"
+        objects[f"repos/gc-batch/blobs/{object_id[:2]}/{object_id[2:]}"] = b"x"
+    client = fake_s3_installer(objects)
+
+    repo = open_repository(repo_uri, s3_client=client)
+    result = repo.gc(dry_run=False, grace_seconds=0)
+
+    assert result.orphan_blobs == 2500
+    assert result.pruned is True
+    assert client.delete_calls == [1000, 1000, 500]
+    assert list(repo.store.iter_object_ids("blob")) == []
 
 
 def _commit_file(repo_dir: Path, name: str, content: str, message: str) -> str:

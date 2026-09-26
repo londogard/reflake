@@ -76,27 +76,38 @@ def _missing_ids(
 def _collect_candidates(
     src_repo: ReflakeRepository, commit_ids: list[str]
 ) -> dict[RepositoryObjectKind, set[str]]:
-    """Every object reachable from *commit_ids* (deduplicated, no I/O probes)."""
+    """Every object reachable from *commit_ids* (deduplicated, no I/O probes).
+
+    The commit DAG is walked with one shared ``seen`` set and leaf references
+    are harvested from each unique tree node exactly once, so a 100-commit
+    push over a 1M-entry tree reads the tree DAG once — not once per commit —
+    and keeps no per-subtree memo.
+    """
     candidates: dict[RepositoryObjectKind, set[str]] = {
         "commit": set(),
         "tree": set(),
         "blob": set(),
         "footer": set(),
     }
-    leaf_refs_memo: dict[str, tuple[tuple[str | None, str | None], ...]] = {}
+    inspector = src_repo.tree_writer.inspector
+    seen_trees: set[str] = set()
     for commit_id in commit_ids:
         commit_obj = src_repo.read_commit(commit_id)
-        candidates["tree"].update(
-            src_repo.tree_writer.iter_tree_hashes(commit_obj.tree)
-        )
-        for blob_hash, footer_hash in src_repo.tree_writer.iter_leaf_refs(
-            commit_obj.tree, memo=leaf_refs_memo
-        ):
-            if blob_hash:
-                candidates["blob"].add(blob_hash)
-            if footer_hash:
-                candidates["footer"].add(footer_hash)
+        for tree_hash in inspector.iter_tree_hashes(commit_obj.tree, _seen=seen_trees):
+            candidates["tree"].add(tree_hash)
         candidates["commit"].add(commit_id)
+
+    for tree_hash in candidates["tree"]:
+        entries = inspector.load_entries(tree_hash)
+        if entries is None:
+            continue
+        for entry in entries:
+            if entry.is_subtree:
+                continue
+            if entry.blob_hash:
+                candidates["blob"].add(entry.blob_hash)
+            if entry.footer:
+                candidates["footer"].add(entry.footer)
     return candidates
 
 

@@ -98,10 +98,18 @@ class RefManager:
         raise UnknownRefError(branch_or_commit)
 
     def branch(self, name: str) -> str:
-        """Create a branch at the current head (idempotent over unborn refs)."""
+        """Create a branch at the current head (idempotent over unborn refs).
+
+        Branch names share one namespace: ``feature`` and ``feature/x``
+        cannot coexist (git has the same rule), because a local repository
+        stores refs as files and a name would have to be both a file and a
+        directory.  The check runs on every backend so S3 and local repos
+        behave identically.
+        """
         from ..repository_support import validate_branch_name
 
         name = validate_branch_name(name)
+        self._reject_namespace_conflict(name)
         existing = self.store.read_branch_ref(name)
         if existing is not None and existing.commit_id is not None:
             raise ValueError(f"Branch already exists: {name}")
@@ -119,6 +127,18 @@ class RefManager:
                 commit_id=created_state.commit_id,
             )
         return name
+
+    def _reject_namespace_conflict(self, name: str) -> None:
+        prefix = f"{name}/"
+        for other in self.store.iter_branches():
+            if other == name:
+                continue
+            if other.startswith(prefix) or name.startswith(f"{other}/"):
+                raise ValueError(
+                    f"Branch name '{name}' conflicts with existing branch "
+                    f"'{other}': a branch cannot be both a branch and a "
+                    "directory of branches"
+                )
 
     def delete_branch(self, name: str) -> str:
         """Delete a branch by CAS-ing its ref to unborn (no commits).

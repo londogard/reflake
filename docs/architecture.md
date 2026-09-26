@@ -440,9 +440,42 @@ merge input, so blob bytes and leaf records are never touched.
 ## 11. Retention / GC stance
 
 - No GC by default; immutable objects accumulate by design (document as a feature).
-- Add `reflake gc --dry-run` (audit-only by default): compute reachable objects from all
-  refs (a cheap tree walk now — blobs, trees, footers, commits) and report orphans.
-  `--prune` stays optional and opt-in.
+  `reflake gc` is an audit first; `--prune` is optional and opt-in.
+
+**Mark-and-sweep, and why the sweep must list.** The mark phase needs no listing:
+refs give reachable commits, commits give their trees, trees give every leaf
+reference. "Dangling" is defined as `exists − reachable`, and because objects are
+content-addressed with no indirection (no index, no refcounts, no ownership
+directories), the store listing is the only authority on existence. Git has the
+same property — `fsck`/`repack` scan the whole object database. The two
+legitimate ways to avoid the scan are out of scope for now and documented here:
+
+- a *publication ledger* (incremental GC) — one record per commit of the ids it
+  wrote; it leaks silently when a writer crashes between publishing objects and
+  appending the record, so it can only ever *augment* a periodic full audit;
+- *store-native inventories* (S3 Inventory) — same data, delivered as manifests
+  instead of N LIST requests.
+
+**Safety.** `--prune` never deletes objects younger than `gc_grace_seconds`
+(default 24h, `--grace-seconds` override): a writer publishes immutable objects
+*before* it CASes its ref, so an age window is what makes the sweep safe without
+coordination. Unknown ages count as young. Leaking garbage is always allowed;
+deleting live data never is. Client-local state (staging, reflog, caches) cannot
+participate — which is another reason the window exists.
+
+**Shape.** The sweep streams an existence source (`ObjectInventory`, implemented
+by both stores; the seam an S3 Inventory adapter plugs into), tests membership
+against the reachable sets as it lists, and deletes in ≤1000-key batches on the
+way through. Peak memory is therefore the reachable sets plus one batch — not a
+copy of the listing, and not a per-subtree leaf memo (leaf references are
+harvested once per unique tree node). Sweeps are idempotent: re-run instead of
+resuming, and an entry a crashed sweep skipped is found next time. Local blob
+shards are snapshotted per directory so deleting during iteration cannot skip
+siblings.
+
+Rejected: reference counting (needs atomic increments on shared objects and
+drifts on crashes) and epoch/indirection directories (every read pays a lookup,
+and objects shared across epochs make reclamation harder).
 
 ---
 

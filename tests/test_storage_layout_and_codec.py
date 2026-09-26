@@ -143,6 +143,20 @@ def test_object_relative_key_matches_physical_layout() -> None:
     assert object_relative_key("ref", "main") == "refs/heads/main"
 
 
+def test_empty_object_id_yields_directory_prefix() -> None:
+    """Regression: empty ids must not produce ``blobs/.`` or ``commits/.json``.
+
+    Listings (GC's existence source, sync inventory) build prefixes from an
+    empty object id; the malformed prefixes silently listed nothing, so S3
+    GC could never see blobs or commits.
+    """
+    assert object_relative_key("blob", "") == "blobs/"
+    assert object_relative_key("commit", "") == "commits/"
+    assert object_relative_key("tree", "") == "trees/"
+    assert object_relative_key("footer", "") == "footers/"
+    assert object_relative_key("ref", "") == "refs/heads/"
+
+
 def test_local_store_paths_derive_from_key_space(tmp_path: Path) -> None:
     repo = create_repository(tmp_path)
     commit_id = _make_commit(repo, "x.txt", "base")

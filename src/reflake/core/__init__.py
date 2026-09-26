@@ -40,6 +40,7 @@ from .manifest import FileEntry, walk_files
 from .objects import (
     BlobTransferBackend,
     LocalObjectStore,
+    ObjectInventory,
     ObjectIO,
     ObjectStore,
     RefCas,
@@ -116,6 +117,7 @@ __all__ = [
     "SourceNotFoundError",
     "Entry",
     "ObjectIO",
+    "ObjectInventory",
     "OptimisticLockError",
     "PreconditionFailedError",
     "ObjectStore",

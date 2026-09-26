@@ -438,7 +438,7 @@ integration tests; and a reproducible scale harness committed to the repo
 
 ---
 
-## Appendix — Status vs. this spec (2026-09-19, after the 0.2.1 hardening)
+## Appendix — Status vs. this spec (2026-09-24, after the 0.2.1 hardening)
 
 Shipped and matching: tree model + sharding with locality, content-only commit
 ids, CAS-only refs, worktree-optional CLI, plan-then-batch sync, identity
@@ -446,9 +446,11 @@ audit/promotion, footer capture + pruning *planning*, VFS, reflog/branches, gc
 audit, **write-time tree validation (I11)**, **ignore rules**, **`reset`**,
 **GC grace window**, **multipart streaming blobs**, **metadata-only drift checks
 with source ETags**, **hierarchical branch names + branch deletion**, **full
-`--json` coverage**, and a trimmed package-root export surface.
+`--json` coverage**, a trimmed package-root export surface, **a bounded-memory
+streaming GC with a pluggable existence source**, **an invariant fuzz test**,
+and **nightly benchmark CI** (`scripts/profile_gc.py` for GC numbers).
 
 Still open (tracked in ROADMAP "Now"): pruning has no execution path yet;
 provenance/author fields; tags/releases; `export`; shared repository config;
-a committed reproducible scale harness; the docs split (architecture vs ADRs
-vs roadmap).
+a committed 1M-file commit-path scale harness; the docs split (architecture
+vs ADRs vs roadmap).

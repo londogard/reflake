@@ -73,7 +73,18 @@ def object_relative_key(kind: RepositoryObjectKind, object_id: str) -> str:
 
     Both adapters (local filesystem and S3) derive their physical layout from
     this mapping, so the on-disk and on-bucket key spaces can never drift.
+    An empty ``object_id`` yields the kind's **directory prefix** (used to
+    list a kind), e.g. ``blobs/`` — never ``blobs/.`` or ``commits/.json``.
     """
+    if not object_id:
+        prefixes = {
+            "blob": "blobs/",
+            "tree": "trees/",
+            "footer": "footers/",
+            "commit": "commits/",
+            "ref": "refs/heads/",
+        }
+        return prefixes[kind]
     if kind == "blob":
         return f"blobs/{blob_relpath(object_id).as_posix()}"
     if kind == "commit":

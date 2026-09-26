@@ -37,6 +37,14 @@ class TreeInspector:
 
     # ── GC enumeration ───────────────────────────────────────────────
 
+    def load_entries(self, tree_hash: str) -> list[Entry] | None:
+        """Parsed entries of one tree node; ``None`` when it is unknown.
+
+        Shares the store's content-addressed prefix cache, so walking the
+        same node from GC and from lookups parses it once per process.
+        """
+        return self._walker.load_entries(tree_hash)
+
     def iter_tree_hashes(
         self, root_tree: str, _seen: set[str] | None = None
     ) -> Iterator[str]:

@@ -75,6 +75,26 @@ def test_delete_branch_cas_and_recreate(tmp_path: Path) -> None:
         repo.delete_branch("never-existed")
 
 
+def test_branch_namespace_conflicts_are_rejected(tmp_path: Path) -> None:
+    """A branch cannot also be a directory of branches (git's ref rule).
+
+    Regression: creating both ``feature/x`` and ``feature`` crashed with
+    ``IsADirectoryError`` when the local ref path was a directory (and was
+    silently allowed on S3, making the two backends disagree).
+    """
+    (tmp_path / "a.txt").write_text("a")
+    repo = create_repository(str(tmp_path))
+    repo.commit("first")
+
+    repo.branch("feature/x")
+    with pytest.raises(ValueError, match="conflicts with existing branch"):
+        repo.branch("feature")
+
+    repo.branch("solo")
+    with pytest.raises(ValueError, match="conflicts with existing branch"):
+        repo.branch("solo/nested")
+
+
 def test_cli_branch_json_and_delete(tmp_path: Path, capsys) -> None:
     (tmp_path / "a.txt").write_text("a")
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0

@@ -131,24 +131,33 @@ class TreeQuery(Protocol):
     ) -> Iterator[Entry]: ...
 
 
-class StoreInventory(Protocol):
-    """Enumeration and deletion of stored objects (gc, sync planning)."""
+class ObjectInventory(Protocol):
+    """Existence source for the GC sweep (one method, one job).
 
-    def iter_branches(self) -> Iterator[str]: ...
-
-    def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]: ...
+    The mark phase needs no listing at all — reachability comes from refs —
+    but computing ``stored - reachable`` requires knowing what exists.  This
+    protocol is the seam for that: the repository store implements it today
+    (directory snapshot locally, paginated ``ListObjectsV2`` on S3), and a
+    future S3 Inventory adapter can implement the same method over inventory
+    manifests without touching GC itself.  ``mtime_ns == 0`` means "unknown
+    age" and is treated as young by the grace window.
+    """
 
     def iter_object_ids_with_mtimes(
         self, kind: RepositoryObjectKind
-    ) -> Iterator[tuple[str, int]]:
-        """Yield ``(object_id, mtime_ns)`` for stored objects of *kind*.
+    ) -> Iterator[tuple[str, int]]: ...
 
-        ``gc --prune`` uses modification times to skip objects younger than
-        its grace window, so a writer that published immutable objects but
-        has not updated its ref yet is never raced. ``0`` means unknown and
-        is treated as young (never pruned).
-        """
-        ...
+
+class BranchLister(Protocol):
+    """Enumeration of branch names (namespace checks, gc, listing)."""
+
+    def iter_branches(self) -> Iterator[str]: ...
+
+
+class StoreInventory(ObjectInventory, BranchLister, Protocol):
+    """Enumeration, deletion, and branch listing (gc, sync planning)."""
+
+    def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]: ...
 
     def delete_objects(
         self, kind: RepositoryObjectKind, object_ids: Iterable[str]
@@ -193,8 +202,8 @@ class ObjectStore(
 # ── Narrow compositions: annotate each consumer with what it uses ────
 
 
-class RefObjectStore(ObjectIO, RefCas, Protocol):
-    """Immutable content + branch refs (e.g. ``RefManager``)."""
+class RefObjectStore(ObjectIO, RefCas, BranchLister, Protocol):
+    """Immutable content + branch refs + ref listing (e.g. ``RefManager``)."""
 
 
 class ContentQueryStore(ObjectIO, TreeQuery, Protocol):

@@ -6,8 +6,9 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import head_commit
 
-from reflake import run_cli
+from reflake.cli import run_cli
 from reflake.core import (
     NonFastForwardError,
     RefConflictError,
@@ -36,7 +37,7 @@ def test_push_blobs_and_commits_to_s3(
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "initial"]) == 0
-    commit_id = capsys.readouterr().out.strip()
+    commit_id = head_commit(capsys, tmp_path)
     assert len(commit_id) == 64
 
     repo = create_repository(str(tmp_path))
@@ -99,11 +100,11 @@ def test_push_multiple_commits(
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "c1"]) == 0
-    c1 = capsys.readouterr().out.strip()
+    c1 = head_commit(capsys, tmp_path)
 
     (tmp_path / "f.txt").write_text("v2")
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "c2"]) == 0
-    c2 = capsys.readouterr().out.strip()
+    c2 = head_commit(capsys, tmp_path)
 
     repo = create_repository(str(tmp_path))
     result = push(repo, "s3://demo-bucket/repos/test")
@@ -156,7 +157,7 @@ def test_pull_from_s3(tmp_path: Path, capsys, monkeypatch, fake_s3_installer) ->
     assert pull_json["updated"] is True
 
     # Restore files from the pulled branch and verify content
-    assert run_cli(["--repo", str(repo_b), "restore", "main"]) == 0
+    assert run_cli(["--repo", str(repo_b), "restore"]) == 0
     restore_out = capsys.readouterr().out
     assert "Restored 2 file(s)" in restore_out
     assert (repo_b / "hello.txt").read_text() == "world"

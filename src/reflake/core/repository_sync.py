@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from .repository import ReflakeRepository
 
 
+from .concurrency import map_bounded
 from .domain import (
     FetchResult,
     PullResult,
@@ -67,10 +68,15 @@ def _missing_ids(
             for object_id in object_ids
             if not store.object_exists(kind, object_id)
         }
-    present = set(store.iter_object_ids(kind))
-    return {
-        object_id for object_id in object_ids if object_id not in present
+    # Filter the (streamed) store listing against the candidate set instead of
+    # materializing every stored id: peak memory is the candidates, not the
+    # repository.
+    present = {
+        object_id
+        for object_id in store.iter_object_ids(kind)
+        if object_id in object_ids
     }
+    return {object_id for object_id in object_ids if object_id not in present}
 
 
 def _collect_candidates(
@@ -117,6 +123,7 @@ def _build_plan(
     commit_ids: list[str],
     *,
     direction: TransferDirection,
+    include_blobs: bool = True,
 ) -> TransferPlan:
     """Compute the exact missing-object set for *commit_ids* on the destination.
 
@@ -125,6 +132,8 @@ def _build_plan(
     ``list_objects_v2`` instead of N HEAD requests).
     """
     candidates = _collect_candidates(src_repo, commit_ids)
+    if not include_blobs:
+        candidates["blob"] = set()
     missing = [
         (kind, object_id)
         for kind, object_ids in candidates.items()
@@ -160,8 +169,9 @@ def _copy_item(
     kind, object_id = item.kind, item.object_id
     if direction == "upload":
         if kind == "blob":
-            with open(item.local_path, "rb") as handle:
-                remote_store.write_blob_stream(object_id, handle, if_missing=True)
+            remote_store.write_blob_file(
+                object_id, item.local_path, if_missing=True
+            )
         elif kind == "tree":
             remote_store.write_tree_file(object_id, item.local_path, if_missing=True)
         elif kind == "footer":
@@ -188,9 +198,7 @@ def _copy_item(
         else:
             payload = remote_store.read_commit_bytes(object_id)
             if payload is not None:
-                local_store.write_commit_bytes(
-                    object_id, payload, if_missing=True
-                )
+                local_store.write_commit_bytes(object_id, payload, if_missing=True)
             return
         if payload is None:
             return
@@ -224,15 +232,17 @@ def execute_transfer_plan(
             progress(transferred, len(items))
         return transferred
 
-    for index, item in enumerate(items):
+    def copy(item: TransferItem) -> None:
         _copy_item(
             item,
             local_store=local_store,
             remote_store=remote_store,
             direction=plan.direction,
         )
-        if progress is not None:
-            progress(index + 1, len(items))
+
+    map_bounded(copy, items)
+    if progress is not None:
+        progress(len(items), len(items))
     return len(items)
 
 
@@ -341,6 +351,78 @@ def _verify_pull_fast_forward(
     return True
 
 
+def _push_tag(
+    repo: ReflakeRepository,
+    remote_uri: str,
+    tag: str,
+    commit_id: str,
+    *,
+    blob_transfer: str | None,
+    progress: Callable[[int, int], None] | None,
+) -> PushResult:
+    """Push a tag's commit lineage, then create the remote tag (create-only).
+
+    Tags are immutable: an existing remote tag at the same commit is a no-op,
+    one at a different commit is an error, and the ref is never retargeted.
+    The ref is written last, after its commit and blobs exist remotely.
+    """
+    from .repository import open_repository
+
+    remote_repo = open_repository(
+        remote_uri, worktree=repo.root, blob_transfer=blob_transfer
+    )
+    remote_commit = remote_repo.store.read_tag_ref(tag)
+    if remote_commit is not None:
+        if remote_commit == commit_id:
+            return PushResult(
+                source_branch=tag,
+                remote_uri=remote_uri,
+                pushed_commits=0,
+                pushed_blobs=0,
+                updated=False,
+            )
+        raise ValueError(
+            f"Tag '{tag}' already exists on the remote at {remote_commit}; "
+            "tags are immutable"
+        )
+
+    commits_to_push = _collect_commits_to_push(repo, remote_repo, commit_id)
+    pushed_blobs = 0
+    if commits_to_push:
+        plan = _build_plan(repo, remote_repo, commits_to_push, direction="upload")
+        execute_transfer_plan(
+            plan,
+            local_store=repo.store,
+            remote_store=remote_repo.store,
+            batch_backend=getattr(remote_repo.store, "transfer_backend", None),
+            progress=progress,
+        )
+        pushed_blobs = sum(1 for item in plan.items if item.kind == "blob")
+
+    if not remote_repo.store.create_tag_ref(tag, commit_id):
+        winner = remote_repo.store.read_tag_ref(tag)
+        if winner != commit_id:
+            raise ValueError(
+                f"Tag '{tag}' already exists on the remote at {winner}; "
+                "tags are immutable"
+            )
+        return PushResult(
+            source_branch=tag,
+            remote_uri=remote_uri,
+            pushed_commits=0,
+            pushed_blobs=0,
+            updated=False,
+        )
+
+    return PushResult(
+        source_branch=tag,
+        remote_uri=remote_uri,
+        pushed_commits=len(commits_to_push),
+        pushed_blobs=pushed_blobs,
+        updated=True,
+    )
+
+
 def push(
     repo: ReflakeRepository,
     remote_uri: str,
@@ -363,13 +445,24 @@ def push(
     """
     from .repository import open_repository
 
-    branch = ref or repo.current_branch()
-    if not repo.store.object_exists("ref", branch):
-        raise ValueError(f"Unknown branch: {branch}")
-    branch_state = repo.store.read_branch_ref(branch)
-    if branch_state is None or branch_state.commit_id is None:
-        raise ValueError(f"Branch '{branch}' has no commits to push")
+    name = ref or repo.current_branch()
+    branch_state = repo.store.read_branch_ref(name)
+    if branch_state is None:
+        tag_commit = repo.store.read_tag_ref(name)
+        if tag_commit is None:
+            raise ValueError(f"Unknown ref: {name}")
+        return _push_tag(
+            repo,
+            remote_uri,
+            name,
+            tag_commit,
+            blob_transfer=blob_transfer,
+            progress=progress,
+        )
+    if branch_state.commit_id is None:
+        raise ValueError(f"Branch '{name}' has no commits to push")
 
+    branch = name
     local_commit_id = branch_state.commit_id
 
     # Open remote repo
@@ -443,6 +536,73 @@ def push(
     )
 
 
+def _pull_tag(
+    repo: ReflakeRepository,
+    remote_repo: ReflakeRepository,
+    remote_uri: str,
+    tag: str,
+    commit_id: str,
+    *,
+    progress: Callable[[int, int], None] | None,
+) -> PullResult:
+    """Download a tag's commit lineage, then create the local tag.
+
+    Symmetric with ``_push_tag``: same commit is a no-op, a different commit
+    is an error (tags never move), and the local ref is created only after
+    the objects it points at exist locally.
+    """
+    local_commit = repo.store.read_tag_ref(tag)
+    if local_commit is not None:
+        if local_commit == commit_id:
+            return PullResult(
+                source_branch=tag,
+                remote_uri=remote_uri,
+                pulled_commits=0,
+                pulled_blobs=0,
+                updated=False,
+            )
+        raise ValueError(
+            f"Tag '{tag}' already exists locally at {local_commit}; "
+            "tags are immutable"
+        )
+
+    commits_to_pull = _collect_commits_to_push(remote_repo, repo, commit_id)
+    pulled_blobs = 0
+    if commits_to_pull:
+        plan = _build_plan(remote_repo, repo, commits_to_pull, direction="download")
+        execute_transfer_plan(
+            plan,
+            local_store=repo.store,
+            remote_store=remote_repo.store,
+            batch_backend=getattr(remote_repo.store, "transfer_backend", None),
+            progress=progress,
+        )
+        pulled_blobs = sum(1 for item in plan.items if item.kind == "blob")
+
+    if not repo.store.create_tag_ref(tag, commit_id):
+        winner = repo.store.read_tag_ref(tag)
+        if winner != commit_id:
+            raise ValueError(
+                f"Tag '{tag}' already exists locally at {winner}; "
+                "tags are immutable"
+            )
+        return PullResult(
+            source_branch=tag,
+            remote_uri=remote_uri,
+            pulled_commits=0,
+            pulled_blobs=0,
+            updated=False,
+        )
+
+    return PullResult(
+        source_branch=tag,
+        remote_uri=remote_uri,
+        pulled_commits=len(commits_to_pull),
+        pulled_blobs=pulled_blobs,
+        updated=True,
+    )
+
+
 def pull(
     repo: ReflakeRepository,
     remote_uri: str,
@@ -450,6 +610,7 @@ def pull(
     *,
     blob_transfer: str | None = None,
     progress: Callable[[int, int], None] | None = None,
+    metadata_only: bool = False,
 ) -> PullResult:
     """Pull commits, trees, and blobs from a remote S3 repo to local.
 
@@ -465,15 +626,28 @@ def pull(
     """
     from .repository import open_repository
 
-    branch = ref or repo.current_branch()
+    name = ref or repo.current_branch()
 
     # Open remote repo
     remote_repo = open_repository(
         remote_uri, worktree=repo.root, blob_transfer=blob_transfer
     )
 
+    if remote_repo.store.read_branch_ref(name) is None:
+        tag_commit = remote_repo.store.read_tag_ref(name)
+        if tag_commit is not None:
+            return _pull_tag(
+                repo,
+                remote_repo,
+                remote_uri,
+                name,
+                tag_commit,
+                progress=progress,
+            )
+
     # Resolve remote ref
-    remote_commit_id = remote_repo.resolve_ref(branch)
+    remote_commit_id = remote_repo.resolve_ref(name)
+    branch = name
 
     # ── Pre-check: reject divergent history before copying any objects ──
     # Ensure the local branch exists for the check (CAS: create if absent).
@@ -511,6 +685,7 @@ def pull(
         repo,
         commits_to_pull,
         direction="download",
+        include_blobs=not metadata_only,
     )
     execute_transfer_plan(
         plan,
@@ -540,6 +715,7 @@ def fetch(
     *,
     blob_transfer: str | None = None,
     progress: Callable[[int, int], None] | None = None,
+    metadata_only: bool = False,
 ) -> FetchResult:
     """Fetch objects from a remote S3 repo without updating local branch refs.
 
@@ -564,6 +740,7 @@ def fetch(
         repo,
         commits_to_fetch,
         direction="download",
+        include_blobs=not metadata_only,
     )
     execute_transfer_plan(
         plan,
@@ -577,6 +754,7 @@ def fetch(
     return FetchResult(
         remote_uri=remote_uri,
         branch=branch,
+        commit_id=remote_commit_id,
         fetched_commits=len(commits_to_fetch),
         fetched_blobs=fetched_blobs,
     )

@@ -1,206 +1,212 @@
 name: CI
 
 on:
-    push:
-    pull_request:
-    schedule:
-        # Nightly benchmarks (wall-clock/memory; excluded from PR runs).
-        - cron: "0 6 * * *"
-    workflow_dispatch:
+  push:
+  pull_request:
+  schedule:
+    # Nightly benchmarks (wall-clock/memory; excluded from PR runs).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
 
 concurrency:
-    group: ${{ github.workflow }}-${{ github.ref }}
-    cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-    lint-and-typecheck:
-        runs-on: ubuntu-latest
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
 
-        steps:
-            - name: Check out repository
-              uses: actions/checkout@v4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-            - name: Set up Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.12"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-            - name: Set up uv
-              uses: astral-sh/setup-uv@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
 
-            - name: Install dependencies
-              run: uv sync --group dev
+      - name: Install dependencies
+        run: uv sync --group dev
 
-            - name: Lint with ruff
-              run: uv run ruff check src tests
+      - name: Lint with ruff
+        run: uv run ruff check src tests
 
-            - name: Typecheck with pyrefly
-              run: uv run pyrefly check
+      - name: Typecheck with pyrefly
+        run: uv run pyrefly check
 
-    test-and-build:
-        runs-on: ubuntu-latest
-        strategy:
-            fail-fast: false
-            matrix:
-                python-version: ["3.11", "3.12", "3.13"]
+  test-and-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
 
-        steps:
-            - name: Check out repository
-              uses: actions/checkout@v4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-            - name: Set up Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: ${{ matrix.python-version }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
-            - name: Set up uv
-              uses: astral-sh/setup-uv@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
 
-            - name: Install dependencies
-              run: uv sync --group dev
+      - name: Install dependencies
+        run: uv sync --group dev
 
-            - name: Reject macOS junk files
-              run: |
-                  if git ls-files | grep -E '(^__MACOSX/|(^|/)\.DS_Store$|(^|/)\._)'; then
-                    echo "Remove macOS archive/junk files before merging."
-                    exit 1
-                  fi
+      - name: Reject macOS junk files
+        run: |
+          if git ls-files | grep -E '(^__MACOSX/|(^|/)\.DS_Store$|(^|/)\._)'; then
+            echo "Remove macOS archive/junk files before merging."
+            exit 1
+          fi
 
-            - name: Run non-integration tests
-              run: uv run pytest tests -m "not integration and not benchmark"
+      - name: Run non-integration tests
+        run: uv run pytest tests -m "not integration and not benchmark"
 
-            - name: Smoke-test CLI help
-              run: uv run reflake --help
+      - name: Smoke-test CLI help
+        run: uv run reflake --help
 
-            - name: Build package
-              run: uv build
+      - name: Build package
+        run: uv build
 
-            - name: Clean-tree check
-              run: |
-                  if [ -n "$(git status --porcelain -- . ':!dist')" ]; then
-                    echo "Working tree is dirty after build (ignoring dist/):"
-                    git status
-                    git diff
-                    exit 1
-                  fi
+      - name: Clean-tree check
+        run: |
+          if [ -n "$(git status --porcelain -- . ':!dist')" ]; then
+            echo "Working tree is dirty after build (ignoring dist/):"
+            git status
+            git diff
+            exit 1
+          fi
 
-            - name: Upload wheel artifact
-              uses: actions/upload-artifact@v4
-              with:
-                  name: wheel-py${{ matrix.python-version }}
-                  path: dist/*.whl
-                  if-no-files-found: error
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
 
-    s3-integration:
-        runs-on: ubuntu-latest
+  s3-integration:
+    runs-on: ubuntu-latest
 
-        steps:
-            - name: Check out repository
-              uses: actions/checkout@v4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-            - name: Set up Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.12"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-            - name: Set up uv
-              uses: astral-sh/setup-uv@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
 
-            - name: Install dependencies
-              run: uv sync --group dev
+      - name: Install dependencies
+        run: uv sync --group dev
 
-            - name: Run S3 integration tests against MiniStack
-              run: bash scripts/run_s3_integration.sh
+      - name: Run S3 integration tests against MiniStack
+        run: bash scripts/run_s3_integration.sh
 
-    isolated-install-smoke:
-        needs: [test-and-build]
-        runs-on: ubuntu-latest
+  isolated-install-smoke:
+    needs: [test-and-build]
+    runs-on: ubuntu-latest
 
-        steps:
-            - name: Set up Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.12"
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-            - name: Download wheel artifact
-              uses: actions/download-artifact@v4
-              with:
-                  name: wheel-py3.12
-                  path: dist
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-py3.12
+          path: dist
 
-            - name: Isolated install and smoke
-              run: |
-                  set -euo pipefail
-                  WHEEL=$(ls dist/*.whl | head -1)
-                  python -m venv /tmp/smoke-venv
-                  /tmp/smoke-venv/bin/pip install "$WHEEL"
-                  echo "=== reflake --help ==="
-                  /tmp/smoke-venv/bin/reflake --help
-                  echo "=== reflake --version ==="
-                  /tmp/smoke-venv/bin/reflake --version 2>/dev/null || true
-                  echo "=== basic commit smoke ==="
-                  TMPDIR=$(mktemp -d)
-                  echo "smoke-test-content" > "$TMPDIR/smoke.txt"
-                  /tmp/smoke-venv/bin/reflake --repo "$TMPDIR" init > /dev/null
-                  /tmp/smoke-venv/bin/reflake --repo "$TMPDIR" commit -m "smoke" > /dev/null
-                  echo "Isolated install smoke test passed."
+      - name: Isolated install and smoke
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/*.whl | head -1)
+          python -m venv /tmp/smoke-venv
+          /tmp/smoke-venv/bin/pip install "$WHEEL"
+          echo "=== reflake --help ==="
+          /tmp/smoke-venv/bin/reflake --help
+          echo "=== reflake --version ==="
+          /tmp/smoke-venv/bin/reflake --version 2>/dev/null || true
+          echo "=== basic commit smoke ==="
+          TMPDIR=$(mktemp -d)
+          echo "smoke-test-content" > "$TMPDIR/smoke.txt"
+          /tmp/smoke-venv/bin/reflake --repo "$TMPDIR" init > /dev/null
+          /tmp/smoke-venv/bin/reflake --repo "$TMPDIR" commit -m "smoke" > /dev/null
+          echo "Isolated install smoke test passed."
 
-    release-gate:
-        if: startsWith(github.ref, 'refs/tags/v')
-        needs: [lint-and-typecheck, test-and-build, s3-integration, isolated-install-smoke]
-        runs-on: ubuntu-latest
-        permissions:
-            id-token: write  # OIDC -> PyPI trusted publishing (no API token)
-            contents: read
+  release-gate:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      [
+        lint-and-typecheck,
+        test-and-build,
+        s3-integration,
+        isolated-install-smoke,
+      ]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC -> PyPI trusted publishing (no API token)
+      contents: read
 
-        steps:
-            - name: Check out repository
-              uses: actions/checkout@v4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-            - name: Set up Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.12"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-            - name: Set up uv
-              uses: astral-sh/setup-uv@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
 
-            - name: Verify tag matches package version
-              run: |
-                  set -euo pipefail
-                  TAG_VERSION="${GITHUB_REF_NAME#v}"
-                  PACKAGE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)"
-                  if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
-                    echo "Tag ${GITHUB_REF_NAME} does not match pyproject version ${PACKAGE_VERSION}" >&2
-                    exit 1
-                  fi
-                  echo "Releasing reflake ${PACKAGE_VERSION}"
+      - name: Verify tag matches package version
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)"
+          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match pyproject version ${PACKAGE_VERSION}" >&2
+            exit 1
+          fi
+          echo "Releasing reflake ${PACKAGE_VERSION}"
 
-            - name: Build package
-              run: uv build
+      - name: Build package
+        run: uv build
 
-            - name: Publish to PyPI
-              run: uv publish --publish-url https://upload.pypi.org/legacy/ --check-url https://pypi.org/pypi/reflake/json
+      - name: Publish to PyPI
+        run: uv publish --publish-url https://upload.pypi.org/legacy/ --check-url https://pypi.org/pypi/reflake/json
 
-    benchmarks:
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        runs-on: ubuntu-latest
-        timeout-minutes: 60
+  benchmarks:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
 
-        steps:
-            - name: Check out repository
-              uses: actions/checkout@v4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-            - name: Set up Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.12"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-            - name: Set up uv
-              uses: astral-sh/setup-uv@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
 
-            - name: Install dependencies
-              run: uv sync --group dev
+      - name: Install dependencies
+        run: uv sync --group dev
 
-            - name: Run benchmark suite (wall-clock/memory)
-              run: uv run pytest tests -m benchmark -q
+      - name: Run benchmark suite (wall-clock/memory)
+        run: uv run pytest tests -m benchmark -q

@@ -238,16 +238,12 @@ class TreeInspector:
         shared store.
         """
         if self.client_state is None:
-            raise RuntimeError(
-                "TreeInspector has no client_state for derived exports"
-            )
+            raise RuntimeError("TreeInspector has no client_state for derived exports")
         cache_path = self.client_state.derived_manifest_path(tree_hash)
         if cache_path.exists():
             return cache_path
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(
-            mode="wb", suffix=".jsonl", delete=False
-        ) as temp:
+        with NamedTemporaryFile(mode="wb", suffix=".jsonl", delete=False) as temp:
             temp_path = Path(temp.name)
         try:
             with temp_path.open("wb") as handle:

@@ -24,6 +24,7 @@ from .backends import (
     TransferPlan,
 )
 from .base import (
+    BlobRangeReader,
     ContentQueryStore,
     HasLocalPath,
     HasRemoteURI,
@@ -34,10 +35,18 @@ from .base import (
     RefCas,
     RefObjectStore,
     RepositoryStore,
+    ScanStore,
     StoreInventory,
+    TagRefs,
     TreeQuery,
 )
 from .local import LocalObjectStore
+from .rangefile import (
+    RangeFile,
+    open_local_range_file,
+    open_s3_range_file,
+    open_source_range_file,
+)
 from .s3 import S3ObjectStore
 from .source import (
     _s3_is_404,
@@ -56,6 +65,7 @@ from .transfer import (
 )
 
 __all__ = [
+    "BlobRangeReader",
     "BlobTransferBackend",
     "BranchRefState",
     "ContentQueryStore",
@@ -66,6 +76,7 @@ __all__ = [
     "ObjectInventory",
     "ObjectStore",
     "QueryRefStore",
+    "RangeFile",
     "RefCas",
     "RefObjectStore",
     "RepositoryStore",
@@ -73,8 +84,10 @@ __all__ = [
     "S3ObjectMetadata",
     "S3ObjectStore",
     "S5CmdBlobTransferBackend",
+    "ScanStore",
     "SourceObjectMetadata",
     "StoreInventory",
+    "TagRefs",
     "TransferDirection",
     "TransferItem",
     "TransferPlan",
@@ -83,6 +96,9 @@ __all__ = [
     "build_s3_client",
     "describe_source_uri",
     "iter_s3_objects",
+    "open_local_range_file",
+    "open_s3_range_file",
+    "open_source_range_file",
     "open_source_uri",
     "parse_s3_uri",
     "source_client",

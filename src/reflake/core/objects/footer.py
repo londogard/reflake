@@ -1,10 +1,11 @@
 """Parquet footer capture: compact row-group statistics for pruning.
 
-At ingest, only the file footer is read (``head_object``-style: the last 8
-bytes give the footer length, then the footer itself).  The footer is a
-thrift-compact-encoded ``FileMetaData``; this module decodes just enough of it
-— schema, row groups, and per-column min/max/null statistics — to prune row
-groups without ever reading data pages (docs/architecture.md §4).
+At ingest, the file footer is read through pyarrow's parquet reader — the same
+reader ``query scan`` executes with — and mapped to the compact stats model:
+schema plus per-row-group column min/max/nulls.  ``min_raw``/``max_raw`` keep
+the **physical** values (timestamps stay integers, byte arrays decode as UTF-8
+when possible), so the pruning domain is unchanged: types without a usable
+bound (opaque binary, decimals, INT96) stay ``None`` and never prune.
 
 The result is a small content-addressed JSON stats object stored under
 ``footers/<hash>`` and referenced from ``bp``/``mp`` tree entries.
@@ -13,195 +14,57 @@ The result is a small content-addressed JSON stats object stored under
 from __future__ import annotations
 
 import json
-import struct
 from collections import OrderedDict
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, BinaryIO
+from typing import Any, Protocol
 
+import pyarrow.parquet as pq
 from blake3 import blake3
 
 from .base import ObjectIO
 
-_PARQUET_MAGIC = b"PAR1"
-_MAX_FOOTER_SIZE = 64 * 1024 * 1024
 
-# thrift compact protocol field types (Apache Thrift numbering)
-_BOOL_TRUE = 1
-_BOOL_FALSE = 2
-_BYTE = 3
-_I16 = 4
-_I32 = 5
-_I64 = 6
-_DOUBLE = 7
-_BINARY = 8
-_LIST = 9
-_SET = 10
-_MAP = 11
-_STRUCT = 12
-_UUID = 13
+class SeekableReader(Protocol):
+    """Just enough file surface to read a parquet footer (see ``rangefile``)."""
 
-_PARQUET_TYPES = {
-    0: "BOOLEAN",
-    1: "INT32",
-    2: "INT64",
-    3: "INT96",
-    4: "FLOAT",
-    5: "DOUBLE",
-    6: "BYTE_ARRAY",
-    7: "FIXED_LEN_BYTE_ARRAY",
-}
+    def read(self, size: int | None = -1, /) -> bytes: ...
+
+    def seek(self, offset: int, whence: int = 0, /) -> int: ...
+
+    def tell(self) -> int: ...
 
 
-class _Reader:
-    __slots__ = ("data", "pos")
-
-    def __init__(self, data: bytes) -> None:
-        self.data = data
-        self.pos = 0
-
-    def read_byte(self) -> int:
-        value = self.data[self.pos]
-        self.pos += 1
-        return value
-
-    def read_varint(self) -> int:
-        result = 0
-        shift = 0
-        while True:
-            byte = self.read_byte()
-            result |= (byte & 0x7F) << shift
-            if not byte & 0x80:
-                return result
-            shift += 7
-
-    def read_zigzag(self) -> int:
-        raw = self.read_varint()
-        return (raw >> 1) ^ -(raw & 1)
-
-    def read_binary(self) -> bytes:
-        length = self.read_varint()
-        value = self.data[self.pos : self.pos + length]
-        if len(value) != length:
-            raise ValueError("truncated thrift binary")
-        self.pos += length
-        return value
-
-    def read_double(self) -> float:
-        value = struct.unpack_from("<d", self.data, self.pos)[0]
-        self.pos += 8
-        return value
-
-    def skip(self, field_type: int) -> None:
-        if field_type in (_BOOL_TRUE, _BOOL_FALSE):
-            return
-        if field_type == _BYTE:
-            self.pos += 1
-        elif field_type == _I16:
-            self.read_zigzag()
-        elif field_type == _I32:
-            self.read_zigzag()
-        elif field_type == _I64:
-            self.read_zigzag()
-        elif field_type == _DOUBLE:
-            self.pos += 8
-        elif field_type == _UUID:
-            self.pos += 16
-        elif field_type == _BINARY:
-            self.read_binary()
-        elif field_type in (_LIST, _SET):
-            size_and_type = self.read_byte()
-            size = size_and_type >> 4
-            element_type = size_and_type & 0x0F
-            if size == 15:
-                size = self.read_varint()
-            for _ in range(size):
-                self.skip(element_type)
-        elif field_type == _MAP:
-            size_and_type = self.read_byte()
-            size = size_and_type >> 4
-            if size == 15:
-                size = self.read_varint()
-            for _ in range(size):
-                self.skip(self.read_byte())
-                self.skip(self.read_byte())
-        elif field_type == _STRUCT:
-            while True:
-                header = self.read_byte()
-                if header == 0:
-                    return
-                delta = header >> 4
-                inner_type = header & 0x0F
-                if delta == 15:
-                    self.read_zigzag()
-                self.skip(inner_type)
-        else:
-            raise ValueError(f"unsupported thrift field type {field_type}")
+_NUMERIC_TYPES = frozenset({"INT32", "INT64", "FLOAT", "DOUBLE"})
+_BYTE_TYPES = frozenset({"BYTE_ARRAY", "FIXED_LEN_BYTE_ARRAY"})
 
 
-def _read_fields(
-    reader: _Reader, handlers: dict[int, Callable[[int], None]]
-) -> None:
-    """Read a thrift-compact struct, dispatching fields by id.
+def _decode_stat(value: Any, physical_type: str) -> Any:
+    """Normalize a raw pyarrow statistic to the JSON-safe pruning domain.
 
-    Field ids are delta-encoded relative to the previous field, so a single
-    pass keeps the running field id.  ``handlers`` maps field id → callable
-    taking the field type nibble; unknown fields are skipped by type.
+    pyarrow's ``min``/``max`` convert by logical type (timestamps become
+    datetimes, decimals become Decimals); the ``*_raw`` variants keep the
+    physical value, which is what the stored stats and the pruning contract
+    expect.
     """
-    last_field = 0
-    while True:
-        header = reader.read_byte()
-        delta = header >> 4
-        if delta == 0:
-            return  # struct stop
-        field_type = header & 0x0F
-        if delta == 15:
-            delta = reader.read_zigzag()
-        field_id = last_field + delta
-        last_field = field_id
-        handler = handlers.get(field_id)
-        if handler is not None:
-            handler(field_type)
-        else:
-            reader.skip(field_type)
-
-
-def _read_list_header(reader: _Reader) -> tuple[int, int]:
-    """Read a thrift-compact list header; returns ``(size, element_type)``."""
-    size_and_type = reader.read_byte()
-    size = size_and_type >> 4
-    element_type = size_and_type & 0x0F
-    if size == 15:
-        size = reader.read_varint()
-    return size, element_type
-
-
-def _decode_min_max(raw: bytes | None, column_type: int) -> Any:
-    if raw is None:
+    if value is None:
         return None
-    match column_type:
-        case 0:  # BOOLEAN
-            return bool(raw[0]) if raw else None
-        case 1:  # INT32
-            return struct.unpack("<i", raw[:4])[0] if len(raw) >= 4 else None
-        case 2:  # INT64
-            return struct.unpack("<q", raw[:8])[0] if len(raw) >= 8 else None
-        case 4:  # FLOAT
-            return struct.unpack("<f", raw[:4])[0] if len(raw) >= 4 else None
-        case 5:  # DOUBLE
-            return struct.unpack("<d", raw[:8])[0] if len(raw) >= 8 else None
-        case 6 | 7:  # BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY
+    if physical_type in _BYTE_TYPES:
+        if isinstance(value, bytes):
             try:
-                return raw.decode("utf-8")
+                return value.decode("utf-8")
             except UnicodeDecodeError:
                 # Opaque binary values have no usable bound in the string
                 # domain; returning None keeps pruning conservative.
                 return None
-        case _:
-            # INT96 (deprecated timestamps) and unknown types: no bound.
-            return None
+        return None
+    if physical_type == "BOOLEAN":
+        return bool(value)
+    if physical_type in _NUMERIC_TYPES:
+        return value
+    # INT96 (deprecated timestamps) and unknown types: no bound.
+    return None
 
 
 @dataclass(frozen=True)
@@ -226,237 +89,55 @@ class FooterStats:
     created_by: str | None = None
 
 
-def parse_parquet_footer(source: BinaryIO) -> FooterStats:
-    """Parse the FileMetaData footer of a seekable parquet *source*."""
-    source.seek(0, 2)
-    end = source.tell()
-    if end < 12:
-        raise ValueError("file too small to be parquet")
-    source.seek(end - 8)
-    tail = source.read(8)
-    if tail[4:] != _PARQUET_MAGIC:
-        raise ValueError("missing PAR1 magic — not a parquet file")
-    footer_length = struct.unpack("<I", tail[:4])[0]
-    if (
-        footer_length <= 0
-        or footer_length > _MAX_FOOTER_SIZE
-        or footer_length > end - 8
-    ):
-        raise ValueError(f"invalid parquet footer length {footer_length}")
-    source.seek(end - 8 - footer_length)
-    footer_bytes = source.read(footer_length)
-    if len(footer_bytes) != footer_length:
-        raise ValueError("truncated parquet footer")
-    return _parse_file_metadata(footer_bytes)
+def parse_parquet_footer(source: SeekableReader) -> FooterStats:
+    """Parse the footer of a seekable parquet *source* into compact stats.
 
-
-def _parse_file_metadata(data: bytes) -> FooterStats:
-    reader = _Reader(data)
-    schema_elements: list[dict[str, Any]] = []
-    row_groups: list[RowGroupStats] = []
-    num_rows = 0
-    created_by: str | None = None
-
-    def handle_schema(field_type: int) -> None:
-        if field_type != _LIST:
-            reader.skip(field_type)
-            return
-        size, element_type = _read_list_header(reader)
-        if element_type != _STRUCT:
-            for _ in range(size):
-                reader.skip(element_type)
-            return
-        for _ in range(size):
-            schema_elements.append(_parse_schema_element(reader))
-
-    def handle_rows(field_type: int) -> None:
-        nonlocal num_rows
-        if field_type == _I64:
-            num_rows = reader.read_zigzag()
-        else:
-            reader.skip(field_type)
-
-    def handle_row_groups(field_type: int) -> None:
-        if field_type != _LIST:
-            reader.skip(field_type)
-            return
-        size, element_type = _read_list_header(reader)
-        if element_type != _STRUCT:
-            for _ in range(size):
-                reader.skip(element_type)
-            return
-        for _ in range(size):
-            row_groups.append(_parse_row_group(reader))
-
-    def handle_created_by(field_type: int) -> None:
-        nonlocal created_by
-        if field_type == _BINARY:
-            created_by = reader.read_binary().decode("utf-8", errors="replace")
-        else:
-            reader.skip(field_type)
-
-    _read_fields(
-        reader,
-        {2: handle_schema, 3: handle_rows, 4: handle_row_groups, 6: handle_created_by},
-    )
-
+    Raises ``ValueError`` (pyarrow's ``ArrowInvalid``) when *source* is not a
+    readable parquet file.
+    """
+    parquet_file = pq.ParquetFile(source)
+    metadata = parquet_file.metadata
+    schema_columns = [
+        parquet_file.schema.column(index) for index in range(len(parquet_file.schema))
+    ]
     schema = tuple(
-        {"name": str(element["name"]), "type": str(element.get("type") or "")}
-        for element in schema_elements
-        if element.get("type") is not None
+        {"name": column.path, "type": column.physical_type} for column in schema_columns
     )
     schema_hash = blake3(json.dumps(schema, sort_keys=True).encode("utf-8")).hexdigest()
+
+    row_groups: list[RowGroupStats] = []
+    for index in range(metadata.num_row_groups):
+        row_group = metadata.row_group(index)
+        columns: list[ColumnStats] = []
+        for column_index in range(row_group.num_columns):
+            chunk = row_group.column(column_index)
+            statistics = chunk.statistics
+            minimum: Any = None
+            maximum: Any = None
+            nulls = 0
+            if statistics is not None:
+                if statistics.has_min_max:
+                    minimum = _decode_stat(statistics.min_raw, chunk.physical_type)
+                    maximum = _decode_stat(statistics.max_raw, chunk.physical_type)
+                if statistics.has_null_count and statistics.null_count is not None:
+                    nulls = statistics.null_count
+            columns.append(
+                ColumnStats(
+                    path=schema_columns[column_index].path,
+                    min=minimum,
+                    max=maximum,
+                    nulls=nulls,
+                )
+            )
+        row_groups.append(
+            RowGroupStats(rows=row_group.num_rows, columns=tuple(columns))
+        )
+
     return FooterStats(
         schema_hash=schema_hash,
         schema=schema,
         row_groups=tuple(row_groups),
-        created_by=created_by,
-    )
-
-
-def _parse_schema_element(reader: _Reader) -> dict[str, Any]:
-    element: dict[str, Any] = {}
-
-    def handle_type(field_type: int) -> None:
-        if field_type in (_I32, _I16):
-            element["type"] = _PARQUET_TYPES.get(reader.read_zigzag())
-        else:
-            reader.skip(field_type)
-
-    def handle_name(field_type: int) -> None:
-        if field_type == _BINARY:
-            element["name"] = reader.read_binary().decode("utf-8", errors="replace")
-        else:
-            reader.skip(field_type)
-
-    def handle_num_children(field_type: int) -> None:
-        if field_type in (_I32, _I16):
-            element["num_children"] = reader.read_zigzag()
-        else:
-            reader.skip(field_type)
-
-    _read_fields(reader, {1: handle_type, 4: handle_name, 5: handle_num_children})
-    return element
-
-
-def _parse_row_group(reader: _Reader) -> RowGroupStats:
-    columns: list[ColumnStats] = []
-    num_rows = 0
-
-    def handle_columns(field_type: int) -> None:
-        if field_type != _LIST:
-            reader.skip(field_type)
-            return
-        size, element_type = _read_list_header(reader)
-        if element_type != _STRUCT:
-            for _ in range(size):
-                reader.skip(element_type)
-            return
-        for _ in range(size):
-            columns.append(_parse_column_chunk(reader))
-
-    def handle_rows(field_type: int) -> None:
-        nonlocal num_rows
-        if field_type == _I64:
-            num_rows = reader.read_zigzag()
-        else:
-            reader.skip(field_type)
-
-    _read_fields(reader, {1: handle_columns, 3: handle_rows})
-    return RowGroupStats(rows=num_rows, columns=tuple(columns))
-
-
-def _parse_column_chunk(reader: _Reader) -> ColumnStats:
-    meta: ColumnStats | None = None
-
-    def handle_meta(field_type: int) -> None:
-        nonlocal meta
-        if field_type == _STRUCT:
-            meta = _parse_column_metadata(reader)
-        else:
-            reader.skip(field_type)
-
-    _read_fields(reader, {3: handle_meta})
-    if meta is None:
-        return ColumnStats(path="")
-    return meta
-
-
-def _parse_column_metadata(reader: _Reader) -> ColumnStats:
-    column_type = 0
-    path_parts: list[str] = []
-    min_value: bytes | None = None
-    max_value: bytes | None = None
-    nulls = 0
-
-    def handle_type(field_type: int) -> None:
-        nonlocal column_type
-        if field_type in (_I32, _I16):
-            column_type = reader.read_zigzag()
-        else:
-            reader.skip(field_type)
-
-    def handle_path(field_type: int) -> None:
-        if field_type != _LIST:
-            reader.skip(field_type)
-            return
-        size, element_type = _read_list_header(reader)
-        if element_type != _BINARY:
-            for _ in range(size):
-                reader.skip(element_type)
-            return
-        for _ in range(size):
-            path_parts.append(reader.read_binary().decode("utf-8", errors="replace"))
-
-    def handle_statistics(field_type: int) -> None:
-        nonlocal min_value, max_value, nulls
-        if field_type != _STRUCT:
-            reader.skip(field_type)
-            return
-
-        def stats_field(field_id: int) -> Callable[[int], None]:
-            # Parquet Statistics: field 1 = max, 2 = min (deprecated);
-            # field 5 = max_value, 6 = min_value.
-            def handler(field_type: int) -> None:
-                nonlocal min_value, max_value, nulls
-                if field_type != _BINARY:
-                    reader.skip(field_type)
-                    return
-                raw = reader.read_binary()
-                if field_id in (1, 5):
-                    max_value = raw
-                else:
-                    min_value = raw
-
-            return handler
-
-        def stats_nulls(field_type: int) -> None:
-            nonlocal nulls
-            if field_type == _I64:
-                nulls = reader.read_zigzag()
-            else:
-                reader.skip(field_type)
-
-        _read_fields(
-            reader,
-            {
-                1: stats_field(1),
-                2: stats_field(2),
-                3: stats_nulls,
-                5: stats_field(5),
-                6: stats_field(6),
-            },
-        )
-
-    _read_fields(
-        reader,
-        {1: handle_type, 3: handle_path, 12: handle_statistics},
-    )
-    return ColumnStats(
-        path=".".join(path_parts),
-        min=_decode_min_max(min_value, column_type),
-        max=_decode_min_max(max_value, column_type),
-        nulls=nulls,
+        created_by=metadata.created_by,
     )
 
 
@@ -520,7 +201,7 @@ def parse_footer_stats(payload: str | bytes) -> FooterStats:
     )
 
 
-def capture_footer_stats(store: ObjectIO, source: BinaryIO) -> str | None:
+def capture_footer_stats(store: ObjectIO, source: SeekableReader) -> str | None:
     """Capture a parquet footer from a seekable *source* into the store.
 
     Returns the content hash of the stats object, or ``None`` when *source*
@@ -528,7 +209,7 @@ def capture_footer_stats(store: ObjectIO, source: BinaryIO) -> str | None:
     """
     try:
         stats = parse_parquet_footer(source)
-    except (ValueError, OSError, IndexError, struct.error):
+    except (ValueError, OSError):
         return None
     payload = serialize_footer_stats(stats).encode("utf-8")
     stats_hash = blake3(payload).hexdigest()
@@ -548,7 +229,7 @@ class FooterCache:
     """Client-local cache of footer stats, keyed by content hash.
 
     Footers are content-addressed and immutable, so a cache entry can never
-    be stale — same argument as the tree cache. Repeated ``query prune`` runs
+    be stale — same argument as the tree cache. Repeated ``query scan`` runs
     over a large prefix then cost O(misses) store reads instead of one read
     per file, and never re-parse a footer they have already seen.
     """
@@ -558,9 +239,7 @@ class FooterCache:
         self._memory: OrderedDict[str, FooterStats] = OrderedDict()
         self._maxsize = maxsize
 
-    def get(
-        self, store: ObjectIO, footer_hash: str
-    ) -> FooterStats | None:
+    def get(self, store: ObjectIO, footer_hash: str) -> FooterStats | None:
         """Return parsed stats for *footer_hash*, reading the store on a miss."""
         cached = self._memory.get(footer_hash)
         if cached is not None:

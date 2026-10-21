@@ -17,6 +17,7 @@ class ReflakeLayout:
     staging_dir: Path
     refs_dir: Path
     heads_dir: Path
+    tags_dir: Path
 
     @classmethod
     def initialize(cls, root: str | Path, *, create_dirs: bool = True) -> ReflakeLayout:
@@ -29,6 +30,7 @@ class ReflakeLayout:
         staging_dir = reflake_dir / "staging"
         refs_dir = reflake_dir / "refs"
         heads_dir = refs_dir / "heads"
+        tags_dir = refs_dir / "tags"
 
         if create_dirs:
             for path in (
@@ -39,6 +41,7 @@ class ReflakeLayout:
                 staging_dir,
                 refs_dir,
                 heads_dir,
+                tags_dir,
             ):
                 path.mkdir(parents=True, exist_ok=True)
 
@@ -52,6 +55,7 @@ class ReflakeLayout:
             staging_dir=staging_dir,
             refs_dir=refs_dir,
             heads_dir=heads_dir,
+            tags_dir=tags_dir,
         )
 
 
@@ -68,6 +72,16 @@ def blob_relpath(content_hash: str) -> Path:
     return Path(content_hash[:2]) / content_hash[2:]
 
 
+def ref_relative_key(namespace: str, name: str | None) -> str:
+    """Location of a ref under ``refs/<namespace>/`` (``heads`` or ``tags``).
+
+    ``name=None`` yields the namespace prefix (used to list a namespace).
+    Tags live in their own namespace so a branch and a tag may share a name;
+    resolution order decides which one a bare name refers to.
+    """
+    return f"refs/{namespace}/" + (name or "")
+
+
 def object_relative_key(kind: RepositoryObjectKind, object_id: str) -> str:
     """Single source of truth for an object's location relative to `.reflake/`.
 
@@ -82,7 +96,7 @@ def object_relative_key(kind: RepositoryObjectKind, object_id: str) -> str:
             "tree": "trees/",
             "footer": "footers/",
             "commit": "commits/",
-            "ref": "refs/heads/",
+            "ref": ref_relative_key("heads", None),
         }
         return prefixes[kind]
     if kind == "blob":
@@ -94,5 +108,5 @@ def object_relative_key(kind: RepositoryObjectKind, object_id: str) -> str:
     if kind == "footer":
         return f"footers/{object_id}"
     if kind == "ref":
-        return f"refs/heads/{object_id}"
+        return ref_relative_key("heads", object_id)
     raise ValueError(f"Unsupported object kind: {kind}")

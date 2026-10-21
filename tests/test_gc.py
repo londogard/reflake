@@ -162,18 +162,16 @@ def test_gc_prune_skips_young_s3_orphans(
     from reflake.core.repository import open_repository
 
     client = fake_s3_installer({})
-    repo = open_repository(
-        "s3://demo-bucket/repos/gc-grace", s3_client=client
-    )
+    repo = open_repository("s3://demo-bucket/repos/gc-grace", s3_client=client)
     old_id, young_id = "c" * 64, "d" * 64
     for index, object_id in enumerate((old_id, young_id)):
         repo.store.write_tree_bytes(
             object_id,
             (f'["b","f{index}","' + "a" * 64 + '",1,1]\n').encode(),
         )
-    client._objects[repo.store._key("tree", old_id)]["LastModified"] = datetime(  # noqa: SLF001
+    client._objects[repo.store._key("tree", old_id)]["LastModified"] = datetime(
         2020, 1, 1, tzinfo=UTC
-    )
+    )  # noqa: SLF001
 
     result = repo.gc(dry_run=False, grace_seconds=86400)
 
@@ -194,7 +192,9 @@ def test_s3_deletes_are_batched(
     object_ids = [f"{index:064x}" for index in range(2500)]
     for object_id in object_ids:
         client.put_object(
-            Bucket="demo-bucket", Key=store._key("blob", object_id), Body=b"x"  # noqa: SLF001
+            Bucket="demo-bucket",
+            Key=store._key("blob", object_id),
+            Body=b"x",  # noqa: SLF001
         )
 
     assert store.delete_objects("blob", object_ids) == 2500

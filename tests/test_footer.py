@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from reflake.core.config import LocalConfig
@@ -25,9 +27,19 @@ def _write_parquet(path: Path, rows: int = 1000) -> None:
     )
 
 
+def _write_parquet_pyarrow(path: Path, rows: int = 1000) -> None:
+    table = pa.table(
+        {
+            "id": pa.array(range(rows), pa.int64()),
+            "lbl": [f"v{i}" for i in range(rows)],
+        }
+    )
+    pq.write_table(table, path)
+
+
 def test_parse_parquet_footer_extracts_schema_and_stats(tmp_path: Path) -> None:
     pfile = tmp_path / "data.parquet"
-    _write_parquet(pfile, rows=1000)
+    _write_parquet_pyarrow(pfile, rows=1000)
 
     with pfile.open("rb") as handle:
         stats = parse_parquet_footer(handle)
@@ -46,6 +58,25 @@ def test_parse_parquet_footer_extracts_schema_and_stats(tmp_path: Path) -> None:
     assert by_path["lbl"].min == "v0"
     assert by_path["lbl"].max == "v999"
     assert len(stats.schema_hash) == 64
+
+
+def test_flagless_byte_array_bounds_are_conservative(tmp_path: Path) -> None:
+    """DuckDB omits the exactness flags, so its string bounds must not prune.
+
+    Using unmarked byte-array min/max as exact bounds would be unsound for
+    writers that truncate long strings; only exact bounds are captured.
+    """
+    pfile = tmp_path / "data.parquet"
+    _write_parquet(pfile, rows=1000)
+
+    with pfile.open("rb") as handle:
+        stats = parse_parquet_footer(handle)
+
+    by_path = {column.path: column for column in stats.row_groups[0].columns}
+    assert by_path["id"].min == 0  # numeric bounds are always exact
+    assert by_path["id"].max == 999
+    assert by_path["lbl"].min is None
+    assert by_path["lbl"].max is None
 
 
 def test_parse_rejects_non_parquet(tmp_path: Path) -> None:

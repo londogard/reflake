@@ -117,9 +117,7 @@ class S5CmdBlobTransferBackend:
         if plan.direction == "upload":
             for item in plan.items:
                 _require_batch_safe(item.local_path, item.remote_uri)
-                lines.append(
-                    f"cp --if-not-exists {item.local_path} {item.remote_uri}"
-                )
+                lines.append(f"cp --if-not-exists {item.local_path} {item.remote_uri}")
         else:
             for item in plan.items:
                 _require_batch_safe(item.remote_uri, item.local_path)

@@ -1,6 +1,6 @@
 [project]
 name = "reflake"
-version = "0.3.0"
+version = "0.5.0"
 description = "A client-first, object-storage-first data versioning engine"
 readme = "README.md"
 authors = [{ name = "Hampus Londögård", email = "hampus.londogard@gmail.com" }]
@@ -31,6 +31,7 @@ dependencies = [
     "duckdb>=1.4.4",
     "fsspec>=2026.2.0",
     "msgspec>=0.19.0",
+    "pyarrow>=25.0.1",
     "simple-parsing>=0.1.7",
 ]
 

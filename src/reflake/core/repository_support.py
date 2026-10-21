@@ -13,9 +13,21 @@ from .entry_codec import Entry
 CommitReader = Callable[[str], CommitObject]
 
 
-def metadata_identity(relative_path: str, size: int) -> str:
-    payload = f"{relative_path}\n{size}".encode()
-    return blake3(payload).hexdigest()
+def pointer_identity(*, size: int, marker: str | None) -> str:
+    """Revision identity for a pointer (unverifiable) entry.
+
+    A pointer entry makes no claim about bytes; it claims "this source object
+    *version*". So the identity is a hash of the source's version marker
+    (S3 ETag, or a local file's mtime) plus its size — and **not** of the
+    repository path, so moving a pointer keeps its identity while re-importing
+    a modified source produces a new one.
+
+    Because the marker is stored on the entry (``source_etag``), drift is
+    detectable by recomputing the same hash from the source's current
+    metadata: no source bytes are read.
+    """
+    body = f"{marker or 'size'}\n{size}"
+    return blake3(body.encode()).hexdigest()
 
 
 def is_ancestor_commit(
@@ -37,9 +49,7 @@ def is_ancestor_commit(
         return True
     generations = _GenerationProvider(read_commit)
     ancestor_commit = read_commit(ancestor)
-    target_generation = (
-        generations.of(ancestor) if ancestor_commit is not None else -1
-    )
+    target_generation = generations.of(ancestor) if ancestor_commit is not None else -1
     seen = {descendant}
     stack = [descendant]
     while stack:
@@ -67,9 +77,7 @@ class _GenerationProvider:
     a root is 0 and every child is ``1 + max(parent generations)``.
     """
 
-    def __init__(
-        self, read_commit: Callable[[str], CommitObject | None]
-    ) -> None:
+    def __init__(self, read_commit: Callable[[str], CommitObject | None]) -> None:
         self._read = read_commit
         self._memo: dict[str, int] = {}
 
@@ -135,26 +143,42 @@ def normalize_repository_path(path: str) -> str:
 
 def validate_branch_name(name: str) -> str:
     """Validate a branch name, allowing hierarchical ``feature/x`` names."""
+    return _validate_ref_name(name, label="Branch")
+
+
+def validate_tag_name(name: str) -> str:
+    """Validate a tag name, allowing hierarchical ``release/v1`` names."""
+    return _validate_ref_name(name, label="Tag")
+
+
+def _validate_ref_name(name: str, *, label: str) -> str:
     value = name.strip()
     _validate_no_binary(value)
     if not value:
-        raise ValueError("Branch name cannot be empty")
+        raise ValueError(f"{label} name cannot be empty")
     if value.startswith("/") or value.endswith("/"):
-        raise ValueError("Branch name cannot start or end with '/'")
+        raise ValueError(f"{label} name cannot start or end with '/'")
     parts = value.split("/")
     if any(part in ("", ".", "..") for part in parts):
-        raise ValueError("Branch name contains an invalid path segment")
+        raise ValueError(f"{label} name contains an invalid path segment")
     if ".." in value:
-        raise ValueError("Branch name cannot contain consecutive dots")
+        raise ValueError(f"{label} name cannot contain consecutive dots")
     if any(part.startswith(".") for part in parts):
-        raise ValueError("Branch name segments cannot start with '.'")
+        raise ValueError(f"{label} name segments cannot start with '.'")
     if any(part.startswith("-") for part in parts):
-        raise ValueError("Branch name segments cannot start with '-'")
+        raise ValueError(f"{label} name segments cannot start with '-'")
     forbidden = set('\\:*?"<>|')
     if any(char in forbidden for char in value):
-        raise ValueError("Branch name contains an invalid character")
+        raise ValueError(f"{label} name contains an invalid character")
     if value.endswith(".lock"):
-        raise ValueError("Branch name cannot end with '.lock'")
+        raise ValueError(f"{label} name cannot end with '.lock'")
+    # Local repositories store refs as files, so a name longer than the
+    # filesystem's NAME_MAX surfaces as a raw OSError. Reject it up front, on
+    # every backend, so S3 and local behave identically.
+    if len(value.encode()) > 200:
+        raise ValueError(
+            f"{label} name is too long ({len(value.encode())} bytes; max 200)"
+        )
     return value
 
 
@@ -201,10 +225,6 @@ def normalize_logical_paths(paths: list[str]) -> list[str]:
     return normalized
 
 
-def matches_logical_path(entry_path: str, logical_path: str) -> bool:
-    return entry_path == logical_path or entry_path.startswith(f"{logical_path}/")
-
-
 def move_logical_path(
     entry_path: str,
     *,
@@ -222,7 +242,10 @@ def relocate_manifest_entry(
     destination_path: str,
 ) -> Entry:
     if entry.identity_mode == "pointer":
-        identity_value = metadata_identity(destination_path, entry.size)
+        identity_value = pointer_identity(
+            size=entry.size,
+            marker=entry.source_etag,
+        )
         return replace(entry, path=destination_path, hash=identity_value)
     return replace(entry, path=destination_path)
 

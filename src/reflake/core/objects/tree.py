@@ -10,11 +10,14 @@ Line shapes (name is a single path component):
 
     ["t", name, hash]                              # real subdirectory
     ["s", name, hash]                              # name-range shard of this directory
-    ["b", name, hash, size, mtime_ns]              # blob-backed file
-    ["m", name, hash, size, mtime_ns, source_uri]  # source pointer (unverifiable)
-    ["bp", name, hash, size, mtime_ns, footer]     # parquet, blob-backed, footer stats
-    ["mp", name, hash, size, mtime_ns, source_uri, footer]
-    # parquet, source, footer stats
+    ["b", name, hash, size]                        # blob-backed file
+    ["m", name, hash, size, source_uri]            # source pointer (unverifiable)
+    ["bp", name, hash, size, footer]               # parquet, blob-backed, footer stats
+    ["mp", name, hash, size, source_uri, footer]   # parquet, source, footer stats
+
+Entries carry no worktree metadata (mtime, inode, owner): a node's hash is a
+function of content identity and source identity only, so the same bytes
+produce the same tree on every machine.
 
 Entries are ``entry_codec.Entry`` (the single record type); this module only
 adds the tree-object container operations.
@@ -52,8 +55,11 @@ from ..entry_codec import (
 from ..entry_codec import Entry
 
 #: A tree object holds at most this many direct entries before it is split
-#: into name-range shard subtrees (≈1 MB at ~100 bytes/line).
-MAX_TREE_ENTRIES = 10_000
+#: into name-range shard subtrees (~230 KB at ~115 bytes/line). Small nodes
+#: keep every cold lookup cheap: a path resolution fetches at most
+#: ``depth x 230 KB`` and a prefix listing touches one shard range instead of
+#: a megabyte-wide node.
+MAX_TREE_ENTRIES = 2_048
 
 
 def _validate_component_name(name: str) -> None:

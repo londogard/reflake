@@ -49,7 +49,8 @@ from ..objects.tree import (
     leaf_to_tree_entry,
     validate_tree_node,
 )
-from ..repository_support import metadata_identity
+from ..repository_support import pointer_identity
+from ..stat_cache import StatCache
 from .refs import RefManager
 from .tree_inspect import TreeInspector
 
@@ -96,14 +97,13 @@ def _leaf_line(
     name: str,
     hash_value: str,
     size: int,
-    mtime_ns: int,
     source_uri: str | None,
     footer: str | None,
 ) -> str:
     # Hot path (once per committed file): inputs are producer-guaranteed
     # (digest output, stat values, walk names, closed kind branch), so
     # serialize directly without building a validated Entry.
-    return encode_leaf_parts(kind, name, hash_value, size, mtime_ns, source_uri, footer)
+    return encode_leaf_parts(kind, name, hash_value, size, source_uri, footer)
 
 
 def _subtree_line(kind: str, name: str, hash_value: str) -> str:
@@ -121,12 +121,12 @@ class TreeWriter:
         store: ObjectIO,
         refs: RefManager,
         client_state: LocalClientState | None = None,
-        trust_mtime: bool = False,
+        stat_cache: StatCache | None = None,
     ) -> None:
         self.store = store
         self.refs = refs
         self.client_state = client_state
-        self.trust_mtime = trust_mtime
+        self.stat_cache = stat_cache
         # Share the store's content-addressed prefix cache: the same tree
         # object must never be parsed and held twice per process.
         tree_cache = getattr(store, "tree_cache", None)
@@ -310,9 +310,7 @@ class TreeWriter:
                     known.add(node_hash)
                     raw = self._walker.load_entries(node_hash)
                     if raw is not None:
-                        known.update(
-                            entry.hash for entry in raw if entry.is_subtree
-                        )
+                        known.update(entry.hash for entry in raw if entry.is_subtree)
                     for entry in entries:
                         merged[entry.path] = entry
             additions = additions_by_dir.pop(dir_path, None)
@@ -347,17 +345,14 @@ class TreeWriter:
             else:
                 children = root_children
                 parent_by_name = root_parent
-            digests = self._prefetch_digests(
-                files,
-                parent_by_name=parent_by_name,
-                identity_mode=identity_mode,
+            digests = (
+                self._materialize_blobs(files) if identity_mode == "content" else {}
             )
             for file_entry in files:
                 children.append(
                     self._materialize_worktree_file(
                         file_entry=file_entry,
                         name=file_entry.relative_path.rsplit("/", 1)[-1],
-                        full_path=file_entry.relative_path,
                         parent_by_name=parent_by_name,
                         identity_mode=identity_mode,
                         capture_footers=capture_footers,
@@ -398,61 +393,73 @@ class TreeWriter:
             )
         return self._write_tree_bytes(b""), leftover_addition_dirs
 
-    def _prefetch_digests(
-        self,
-        files: list[FileEntry],
-        *,
-        parent_by_name: dict[str, Entry] | None,
-        identity_mode: str,
+    def _materialize_blobs(
+        self, files: list[FileEntry]
     ) -> dict[Path, str]:
-        """Hash the files that cannot be reused, in parallel.
+        """Store every file's content once and return ``path -> digest``.
 
-        Only content-mode files that actually need a digest are hashed: files
-        matched by size+mtime when ``trust_mtime`` is enabled are reused
-        without reading their bytes at all.
+        Files whose ``(size, mtime_ns)`` match the client stat cache reuse the
+        recorded digest (the store still confirms the blob exists); the rest
+        are read **once** by ``materialize_blob_file`` — hashing and copying
+        in the same pass — with up to ``_HASH_WORKERS`` files in flight
+        (blake3 and the file I/O both release the GIL).
+
+        The previous shape hashed every file in parallel and then read it
+        again, single-threaded, to copy it into the store: 76 % of a local
+        commit's wall time, and a 1.7x CPU multiplier on every byte.
         """
-        if identity_mode != "content":
-            return {}
-        candidates: list[Path] = []
+        resolved: dict[Path, str] = {}
+        pending: list[FileEntry] = []
         for file_entry in files:
-            name = file_entry.relative_path.rsplit("/", 1)[-1]
-            parent_entry = parent_by_name.get(name) if parent_by_name else None
-            if self._can_reuse_without_hash(parent_entry, file_entry):
-                continue
-            candidates.append(file_entry.path)
-        if not candidates:
-            return {}
-        if len(candidates) < 2 or _HASH_WORKERS < 2:
-            return {path: blake3_digest_file(path) for path in candidates}
-        with ThreadPoolExecutor(
-            max_workers=min(_HASH_WORKERS, len(candidates))
-        ) as pool:
-            return {
-                path: digest
-                for path, digest in zip(
-                    candidates, pool.map(blake3_digest_file, candidates), strict=True
+            cached = (
+                self.stat_cache.lookup(
+                    file_entry.relative_path,
+                    size=file_entry.size,
+                    mtime_ns=file_entry.mtime_ns,
                 )
-            }
+                if self.stat_cache is not None
+                else None
+            )
+            if cached is not None:
+                resolved[file_entry.path] = self.store.materialize_blob_file(
+                    file_entry.path, known_digest=cached
+                )
+            else:
+                pending.append(file_entry)
 
-    def _can_reuse_without_hash(
-        self, parent_entry: Entry | None, file_entry: FileEntry
-    ) -> bool:
-        """True when a content entry can be reused from size+mtime alone."""
-        return (
-            self.trust_mtime
-            and parent_entry is not None
-            and not parent_entry.is_subtree
-            and parent_entry.kind in {KIND_BLOB, KIND_BP}
-            and parent_entry.size == file_entry.size
-            and parent_entry.mtime_ns == file_entry.mtime_ns
-        )
+        if not pending:
+
+            return resolved
+
+        def store(file_entry: FileEntry) -> tuple[Path, str]:
+            return file_entry.path, self.store.materialize_blob_file(file_entry.path)
+
+        if len(pending) < 2 or _HASH_WORKERS < 2:
+            stored = [store(file_entry) for file_entry in pending]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(_HASH_WORKERS, len(pending))
+            ) as pool:
+                stored = list(pool.map(store, pending))
+
+        by_path = {file_entry.path: file_entry for file_entry in pending}
+        for path, digest in stored:
+            resolved[path] = digest
+            file_entry = by_path[path]
+            if self.stat_cache is not None:
+                self.stat_cache.record(
+                    file_entry.relative_path,
+                    size=file_entry.size,
+                    mtime_ns=file_entry.mtime_ns,
+                    digest=digest,
+                )
+        return resolved
 
     def _materialize_worktree_file(
         self,
         *,
         file_entry: FileEntry,
         name: str,
-        full_path: str,
         parent_by_name: dict[str, Entry] | None,
         identity_mode: str,
         capture_footers: bool,
@@ -462,15 +469,9 @@ class TreeWriter:
         if parent_entry is not None and not parent_entry.is_subtree:
             if identity_mode == "content":
                 if parent_entry.kind in {KIND_BLOB, KIND_BP} and (
-                    self._can_reuse_without_hash(parent_entry, file_entry)
-                    or (
-                        parent_entry.size == file_entry.size
-                        and (
-                            prefetched_digest
-                            or blake3_digest_file(file_entry.path)
-                        )
-                        == parent_entry.hash
-                    )
+                    parent_entry.size == file_entry.size
+                    and (prefetched_digest or blake3_digest_file(file_entry.path))
+                    == parent_entry.hash
                 ):
                     return self._reuse_or_backfill_footer(
                         parent_entry=parent_entry,
@@ -479,40 +480,44 @@ class TreeWriter:
                         source_uri=None,
                         capture_footers=capture_footers,
                     )
-            elif (
-                parent_entry.kind in {KIND_META, KIND_MP}
-                and metadata_identity(full_path, file_entry.size) == parent_entry.hash
-            ):
-                return self._reuse_or_backfill_footer(
-                    parent_entry=parent_entry,
-                    name=name,
-                    source_path=file_entry.path,
-                    source_uri=file_entry.path.as_uri(),
-                    capture_footers=capture_footers,
+            elif parent_entry.kind in {KIND_META, KIND_MP}:
+                identity = pointer_identity(
+                    size=file_entry.size,
+                    marker=f"mtime:{file_entry.mtime_ns}",
                 )
+                if identity == parent_entry.hash:
+                    return self._reuse_or_backfill_footer(
+                        parent_entry=parent_entry,
+                        name=name,
+                        source_path=file_entry.path,
+                        source_uri=file_entry.path.as_uri(),
+                        capture_footers=capture_footers,
+                    )
 
         if identity_mode == "content":
-            identity_value = prefetched_digest or blake3_digest_file(file_entry.path)
-            self.store.write_blob_file(identity_value, file_entry.path, if_missing=True)
+            identity_value = prefetched_digest or self.store.materialize_blob_file(
+                file_entry.path
+            )
             footer = self._capture_footer(file_entry.path, capture_footers)
             line = _leaf_line(
                 KIND_BP if footer else KIND_BLOB,
                 name,
                 identity_value,
                 file_entry.size,
-                file_entry.mtime_ns,
                 None,
                 footer,
             )
         else:
-            identity_value = metadata_identity(full_path, file_entry.size)
+            identity_value = pointer_identity(
+                size=file_entry.size,
+                marker=f"mtime:{file_entry.mtime_ns}",
+            )
             footer = self._capture_footer(file_entry.path, capture_footers)
             line = _leaf_line(
                 KIND_MP if footer else KIND_META,
                 name,
                 identity_value,
                 file_entry.size,
-                file_entry.mtime_ns,
                 file_entry.path.as_uri(),
                 footer,
             )
@@ -539,7 +544,6 @@ class TreeWriter:
             name,
             parent_entry.hash,
             parent_entry.size,
-            parent_entry.mtime_ns,
             source_uri,
             footer,
         )
@@ -638,9 +642,7 @@ class TreeWriter:
                         )
                         continue
                     upper = (
-                        entries[index + 1].path
-                        if index + 1 < len(entries)
-                        else None
+                        entries[index + 1].path if index + 1 < len(entries) else None
                     )
                     touched = any(
                         (upper is None or low < upper) and high > shard.path
@@ -768,9 +770,7 @@ class TreeWriter:
         return merged, conflicts
 
     def _children_by_name(self, tree_hash: str) -> dict[str, Entry]:
-        return {
-            entry.path: entry for entry in self._walker.load_children(tree_hash)
-        }
+        return {entry.path: entry for entry in self._walker.load_children(tree_hash)}
 
     def _merge_directory(
         self,
@@ -925,14 +925,19 @@ class TreeWriter:
         """Merge one named child (leaf or subtree); ``None`` means removed."""
 
         def equal(left: Entry | None, right: Entry | None) -> bool:
+            if left is None or right is None:
+                return left is None and right is None
             return (
-                left is not None
-                and right is not None
-                and left.kind == right.kind
+                left.kind == right.kind
                 and left.hash == right.hash
                 and left.size == right.size
             )
 
+        # Deleting the same path on both sides is not a conflict: the union
+        # of both sides simply does not contain it. (This used to fall through
+        # to the "present on one side" branch and trip an assertion.)
+        if ours is None and theirs is None:
+            return None
         if equal(ours, theirs):
             return ours
         if ours is None or theirs is None:
@@ -954,9 +959,7 @@ class TreeWriter:
         if ours.is_subtree and theirs.is_subtree:
             merged_hash = self._merge_directory(
                 dir_path=path,
-                base_hash=(
-                    base.hash if base is not None and base.is_subtree else None
-                ),
+                base_hash=(base.hash if base is not None and base.is_subtree else None),
                 ours_hash=ours.hash,
                 theirs_hash=theirs.hash,
                 conflicts=conflicts,
@@ -1438,10 +1441,7 @@ class TreeWriter:
         generation = 0
         if parents:
             generation = (
-                max(
-                    self.refs.generation_of(parent_id) for parent_id in parents
-                )
-                + 1
+                max(self.refs.generation_of(parent_id) for parent_id in parents) + 1
             )
         created_at = datetime.now(UTC).isoformat()
         # The commit id hashes only content (not timestamp or generation), so
@@ -1538,7 +1538,9 @@ def _close_frame(
     # If the rebuilt node (or any of its shard bodies) is byte-identical to a
     # parent object, skip the write (avoids doomed conditional PUTs per
     # unchanged directory on S3).
-    subtree_hash = writer._build_children(merged, skip_hashes=known_hashes)  # noqa: SLF001
+    subtree_hash = writer._build_children(
+        merged, skip_hashes=known_hashes
+    )  # noqa: SLF001
     name = dir_path.rsplit("/", 1)[-1]
     line = _subtree_line(KIND_TREE, name, subtree_hash)
     if stack:

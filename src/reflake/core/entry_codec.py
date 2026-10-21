@@ -3,15 +3,20 @@
 Every content leaf in a manifest line or tree line is a positional JSON array
 tagged by kind:
 
-    ["b",  name, hash, size, mtime_ns]
-    ["m",  name, hash, size, mtime_ns, source_uri]
-    ["bp", name, hash, size, mtime_ns, footer]
-    ["mp", name, hash, size, mtime_ns, source_uri, footer]
+    ["b",  name, hash, size]
+    ["m",  name, hash, size, source_uri]
+    ["bp", name, hash, size, footer]
+    ["mp", name, hash, size, source_uri, footer]
 
 ``m``/``mp`` entries may carry one trailing field, the source object's
 ETag/version marker (``source_etag``).  It is optional so local-file sources
 (which have none) keep their short shape, and it is what makes
 ``identity verify --drift`` possible without reading source bytes.
+
+Entries are canonical: the serialized form contains **only** content identity
+and source metadata. Worktree facts such as mtime live in the client-local
+stat cache, never in an object, so identical content produces identical tree
+hashes on every machine (and re-committing the same bytes is a no-op).
 
 Subtree pointers (tree nodes only) are short lines:
 
@@ -47,10 +52,10 @@ SUBTREE_KINDS = frozenset({KIND_TREE, KIND_SHARD})
 SUPPORTED_KINDS = frozenset({KIND_TREE, KIND_SHARD, *LEAF_KINDS})
 
 _ARITY_BY_KIND = {
-    KIND_BLOB: (5, 5),
-    KIND_META: (6, 7),
-    KIND_BP: (6, 6),
-    KIND_MP: (7, 8),
+    KIND_BLOB: (4, 4),
+    KIND_META: (5, 6),
+    KIND_BP: (5, 5),
+    KIND_MP: (6, 7),
 }
 
 # Compiled once: strict lowercase-hex check at C speed (~4x faster than a
@@ -83,6 +88,15 @@ def _validate_entry_path(path: str) -> None:
             raise ValueError("Entry path must be a normalized relative path")
 
 
+def matches_logical_path(entry_path: str, logical_path: str) -> bool:
+    """Component-aware match: ``a/b`` matches ``a/b`` and ``a/b/c`` only.
+
+    The single prefix rule shared by repository operations, the tree-walk
+    listings, and staged overlays, so it cannot drift between them.
+    """
+    return entry_path == logical_path or entry_path.startswith(f"{logical_path}/")
+
+
 @dataclass(frozen=True)
 class Entry:
     """One addressable node: subtree pointer or content leaf.
@@ -96,7 +110,6 @@ class Entry:
     kind: str
     hash: str
     size: int = 0
-    mtime_ns: int = 0
     source_uri: str | None = None
     footer: str | None = None
     #: Source object's ETag/version marker for pointer entries (optional;
@@ -111,16 +124,8 @@ class Entry:
             raise ValueError("Entry hash must be a 64-character hex digest")
         if self.size < 0:
             raise ValueError("Entry size cannot be negative")
-        if self.mtime_ns < 0:
-            raise ValueError("Entry mtime_ns cannot be negative")
         if self.kind in SUBTREE_KINDS:
-            if (
-                self.size
-                or self.mtime_ns
-                or self.source_uri
-                or self.footer
-                or self.source_etag
-            ):
+            if self.size or self.source_uri or self.footer or self.source_etag:
                 raise ValueError("Subtree entries only carry a path and hash")
             return
         validate_leaf(
@@ -130,9 +135,7 @@ class Entry:
             source_etag=self.source_etag,
         )
         if self.footer is not None and not _is_hex_digest(self.footer):
-            raise ValueError(
-                "Parquet entries must carry a footer hash (64 hex chars)"
-            )
+            raise ValueError("Parquet entries must carry a footer hash (64 hex chars)")
         if self.source_uri is not None and not self.source_uri.strip():
             raise ValueError("Entry source_uri cannot be empty")
 
@@ -172,9 +175,9 @@ class Entry:
 
     def serialize(self) -> str:
         if self.kind in SUBTREE_KINDS:
-            return msgspec.json.encode(
-                [self.kind, self.path, self.hash]
-            ).decode("utf-8")
+            return msgspec.json.encode([self.kind, self.path, self.hash]).decode(
+                "utf-8"
+            )
         return encode_leaf(self)
 
     @staticmethod
@@ -193,9 +196,7 @@ class Entry:
             try:
                 name, hash_value = str(payload[1]), str(payload[2])
             except IndexError as error:
-                raise ValueError(
-                    "Entry payload is missing required fields"
-                ) from error
+                raise ValueError("Entry payload is missing required fields") from error
             return Entry(path=name, kind=kind, hash=hash_value)
         return _entry_from_leaf_payload(payload)
 
@@ -204,7 +205,6 @@ class Entry:
         path: str,
         hash_value: str,
         size: int,
-        mtime_ns: int,
         identity_mode: str,
         *,
         source_uri: str | None = None,
@@ -217,7 +217,6 @@ class Entry:
             kind=leaf_kind_for(identity_mode, has_footer=footer is not None),
             hash=hash_value,
             size=size,
-            mtime_ns=mtime_ns,
             source_uri=source_uri,
             footer=footer,
             source_etag=source_etag,
@@ -267,7 +266,6 @@ def encode_leaf(record: Entry) -> str:
         record.path,
         record.hash,
         record.size,
-        record.mtime_ns,
         record.source_uri,
         record.footer,
         record.source_etag,
@@ -279,7 +277,6 @@ def encode_leaf_parts(
     name: str,
     hash_value: str,
     size: int,
-    mtime_ns: int,
     source_uri: str | None = None,
     footer: str | None = None,
     source_etag: str | None = None,
@@ -295,7 +292,7 @@ def encode_leaf_parts(
     The trailing ``source_etag`` is written only for pointer kinds that have
     one, so local-file pointers keep the shorter line shape.
     """
-    payload: list[object] = [kind, name, hash_value, size, mtime_ns]
+    payload: list[object] = [kind, name, hash_value, size]
     if kind in (KIND_META, KIND_MP):
         payload.append(source_uri)
     if kind in (KIND_BP, KIND_MP):
@@ -311,24 +308,23 @@ def _entry_from_leaf_payload(payload: list[Any]) -> Entry:
     bounds = _ARITY_BY_KIND.get(kind)
     if bounds is None or not (bounds[0] <= len(payload) <= bounds[1]):
         raise ValueError(f"Leaf entry payload has an unsupported shape: {kind}")
-    source_uri = str(payload[5]) if kind in (KIND_META, KIND_MP) else None
+    source_uri = str(payload[4]) if kind in (KIND_META, KIND_MP) else None
     if kind == KIND_MP:
-        footer = str(payload[6])
-    elif kind == KIND_BP:
         footer = str(payload[5])
+    elif kind == KIND_BP:
+        footer = str(payload[4])
     else:
         footer = None
     source_etag: str | None = None
-    if kind == KIND_META and len(payload) >= 7:
+    if kind == KIND_META and len(payload) >= 6:
+        source_etag = None if payload[5] is None else str(payload[5])
+    elif kind == KIND_MP and len(payload) >= 7:
         source_etag = None if payload[6] is None else str(payload[6])
-    elif kind == KIND_MP and len(payload) >= 8:
-        source_etag = None if payload[7] is None else str(payload[7])
     return Entry(
         path=str(payload[1]),
         kind=kind,
         hash=str(payload[2]),
         size=int(payload[3]),
-        mtime_ns=int(payload[4]),
         source_uri=source_uri,
         footer=footer,
         source_etag=source_etag,

@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from reflake import run_cli
+from reflake.cli import run_cli
 from reflake.core import create_repository, open_repository
 from reflake.core.domain import StageChange
 from reflake.core.objects.transfer import (

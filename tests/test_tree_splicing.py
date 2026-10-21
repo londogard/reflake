@@ -201,13 +201,12 @@ def test_tree_entry_msgspec_serialization_roundtrip() -> None:
     """Verifies that msgspec serialization preserves exact tree entry fields."""
     entries = [
         Entry(path="dir1", kind="t", hash="a" * 64),
-        Entry(path="file1.txt", kind="b", hash="b" * 64, size=1024, mtime_ns=5000),
+        Entry(path="file1.txt", kind="b", hash="b" * 64, size=1024),
         Entry(
             path="file2.parquet",
             kind="bp",
             hash="c" * 64,
             size=2048,
-            mtime_ns=6000,
             footer="d" * 64,
         ),
         Entry(
@@ -215,7 +214,6 @@ def test_tree_entry_msgspec_serialization_roundtrip() -> None:
             kind="m",
             hash="e" * 64,
             size=512,
-            mtime_ns=7000,
             source_uri="s3://bucket/key",
         ),
     ]

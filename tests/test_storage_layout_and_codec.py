@@ -32,13 +32,12 @@ def _make_commit(repo, name: str, message: str) -> str:
 
 def test_leaf_codec_round_trips_every_shape() -> None:
     cases = [
-        Entry(kind="b", path="f.txt", hash=DIGEST, size=1, mtime_ns=2),
+        Entry(kind="b", path="f.txt", hash=DIGEST, size=1),
         Entry(
             kind="m",
             path="f.txt",
             hash=DIGEST,
             size=1,
-            mtime_ns=2,
             source_uri="s3://bucket/key",
         ),
         Entry(
@@ -46,7 +45,6 @@ def test_leaf_codec_round_trips_every_shape() -> None:
             path="f.parquet",
             hash=DIGEST,
             size=1,
-            mtime_ns=2,
             footer=FOOTER,
         ),
         Entry(
@@ -54,7 +52,6 @@ def test_leaf_codec_round_trips_every_shape() -> None:
             path="f.parquet",
             hash=DIGEST,
             size=1,
-            mtime_ns=2,
             source_uri="file:///f.parquet",
             footer=FOOTER,
         ),
@@ -70,7 +67,6 @@ def test_manifest_and_tree_serializations_agree() -> None:
         kind="mp",
         hash=DIGEST,
         size=7,
-        mtime_ns=8,
         source_uri="file:///dir/f.parquet",
         footer=FOOTER,
     )
@@ -79,7 +75,6 @@ def test_manifest_and_tree_serializations_agree() -> None:
         kind="mp",
         hash=DIGEST,
         size=7,
-        mtime_ns=8,
         source_uri="file:///dir/f.parquet",
         footer=FOOTER,
     )
@@ -102,7 +97,6 @@ def test_subtree_lines_reject_leaf_fields() -> None:
             kind="b",
             hash=DIGEST,
             size=1,
-            mtime_ns=1,
             source_uri="file:///f.txt",
         )
 
@@ -116,14 +110,13 @@ def test_leaf_kind_derivation_is_single_sourced() -> None:
 
 def test_tree_object_round_trip_with_mixed_entries() -> None:
     entries = [
-        Entry(path="a.bin", kind="b", hash=DIGEST, size=1, mtime_ns=2),
+        Entry(path="a.bin", kind="b", hash=DIGEST, size=1),
         Entry(path="sub", kind="t", hash=DIGEST),
         Entry(
             path="z.meta",
             kind="m",
             hash=DIGEST,
             size=1,
-            mtime_ns=2,
             source_uri="s3://bucket/z",
         ),
     ]
@@ -190,7 +183,6 @@ def test_overlay_staged_uses_stream_merge_for_replacement(tmp_path: Path) -> Non
         kind="b",
         hash="1" * 64,
         size=3,
-        mtime_ns=4,
     )
     new_tree = writer.overlay_staged(
         parent_tree=head_tree,
@@ -219,7 +211,7 @@ def test_branch_snapshots_relocated_out_of_refs_heads(tmp_path: Path) -> None:
 
 
 def test_staged_flow_end_to_end_after_refactors(tmp_path: Path, capsys) -> None:
-    from reflake import run_cli
+    from reflake.cli import run_cli
 
     (tmp_path / "z.txt").write_text("z")
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0

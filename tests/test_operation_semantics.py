@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from reflake import run_cli
+from reflake.cli import run_cli
 from reflake.core import create_repository, open_repository
 from reflake.core.domain import BlobIntegrityError, StageChange
 from reflake.core.objects import LocalObjectStore
@@ -116,7 +116,7 @@ def test_restore_cli_reports_missing_path_as_exit_3(tmp_path: Path) -> None:
     _seed_repo(tmp_path)
 
     assert (
-        run_cli(["--repo", str(tmp_path), "restore", "main", "--path", "nope.txt"])
+        run_cli(["--repo", str(tmp_path), "restore", "nope.txt"])
         == 3
     )
 

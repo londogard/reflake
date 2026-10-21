@@ -191,9 +191,7 @@ def test_random_operation_sequences_keep_repository_valid(
             pass
 
         known_commits = [
-            commit
-            for commit in known_commits
-            if _commit_exists(repo, commit)
+            commit for commit in known_commits if _commit_exists(repo, commit)
         ]
         assert_repository_invariants(repo)
 

@@ -6,6 +6,7 @@ import time
 import tracemalloc
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 
 from reflake.core import (
@@ -174,7 +175,6 @@ def test_memory_safe_tree_build_100k_entries(tmp_path: Path) -> None:
                 "kind": "b",
                 "hash": "a" * 64,
                 "size": 1,
-                "mtime_ns": 1,
             },
             "normalized relative path",
         ),
@@ -184,7 +184,6 @@ def test_memory_safe_tree_build_100k_entries(tmp_path: Path) -> None:
                 "kind": "b",
                 "hash": "g" * 64,
                 "size": 1,
-                "mtime_ns": 1,
             },
             "64-character hex digest",
         ),
@@ -194,7 +193,6 @@ def test_memory_safe_tree_build_100k_entries(tmp_path: Path) -> None:
                 "kind": "b",
                 "hash": "a" * 64,
                 "size": -1,
-                "mtime_ns": 1,
             },
             "size cannot be negative",
         ),
@@ -204,7 +202,6 @@ def test_memory_safe_tree_build_100k_entries(tmp_path: Path) -> None:
                 "kind": "m",
                 "hash": "a" * 64,
                 "size": 1,
-                "mtime_ns": 1,
             },
             "Source-pointer entries must carry a non-empty source_uri",
         ),
@@ -218,7 +215,7 @@ def test_entry_validation_rejects_invalid_payloads(
 
 
 def test_corrupt_tree_object_payloads_are_rejected() -> None:
-    good_line = '["b","ok.txt","' + ("a" * 64) + '",1,1]'
+    good_line = '["b","ok.txt","' + ("a" * 64) + '",1]'
 
     with pytest.raises(CorruptEntryError, match="Corrupt entry payload"):
         parse_tree_object(f'{good_line}\n{{"path": invalid json}}\n'.encode())
@@ -226,8 +223,8 @@ def test_corrupt_tree_object_payloads_are_rejected() -> None:
     with pytest.raises(ValueError, match="sorted"):
         parse_tree_object(
             (
-                '["b","b.txt","' + ("a" * 64) + '",1,1]\n'
-                '["b","a.txt","' + ("a" * 64) + '",1,1]\n'
+                '["b","b.txt","' + ("a" * 64) + '",1]\n'
+                '["b","a.txt","' + ("a" * 64) + '",1]\n'
             ).encode()
         )
 
@@ -598,6 +595,12 @@ def test_disposable_analytical_index(tmp_path: Path) -> None:
     paths = build_analytical_index(tmp_path, "main", export_parquet=True)
     assert paths.database_path.exists()
     assert paths.parquet_path is not None and paths.parquet_path.exists()
+
+    # The export carries provenance so the derived file stays traceable to
+    # its commit after it leaves the index directory.
+    metadata = pq.ParquetFile(paths.parquet_path).metadata.metadata or {}
+    assert metadata.get(b"origin") == b"reflake"
+    assert metadata.get(b"commit_id") == commit_id.encode()
 
     rows = query_analytical_index(
         paths.database_path,
@@ -1101,9 +1104,7 @@ def test_reflog_records_ref_updates(tmp_path: Path) -> None:
     entries = list(repo.client_state.iter_reflog("main"))
     assert len(entries) == 2
     assert entries[0].startswith(f"{first} {second} commit ")
-    assert entries[1].startswith(
-        f"{'0' * 64} {first} commit "
-    )
+    assert entries[1].startswith(f"{'0' * 64} {first} commit ")
 
 
 def test_catalog_lists_branches(tmp_path: Path) -> None:

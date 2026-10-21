@@ -41,7 +41,7 @@ Reflake separates data into three layers:
 | Concept | What it is |
 |---|---|
 | **Repository** | A `.reflake/` directory locally, or an `s3://bucket/prefix` prefix remotely — same commands against both. |
-| **Tree** | A content-addressed Merkle node: sorted JSONL lines addressing child trees or leaf files. Directories over 10k entries shard automatically. |
+| **Tree** | A content-addressed Merkle node: sorted JSONL lines addressing child trees or leaf files. Directories over 2k entries shard automatically. Entries record content identity and source identity only — never filesystem metadata. |
 | **Commit** | `{tree, parents[], message}` — parents form a real DAG, so merges are first-class. The commit id hashes only content, so identical content yields identical ids across branches. |
 | **Branch** | A pointer updated with compare-and-swap on the commit id (S3 conditional writes) — safe under concurrent clients without locks. |
 | **Staging** | Per-client, per-branch overlay of adds/removes applied onto the parent tree by `commit --staged`. |
@@ -49,20 +49,23 @@ Reflake separates data into three layers:
 
 ### Command map
 
-`--repo` and `--json` are global flags and come before the command: `reflake --repo <uri> [--json] <command>`.
+`--repo` and `--json` are global flags. They may appear before *or* after the
+command: `reflake --repo <uri> commit -m x` and `reflake commit -m x --repo
+<uri>` are equivalent.
 
 | Area | Commands |
 |---|---|
 | Ingest | `init`, `add`, `commit [--staged]` |
 | Identity | `identity verify [--drift] [--ref]` (read-only audit), `identity promote [--ref]` (materialize) |
 | Inspect | `status`, `log`, `diff`, `list` (`ls`), `cat`, `branches`, `reflog` |
-| Branch | `branch [-d]`, `checkout`, `merge` (fast-forward + 3-way metadata merge), `reset` (undo/redo) |
-| Mutate | `rm`, `mv`, `gc [--prune] [--grace-seconds N]`, `restore` |
-| Sync | `push`, `pull`, `fetch`, `transfer` |
-| Analyze | `query build` (DuckDB/Parquet), `query prune` (row-group pruning) |
+| Branch | `branch [-d]`, `tag <name> [-d] [-l]`, `checkout`, `merge` (fast-forward + 3-way metadata merge), `reset` (undo/redo) |
+| Mutate | `rm [--keep-worktree]`, `mv [--keep-worktree]`, `gc [--prune] [--grace-seconds N]`, `restore [<path>...] [--ref]` |
+| Sync | `push`, `pull [--metadata-only]`, `fetch [--metadata-only]`, `clone`, `transfer` |
+| Analyze | `query build` (DuckDB/Parquet), `query scan` (pruned reads; `--explain` for the plan only) |
 
 Worktree walks honor `.reflakeignore` (plus built-in `.reflake/` and `.git/`)
-unless a path is named explicitly.
+unless a path is named explicitly. Symbolic links are not versioned; `status`
+and `commit` report how many were skipped.
 
 Exit codes: `0` ok · `1` usage/validation (unknown/missing **source** inputs,
 `identity verify` with remaining pointer entries or detected drift) · `2`
@@ -126,20 +129,21 @@ uv run reflake --repo /tmp/reflake-demo commit --staged -m "feature updates"
 uv run reflake --repo /tmp/reflake-demo checkout main
 uv run reflake --repo /tmp/reflake-demo merge feature main
 
-# restore files from a ref
-uv run reflake --repo /tmp/reflake-demo restore main
-uv run reflake --repo /tmp/reflake-demo restore main --path data/new.csv
-uv run reflake --repo /tmp/reflake-demo restore main --force
+# restore files from a ref (default: the current branch)
+uv run reflake --repo /tmp/reflake-demo restore
+uv run reflake --repo /tmp/reflake-demo restore data/new.csv --ref main
+uv run reflake --repo /tmp/reflake-demo restore --force
 
 echo "hello v2" > /tmp/reflake-demo/a.txt
 uv run reflake --repo /tmp/reflake-demo commit -m "update"
 
 uv run reflake --repo /tmp/reflake-demo diff <from_ref> <to_ref>
 
-# Stage and commit metadata mutations
+# Stage and commit metadata mutations (the worktree is updated too, like git)
 uv run reflake --repo /tmp/reflake-demo rm old-prefix
 uv run reflake --repo /tmp/reflake-demo mv raw/images curated/images
 uv run reflake --repo /tmp/reflake-demo commit -m "clean up old files and rename image prefix"
+# --keep-worktree stages a pure metadata change (virtual datasets, no checkout)
 
 # remote repo metadata operations from the current working tree
 uv run reflake --repo s3://my-bucket/datasets/demo branch feature
@@ -148,8 +152,12 @@ uv run reflake --repo s3://my-bucket/datasets/demo rm obsolete
 uv run reflake --repo s3://my-bucket/datasets/demo mv bootstrap final
 uv run reflake --repo s3://my-bucket/datasets/demo commit --staged -m "drop obsolete paths and rename imported prefix"
 
-# JSON output for programmatic use (global --json flag)
+# Clone a remote dataset without downloading data (metadata only)
+uv run reflake clone s3://my-bucket/datasets/demo ./demo --with-data=false
+
+# JSON output for programmatic use (--json works before or after the command)
 uv run reflake --repo /tmp/reflake-demo --json status
+uv run reflake --repo /tmp/reflake-demo status --json
 uv run reflake --repo /tmp/reflake-demo --json diff main feature
 ```
 
@@ -317,16 +325,25 @@ external file explicitly with `add --as`.
 
 `reflake checkout <branch>` only **points the client at another branch** (a
 client-local symbolic ref); it never rewrites the working tree. Materializing
-data is an explicit, separate step: `restore <ref>` (optionally `--path <dir>`),
+data is an explicit, separate step: `restore [<path>...]` (optionally `--ref <ref>`),
 `pull`, `cat`, or the read-only VFS. Files are only ever downloaded because you
 asked for them.
 
-### Staging semantics: a recipe, not a snapshot
+### Staging semantics: `add` snapshots content
 
-`add` records a *recipe* (logical path + source), not frozen bytes: content is
-read when you commit. If a staged source changes in between, the commit
-contains the bytes **at commit time** — the CLI warns loudly (`Staged
-source(s) changed since \`add\``) rather than committing silently.
+`reflake add` hashes and stores content-mode files immediately, so `commit`
+never re-reads the worktree and never commits bytes you did not stage. If a
+source changes between `add` and `commit`, the CLI says so and still commits
+the snapshot you staged — run `add` again to pick up the new bytes. Pointer
+mode is the exception by design: it records a source reference and reads the
+bytes only on `promote`.
+
+### Removing and moving
+
+`rm` and `mv` change the dataset *and* the worktree (like `git rm` / `git mv`).
+Without that, the next full `commit` would overlay the still-present file back
+onto the parent and silently undo the deletion. Use `--keep-worktree` for a
+pure metadata change.
 
 ### Branch names, and deleting branches
 
@@ -334,6 +351,22 @@ Branch names may be hierarchical (`feature/nightly-ingest`). `reflake branch
 draft -d` deletes a branch by CAS-ing its ref to *unborn* — a concurrent
 advance surfaces as a conflict instead of losing an update, and the name can
 be re-created with `reflake branch draft`.
+
+### Tags (immutable pins)
+
+`reflake tag v1.2 [--ref <branch|commit>]` pins a commit under `refs/tags/`
+(default target: the current branch head). Tags are **immutable**: creating
+an existing tag fails and there is no update path — to "move" one, delete it
+explicitly (`tag -d`) and create it again. `tag` with no arguments lists tags
+(`tag -l` does the same).
+
+Tags are refs, so every ref-accepting command resolves them: `log v1.2`,
+`diff v1.1 v1.2`, `restore --ref v1.2`, `query scan "..." --ref v1.2`, and
+`push <uri> --ref v1.2` / `pull <uri> --ref v1.2` (explicit tag transfer;
+branches never push tags implicitly). Branch and tag names live in separate
+namespaces — when they collide, a *born* branch wins resolution, while an
+unborn branch does not shadow a tag. Tags are GC roots: a commit pinned by a
+tag survives branch deletion or `reset` until the tag is deleted.
 
 ## Ignore Rules
 
@@ -398,20 +431,67 @@ uv run reflake --repo /tmp/reflake-demo query build --parquet
 duckdb /path/to/<commit>.duckdb "SELECT COUNT(*) FROM files"
 ```
 
+With `--parquet`, the exported file is stamped with `origin=reflake` and
+`commit_id=<id>` in its kv metadata (DuckDB's `parquet_kv_metadata(...)`, or
+pyarrow's `ParquetFile(...).metadata.metadata`), so the derived file stays
+traceable to its commit.
+
 If the index is deleted, Reflake remains fully functional from trees and commits.
 
 ### Row-group pruning
 
-With `config set parquet_footer true`, parquet ingests also capture compact footer statistics (schema + per-row-group min/max/nulls) under `footers/<hash>`. `reflake query prune` then selects the row groups that may match a WHERE-style predicate — reading metadata only, never data pages:
+With `config set parquet_footer true`, parquet ingests also capture compact footer statistics (schema + per-row-group min/max/nulls) under `footers/<hash>`. `reflake query scan --explain` then selects the row groups that may match a WHERE-style predicate — reading metadata only, never data pages:
 
 ```bash
-uv run reflake --repo /tmp/reflake-demo query prune <ref> images/ --where "id >= 100 AND active = true"
+uv run reflake --repo /tmp/reflake-demo query scan --explain "id >= 100 AND active = true" --ref <ref> --path images/
 ```
 
-`query prune` reuses a footer cache inside the index directory: footers are
-content-addressed, so scanning the same revision twice reads nothing further.
+The plan view reuses a footer cache inside the index directory: footers are
+content-addressed, so planning the same revision twice reads nothing further.
 Stats survive `identity promote` — promoting an `mp` entry yields `bp`, never a
-statless plain blob.
+statless plain blob. Byte-array (string) bounds are captured only when the
+writer marks them exact (pyarrow/parquet-cpp does; DuckDB omits the flags), so
+flagless string stats degrade to "no pruning" instead of ever risking a wrong
+one — numeric bounds always apply.
+
+### Executing pruned scans
+
+`reflake query scan` executes the plan instead of just reporting it: it reads
+only the kept row groups (ranged reads — local file handles or S3 `Range`
+GETs, never a whole-file download), applies the exact predicate, and streams
+matching rows as JSONL. The summary reports what that cost:
+
+```bash
+$ uv run reflake --repo /tmp/reflake-demo query scan "id >= 995000 AND id < 996000"
+{"id": 995000, "user_name": "user-0", "amount": 15000.0}
+{"id": 995001, "user_name": "user-1", "amount": 15037.0}
+...
+{"id": 995999, "user_name": "user-999", "amount": 51963.0}
+Scanned 1 file(s), kept 1/98 row groups; fetched 129.2 KiB of 9.4 MiB in 2 request(s).
+Bytes saved: 98.7%
+```
+
+That run is a 1M-row, 9.4 MiB parquet with 98 row groups: 1000 matching rows
+fetched with two ranged reads (the 64 KiB footer tail and the one kept row
+group) — 132,269 of 9,847,615 bytes.
+
+- `--ref <branch|commit>` and `--path <prefix>` scope the scan (defaults:
+  current branch, whole tree).
+- `--limit N` stops after N rows — remaining row groups are never read.
+- `--explain` prints the prune plan and reads **zero data bytes**.
+- `--json` emits a `{stats, rows}` envelope; stats include `bytes_fetched`,
+  `bytes_total`, `requests`, row groups kept/total, and skipped files.
+- Pointer entries (`m`/`mp`) are read through their `source_uri` too, so a
+  pointer ingest can be scanned without promoting first. A missing or
+  unreachable source is skipped and counted (with a warning) unless `--strict`
+  is passed.
+- Entries with no footer stats are read fully and counted as full scans;
+  non-parquet entries are skipped (counted). A predicate column missing from a
+  file's schema raises an error listing the files (typo protection), while a
+  type-incompatible literal applies no filtering and is reported as
+  `inapplicable`.
+- `--verify` full-hash-verifies each content blob before scanning it (off by
+  default: scans trust content addressing + TLS, like `open_blob_stream`).
 
 ## Commit Cost Model
 
@@ -423,15 +503,19 @@ not to the size of the tree:
   detected by hash and never re-written. Committing one changed file in a
   50-directory repository puts 2 tree objects; a full commit that changes
   nothing puts none.
-- Directories above 10k entries are stored as name-range shards. A staged
+- Directories above 2k entries are stored as name-range shards. A staged
   add or removal rewrites only the shard whose range contains the touched
   paths (binary search per name), and merges compare shard pointers pairwise,
   reading shard bodies only where both sides changed the same range.
-- New or changed worktree files are hashed in parallel (up to 8 workers;
-  blake3 releases the GIL).
-- With `config set trust_mtime true`, a worktree file whose size *and*
-  `mtime_ns` match the committed entry is reused without hashing. Trade-off:
-  a same-size, same-mtime edit is not detected — off by default.
+- A client-local **stat cache** (`path -> size, mtime, digest`) makes
+  `status` and `commit` O(changes): unchanged files are never opened. It is
+  on by default (`config set stat_cache false` forces a full re-hash) and can
+  be deleted at any time — it is only an accelerator.
+- Commits read each new file **once**: hashing and publishing happen in the
+  same pass (local stores additionally publish blobs as copy-on-write clones
+  on APFS/btrfs/XFS). Blob writes, transfers, restores and multipart parts run
+  with bounded concurrency, so a WAN commit is latency-bound on a few
+  round trips rather than one per file.
 - GC issues batched `DeleteObjects` calls (up to 1000 keys each) instead of
   one request per object.
 
@@ -450,6 +534,29 @@ with fs.open("reflake://my_data@feature+staged/a.txt", "rb") as handle:
 ```
 
 In `pointer` snapshots, Reflake reads from `source_uri` when no canonical `blobs/` object exists.
+
+### DuckDB over `reflake://`
+
+DuckDB can query datasets through the same VFS via its fsspec bridge — no
+export, no copies:
+
+```python
+import duckdb
+from reflake.core import ReflakeFileSystem
+
+duckdb.register_filesystem(
+    ReflakeFileSystem(dataset_roots={"my_data": "/tmp/reflake-demo"})
+)
+duckdb.sql("""
+    SELECT count(*) FROM read_parquet('reflake://my_data@main/events.parquet')
+    WHERE id >= 995000
+""")
+```
+
+VFS reads are seekable and ranged (local file handles or S3 `Range` GETs
+through the repository client), so DuckDB only fetches the footer tail and the
+row groups its own pushdown decides to read. For footer-driven pruning with
+measured byte accounting, use `reflake query scan`.
 
 ## Python API
 
@@ -489,10 +596,14 @@ Reflake creates `.reflake/` under each dataset root:
 - `trees/` - Merkle tree nodes (sorted JSONL, content-addressed)
 - `footers/` - parquet footer-stats objects (when enabled)
 - `commits/` - commit metadata objects
+- `repo.json` - **shared** format + ingest policy (`identity`, `parquet_footer`,
+  `default_branch`); written once by `init`, read by every client so identical
+  bytes always produce identical trees
 - `refs/heads/` - branch pointers only (CAS-updated, `feature/x` allowed)
+- `refs/tags/` - immutable tag pointers (create-only, never retargeted)
 - `refs/HEAD` - **client-local** symbolic active branch reference (never shared)
 - `state/` - client-local branch snapshots (never shared, never a ref)
-- `staging/`, `cache/`, `index/`, `reflog/` - client-local state
+- `staging/`, `cache/` (stat cache), `index/`, `reflog/` - client-local state
 
 Every object kind has exactly one physical location, defined by
 `layout.object_relative_key()` — the local filesystem and the S3 key space are
@@ -530,7 +641,7 @@ There are no locks. Every shared mutation goes through compare-and-swap:
 Current tests cover required invariants:
 
 - Metadata-only diff, remove, and move read no blob payloads; `identity verify` (dry run) writes no objects at all.
-- Sharded directories (>10k entries) survive full commits without duplicate or lost entries.
+- Sharded directories (>2k entries) survive full commits without duplicate or lost entries.
 - Build a 100k-entry tree under a RAM cap (benchmark, see below).
 - `reflake://my_data@main/test.csv` resolves and returns expected bytes.
 - Staged commits stay correct regardless of path sort order; merged lineages survive push/pull; blob reads are hash-verified.

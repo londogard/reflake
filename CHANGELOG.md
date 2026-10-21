@@ -4,7 +4,200 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and Reflake currently tracks changes before its first public alpha release.
 
+## [0.5.0] - 2026-10-21
+
+**Format break.** Entry lines, tree fanout, and pointer identity changed.
+Repositories written by 0.4.x are not readable by this version; recreate them
+(or keep a 0.4.x checkout for migration).
+
+### Changed
+
+- **Trees are canonical.** Leaf lines no longer carry `mtime_ns`
+  (`["b", name, hash, size]`, `["m", name, hash, size, source_uri]`, …).
+  Identical bytes now produce identical tree hashes on every machine, which is
+  what makes commit ids comparable and cross-machine dedupe real. Worktree
+  facts live in a client-local **stat cache**
+  (`.reflake/cache/stat-cache.json`, `path -> size, mtime, digest`), replacing
+  the old `trust_mtime` switch. `config set stat_cache false` disables it.
+- **Tree fanout is 2 048 entries per node** (was 10 000). A cold lookup now
+  fetches ≈230 KB per level instead of ≈1.1 MB, and the parsed-node cache is
+  bounded by *entries* (250 k) instead of node count — a node-count bound let
+  wide directories push the cache into the gigabytes.
+- **Pointer identity is the source version, not the path**:
+  `BLAKE3("<marker>\n<size>")` where the marker is the S3 ETag or a local
+  file's mtime. Moving a pointer keeps its identity; re-importing a modified
+  source produces a new one, so *drift is visible in the revision graph* and
+  `identity verify --drift` is a pure metadata comparison.
+- **`add` snapshots content.** Content-mode `add` hashes and stores the blob
+  immediately, so `commit` never re-reads the worktree and always commits
+  exactly what was staged. Staging payloads are compact JSON. A changed source
+  is reported (and the snapshot is still committed).
+
+### Performance
+
+- **Local commits read every file once.** `write_blob_file` is now a pure
+  publish; the new `materialize_blob_file` hashes *while* copying. The old
+  shape hashed in parallel and then re-read every file single-threaded to copy
+  it into the store (76 % of commit wall time on a 10 k-file commit, 1.7× CPU
+  per byte). Blobs are also published as copy-on-write clones where the
+  filesystem supports it (APFS `clonefile`, btrfs/XFS `FICLONE`).
+- **Bounded concurrency everywhere I/O is latency-bound**: blob uploads during
+  a commit, sync transfers, restores, and multipart parts
+  (`core/concurrency.py`, 16 in flight). Simulated 20 ms RTT: a 1 000-file S3
+  commit drops from ~21 s of serial PUTs to 6.1 s.
+- **`status` is O(changes)**, not O(dataset): it merge-joins the sorted
+  worktree walk against the sorted tree walk, so it holds no flattened tree in
+  memory and never opens an unchanged file. 500 MB dataset: 0.53 s → 0.007 s.
+  An S3-backed `status` on a clean 1 000-file tree: 0.86 s → 0.07 s.
+- **Multipart uploads run parts in parallel** with an 8 MiB part size and a
+  128 MiB per-file memory budget (was 64 MiB parts uploaded one at a time).
+- **S3→S3 content import copies server-side**: read once to hash, then
+  `CopyObject` into the blob key. No second upload, no temp file the size of
+  the object.
+- **Sharded prefix listings only read the touched shard** (range test on the
+  shard pointers). 30 k-file directory: 0.124 s → 0.008 s.
+- **Sync planning no longer materializes the destination listing**, only the
+  candidates it needs.
+
+### Fixed
+
+- **3-way merge crashed on identical deletions** (`AssertionError` when both
+  branches deleted the same path and the containing directory also changed).
+  Deleting the same file on both sides is now resolved silently, as it should
+  be.
+- **`default_branch` was ignored**: `init --default-branch develop` created an
+  unborn `develop` ref but committed to `main`.
+- **`rm`/`mv` silently resurrected data.** They were metadata-only, so the
+  file stayed on disk and the next full commit re-added it (and `mv` left a
+  duplicate). Both now update the worktree by default (`--keep-worktree` keeps
+  the old behaviour).
+- **`restore` left the stat cache cold**, so restored files were re-hashed on
+  every subsequent command; it now records the digest (and restores a local
+  pointer's mtime) after writing.
+- `rm` of a missing path now fails instead of reporting a phantom removal.
+- Branch/tag names longer than 200 bytes are rejected instead of surfacing a
+  filesystem `ENAMETOOLONG`.
+- `merge` reads the target ref fresh (like `reset`) instead of trusting a
+  possibly stale client snapshot.
+
+### Added
+
+- **Shared `repo.json`** in the shared scope: `identity`, `parquet_footer`, and
+  `default_branch` are repository-wide, so two clients cannot produce
+  different trees for identical data. Client config keeps client-only knobs.
+- **`reflake clone <remote> [dir]`** — metadata-only by default (`--with-data`
+  to fetch blobs), so a virtual dataset is available without moving bytes.
+- `pull`/`fetch` gain `--metadata-only`.
+- `commit` prints `[branch <short-id>] message` plus added/modified/removed
+  counts; `--json` carries the full summary (`CommitId.stats`).
+- `ls` prints size and identity mode per entry.
+- Global `--repo`/`--json` work before *or* after the command.
+- Consistent argument order: paths are positional, refs are `--ref`
+  (`cat <path> --ref`, `restore [<path>...] --ref`); `merge <source>
+  [<target>]` defaults to the current branch.
+- `status`/`commit` report skipped symbolic links instead of dropping them
+  silently.
+
+### Removed
+
+- `src/reflake/cli.py` — 1 732 lines of dead code shadowed by the
+  `reflake.cli` package since 0.4.0.
+- `trust_mtime` config key (superseded by `stat_cache`).
+- Package-root exports `build_parser`, `run_cli`, `StageChange`, `FileEntry`,
+  the config classes, and `DEFAULT_CHUNK_SIZE`; the documented stable surface
+  is now what `__all__` says it is.
+
 ## Unreleased
+
+### Added
+
+- **Tags (`refs/tags/*`)** — `reflake tag <name> [--ref <branch|commit>]`
+  creates an immutable pin (default: current branch head); `tag` / `tag -l`
+  lists, `tag -d` deletes. Tags resolve everywhere a ref is accepted (`log`,
+  `diff`, `restore`, `query scan --ref`, and `push`/`pull`/`fetch --ref`),
+  are transferred explicitly by push/pull, and are GC roots, so a pinned
+  commit survives branch moves until the tag is deleted. Branches and tags
+  use independent namespaces; a born branch wins name resolution.
+
+## [0.4.0] - 2026-10-03
+
+### Added
+
+- **`reflake query scan "<where>"`** — executes a prune plan instead of just
+  reporting it: reads only the kept row groups (ranged reads: local file
+  handles, or S3 `Range` GETs through the repository client), applies the
+  exact predicate, and streams matching rows as JSONL. Flags: `--ref`,
+  `--path`, `--limit` (stops early; unread row groups are never fetched),
+  `--explain` (plan only, zero data bytes), `--verify` (full-hash-check each
+  content blob first), `--strict` (fail on unreachable pointer sources).
+  `--json` emits a `{stats, rows}` envelope with `bytes_fetched`,
+  `bytes_total`, `requests`, and row groups kept/total. Example: a selective
+  predicate on a 1M-row / 9.4 MiB parquet (98 row groups) returns 1000 rows
+  after fetching 132,269 of 9,847,615 bytes in 2 ranged reads — 98.7% saved.
+- **Pointer entries are scannable through their `source_uri`** without
+  promoting first. Missing or unreachable sources are skipped and counted
+  (with a stderr warning), or raise under `--strict`. Entries without footer
+  stats are read fully and counted as full scans; non-parquet entries are
+  skipped (counted); a predicate column missing from a file's schema raises
+  `ValueError` listing the file (typo protection), and a type-incompatible
+  literal applies no filtering and is reported under `inapplicable`.
+- **`core/query/execute.py`** (`execute_scan`, `ScanStats`, `Scan`) and
+  **`core/objects/rangefile.py`** (`RangeFile`, local/S3/source openers): a
+  seekable ranged file object with byte/request accounting, consumed by
+  pyarrow. The store surface gains `BlobRangeReader.read_blob_range` on both
+  adapters (`objects/rangefile.py` uses closed ranges; pyarrow serializes
+  reads via `PyReadableFile`'s lock, and scans read row groups with
+  `use_threads=False`).
+- New tests (`tests/test_query_scan.py`): exact rows vs DuckDB `WHERE`
+  (including NULL semantics), bytes bounded by kept row groups + footer tail,
+  `--explain` fetching zero data bytes, missing-column errors, no-footer full
+  scans, pointer source scanning/skipping/strict, CLI output modes, fake-S3
+  only-kept-range assertions, and a benchmark-marked bytes-saved scaling test.
+- **DuckDB over `reflake://`**: `ReflakeFileSystem` registers with
+  `duckdb.register_filesystem(...)`, so SQL reads datasets directly through
+  the VFS (`read_parquet('reflake://dataset@ref/path')`) with DuckDB's own
+  pushdown. VFS files are now seekable ranged readers (local file handles or
+  S3 `Range` GETs), replacing the whole-stream wrapper classes.
+- **Parquet export provenance**: `query build --parquet` stamps the exported
+  index file with `origin=reflake` and `commit_id=<commit>` kv metadata
+  (readable via DuckDB's `parquet_kv_metadata(...)` or pyarrow), so derived
+  files stay traceable to their commit.
+
+### Changed
+
+- `pyarrow` is now a hard dependency — scanning is a core product feature, not
+  an optional extra.
+- `plan_pruned_scan` and `execute_scan` share one per-file planner
+  (`plan_pruned_file`), so pruning decisions cannot drift between the report
+  and execution.
+- `ObjectStore`/`RepositoryStore` protocols include `BlobRangeReader`.
+- Internal cleanup: one prefix-match rule (`entry_codec.matches_logical_path`,
+  replacing the duplicate `matches_prefix` and `repository_support` copies), a
+  type→name registry for CLI command naming instead of an isinstance ladder,
+  and a `SeekableReader` protocol for footer parsing so real file objects and
+  ranged files both type-check. The CLI is now a `reflake.cli` package
+  (`args`/`runner` plus one module per command group), option help is
+  generated from field comments, and positional arguments render real names.
+  Footer capture now reads through pyarrow's parquet reader (the hand-rolled
+  thrift decoder is gone — ~320 lines removed), and byte-array bounds are
+  captured only when the writer marks them exact: pyarrow/parquet-cpp does,
+  DuckDB omits the flags, so flagless string stats are conservatively
+  inapplicable instead of risking a wrong prune. Numeric bounds always apply.
+
+### Removed
+
+- **`reflake query prune`** — folded into `query scan --explain` (the same
+  pruning plan, one command): use
+  `reflake query scan --explain "<where>" [--ref REF] [--path PATH]`.
+
+### Fixed
+
+- **S3-sourced parquet ingest now captures footer stats.** `add s3://…` went
+  through the non-seekable S3 streaming body (`StreamingBody.seek` raises
+  `UnsupportedOperation`, swallowed by the best-effort wrapper) and
+  `import_s3` skipped capture entirely, so S3-ingested parquet silently had no
+  footers and could never prune. Footer capture now reads through the same
+  ranged file object as scans (local file handles or S3 `Range` GETs).
 
 ## [0.3.0] - 2026-09-24
 

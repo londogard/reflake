@@ -64,9 +64,21 @@ paths); per-branch reflog (`reflake reflog`); branch registry (`reflake branches
 **Post-rollout shipped (rev. 3):** the `repository_store/` + `storage/` → `objects/` store
 unification (§12 — one `ObjectStore` protocol; `LocalObjectStore` / `S3ObjectStore`
 adapters) and the query pruning engine over footer stats (§4 — `core/query/pruning.py` +
-`reflake query prune`, row-group selection from stats objects only).  Open questions
+`reflake query scan --explain`, row-group selection from stats objects only).  Open questions
 remain in §15 (bucket layout, `export` first-class, tree-prefix pin policy, remote
 row-group stats on `mp` entries).
+**Rev. 6 (2026-10, v0.4):** pruned scans execute (§4 — `core/query/execute.py` reads only
+the kept row groups through a ranged, accounting file object over local files or S3
+`Range` GETs, applies the exact predicate with `pyarrow.compute`, and reports bytes
+fetched vs bytes total); pointer entries are scannable through their `source_uri` without
+promoting; `pyarrow` is a hard dependency.  Ranged blob reads are a store capability
+(`BlobRangeReader`), and read coalescing remains a measure-first follow-up.  The
+report-only `query prune` CLI is folded into `query scan --explain` (one plan path), and
+the CLI is now a package split by command group with help generated from field comments.
+Footer capture reads through the same pyarrow metadata reader as scans (the hand-rolled
+thrift decoder is gone; flagless byte-array stats are conservatively inapplicable), and
+the VFS reads through the ranged file object — which lets DuckDB query
+`reflake://` URIs via `duckdb.register_filesystem`.
 **Assumption:** **no backwards compatibility** with v1 on-disk formats, commit schema,
 manifest format, ref format, staging format, lock format, or module layout. We can break
 the on-disk contract freely.
@@ -134,7 +146,7 @@ src/reflake/
     services/        # RefManager, TreeWriter (was SnapshotWriter), StagingArea, EntryFactory
     client_state.py  # + lookup caches: tree-prefix LRU, optional derived-manifest cache
     config.py, hashing.py, layout.py
-  cli.py
+  cli/               # args + runner; one module per command group
 ```
 
 - `RepositoryStore` protocol → a single `ObjectStore` protocol (index and lock concerns are gone).
@@ -170,7 +182,7 @@ flowchart LR
 - **blob** — content bytes, keyed by blake3. Layout unchanged (`<hash[:2]>/<hash[2:]>`).
 - **tree** — sorted entries `(name, kind, hash)`; `kind` ∈ {t, b, m, bp, mp}. Addressable
   by blake3 of its serialized form; stored under `trees/` (or unified `objects/`, §15).
-  **Bounded fanout**: a tree object holds at most ~10k entries (≈1 MB). A directory whose
+  **Bounded fanout**: a tree object holds at most 2 048 entries (≈230 KB). A directory whose
   entry count exceeds the bound splits into **name-range shard subtrees** (a `t` entry
   covering a contiguous name slice of the same directory). This preserves v1's
   block-index property for flat directories: 1M files in one directory → a small top node
@@ -201,10 +213,10 @@ manifest lines, relabeled):
 ```
 # tree object (one entry per line, sorted by name)
 ["t", name, hash]                              # subtree (directory or name-range shard)
-["b", name, hash, size, mtime_ns]              # blob-backed file
-["m", name, hash, size, mtime_ns, source_uri]  # source pointer (unverifiable)
-["bp", name, hash, size, mtime_ns, footer]     # parquet, blob-backed, + footer stats
-["mp", name, hash, size, mtime_ns, source_uri, footer, source_etag?]
+["b", name, hash, size]                        # blob-backed file
+["m", name, hash, size, source_uri]            # source pointer (unverifiable)
+["bp", name, hash, size, footer]               # parquet, blob-backed, + footer stats
+["mp", name, hash, size, source_uri, footer, source_etag?]
 # `m`/`mp` may carry one optional trailing field: the source object's
 # ETag/version marker, which makes `identity verify --drift` metadata-only.
 ```
@@ -274,8 +286,9 @@ flowchart TB
   - exact-path, warm: **< 20 ms** (S3), **< 1 ms** local FS — 0–1 GET.
   - exact-path, cold worst: bounded by depth × small GET; **≤ ~200 ms** only when every
     level misses, typically 1–2 GETs. Depth is ≤ 4–5 at 100M entries (path depth +
-    shard splits at 10k fanout).
-  - prefix listing: O(matches + depth) — 200 files < 50 ms cold, 10k files < 300 ms cold.
+    shard splits at 2 048 fanout).
+  - prefix listing: O(matches + depth); a sharded directory only fetches the
+    shard whose name range can contain the prefix.
 
 This deletes: `ManifestIndexStore`, `manifest_query` dual paths, `_cached_manifest_index_path`,
 `build_manifest_index_file`, the index/fallback decision tree, and `ManifestWriter.build_index`
@@ -289,7 +302,7 @@ plumbing. One lookup core + one optional materialization instead of three paths.
   overlay (`+staged`). Read-only fsspec already exists; make it the center of the product
   instead of the working tree.
 - **`reflake.core.query`** absorbs the existing `core/index.py` (`build_analytical_index`,
-  `query_analytical_index`): manifest/tree → DuckDB table (`path, hash, size, mtime_ns, …`)
+  `query_analytical_index`): manifest/tree → DuckDB table (`path, hash, size, identity_mode, …`)
   with optional parquet export. The catalog becomes derivable from tree + footer objects
   without re-reading footers.
   - DuckDB over `reflake://` (via fsspec/duckdb path, or a branch-scoped table function)
@@ -303,10 +316,26 @@ plumbing. One lookup core + one optional materialization instead of three paths.
     entries carry a `has_footer` marker so `promote` can backfill it later.
     **Shipped (rev. 3):** the pruning engine lives in `core/query/pruning.py`
     (`parse_where_clause`, `prune_row_groups`, `plan_pruned_scan`) and is exposed as
-    `reflake query prune <ref> <path> --where "col >= x"` — it reads only the
+    `reflake query scan --explain "col >= x" [--ref] [--path]` — it reads only the
     `footers/<hash>` stats objects and reports the row groups that may match, with
     conservative keep-on-unknown handling. Predicates are AND-composed `= != < <= > >=
     IS NULL IS NOT NULL`; OR is rejected.
+    **Executing the plan (v0.4):** `core/query/execute.py::execute_scan` executes those
+    plans. `objects/rangefile.py` gives pyarrow a seekable file over the data: a local
+    file handle for local repositories, S3 `Range` GETs through the store's client for
+    remote blobs and pointer `source_uri`s, wrapped in a counting layer that tracks
+    bytes and requests. Only the kept row groups are read (`pyarrow.parquet`), and the
+    exact `pyarrow.compute` filter mirrors the pruning null contract (comparisons
+    involving NULL never match). `ScanStats` reports files, row groups kept/total,
+    `bytes_fetched`/`bytes_total`, `requests`, and inapplicable columns; entries
+    without footer stats are read fully (counted), non-parquet entries are skipped
+    (counted), and unreachable pointer sources are skipped and counted unless
+    `--strict`. CLI: `reflake query scan "<where>" [--ref] [--path] [--limit]
+    [--explain] [--verify] [--strict]`; `--explain` reads zero data bytes. `pyarrow`
+    is a hard dependency — scanning is a core product feature, not an optional extra.
+    First measurements: a selective predicate on a 98-row-group file fetches two
+    ranges (the 64 KiB footer tail + the kept row group); S3 read coalescing stays a
+    measure-first follow-up.
 - **Restore (materialization from trees):** walk the path chain to the requested
   paths (files or directory prefixes), read only the needed blobs (or source URIs),
   write to the working tree. `checkout` is deliberately *not* a materializing
@@ -340,6 +369,11 @@ v2 (format change is free):
   local CAS compares under an `fcntl`/`msvcrt` lock file, S3 CAS re-reads the
   commit plus its ETag and conditional-Puts against it (the ETag stays an
   internal detail).
+- **Tags are refs with a create-only contract.** `refs/tags/*` are written
+  under the same local lock file or via S3 `IfNoneMatch="*"`, so concurrent
+  creates have exactly one winner and an existing tag is never retargeted.
+  Changing a tag means an explicit delete + create; there is deliberately no
+  tag CAS/update path.
 - Remove S3 branch-lock objects (`locks/refs/heads/*`) and the `lock list` / `lock cleanup`
   surface, or demote them to optional diagnostics. Expiry-based locks are not load-bearing
   (clock skew / long operations), and with no backcompat there's no reason to keep them in
@@ -376,8 +410,8 @@ v2:
 - All `botocore`/`ClientError` handling moves into the S3 adapter, which raises domain errors
   (`ObjectMissingError`, `PreconditionFailedError`, `StorageUnavailableError` — subclasses of
   `ReflakeError`).
-- `cli.py` drops `BotoCoreError`/`ClientError` from its handled-errors list; one
-  `ReflakeError`-based list remains.
+- The `reflake.cli` runner drops `BotoCoreError`/`ClientError` from its handled-errors
+  list; one `ReflakeError`-based list remains.
 
 ---
 
@@ -414,11 +448,15 @@ merge input, so blob bytes and leaf records are never touched.
   (`skip_hashes`). The frame builder seeds that set with the parent node **and its
   subtree hashes**, so an unchanged directory — or an untouched shard inside a
   changed one — costs zero PUTs (one changed file in a 50-directory repo: 2 PUTs).
-- New/changed worktree blobs are hashed in parallel (`ThreadPoolExecutor`, ≤ 8
-  workers; blake3 releases the GIL).
-- `trust_mtime` (off by default) reuses a content entry when size **and**
-  `mtime_ns` match, trading a (same-size, same-mtime) edit detection for hash-free
-  re-commits.
+- New/changed worktree blobs are read **once**: `materialize_blob_file` hashes
+  while it copies (local blobs are published as copy-on-write clones where the
+  filesystem supports it), and up to 8 files are in flight per directory.
+- The client **stat cache** (on by default) reuses a content entry when size
+  **and** mtime match the recorded stat, so an unchanged file is never opened —
+  the signal a tree cannot carry, because entries hold content identity only.
+- Blob uploads, transfer-plan copies, restores, and multipart parts run with
+  bounded concurrency (`core/concurrency.py`, 16 in flight), because they are
+  latency-bound rather than CPU-bound.
 - GC prunes in `DeleteObjects` batches (≤ 1000 keys/request) instead of one
   request per object.
 
@@ -443,8 +481,8 @@ merge input, so blob bytes and leaf records are never touched.
   `reflake gc` is an audit first; `--prune` is optional and opt-in.
 
 **Mark-and-sweep, and why the sweep must list.** The mark phase needs no listing:
-refs give reachable commits, commits give their trees, trees give every leaf
-reference. "Dangling" is defined as `exists − reachable`, and because objects are
+branch heads and tags give reachable commits, commits give their trees, trees give
+every leaf reference. "Dangling" is defined as `exists − reachable`, and because objects are
 content-addressed with no indirection (no index, no refcounts, no ownership
 directories), the store listing is the only authority on existence. Git has the
 same property — `fsck`/`repack` scan the whole object database. The two

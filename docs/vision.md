@@ -159,16 +159,16 @@ name**; `name` is a single path component (no `/`, no `.`/`..`, non-empty).
 ```
 ["t",  name, hash]                              # subtree = directory
 ["s",  name, hash]                              # name-range shard of this directory
-["b",  name, hash, size, mtime_ns]              # blob-backed file
-["m",  name, hash, size, mtime_ns, source_uri]  # source reference, unverifiable
-["bp", name, hash, size, mtime_ns, footer]      # parquet + footer stats
-["mp", name, hash, size, mtime_ns, source_uri, footer]
+["b",  name, hash, size]                        # blob-backed file
+["m",  name, hash, size, source_uri]            # source reference, unverifiable
+["bp", name, hash, size, footer]                # parquet + footer stats
+["mp", name, hash, size, source_uri, footer]
 ```
 
 - `hash` = Blake3 hex (64 lowercase chars). For `b`/`bp` it is the content
   hash; for `m`/`mp` it is `BLAKE3("<path>\n<size>")` — an *unverifiable
   reference*, explicitly not a content identity.
-- Sharding rule (**I2**): a node has at most `MAX_TREE_ENTRIES` (10 000)
+- Sharding rule (**I2**): a node has at most `MAX_TREE_ENTRIES` (2 048)
   children. A directory exceeding the bound is stored as contiguous
   name-range shards; each shard body is a **plain** node (shards never nest);
   a shard pointer's name is the first contained name, so ranges remain
@@ -217,7 +217,8 @@ time. Implementations SHOULD document this, and MAY add an explicit
 
 - `commit` (full): walk the worktree (skip `.reflake` and symlinks), hash new
   or changed content-mode files in parallel, reuse parent leaves on
-  size+mtime (`trust_mtime`, opt-in) or size+digest; merge parent-only entries
+  size+digest, consulting the client-local stat cache to skip re-reading
+  unchanged files; merge parent-only entries
   in (overlay semantics, I10); prune staged removals; build bottom-up with
   `skip_hashes` so byte-identical nodes and untouched shard bodies are not
   rewritten. Cost: O(files walked) hashing + O(changed directories) writes.
@@ -295,7 +296,7 @@ time. Implementations SHOULD document this, and MAY add an explicit
 
 - `query build`: flatten the tree to a CSV (benchmarked fast path) →
   DuckDB database (+ optional Parquet). Disposable, derived.
-- `query prune`: parse an AND-only predicate, select row groups from
+- `query scan --explain`: parse an AND-only predicate, select row groups from
   `footers/<hash>` stats only, conservatively (unknown ⇒ keep). Never claim
   pruning for entries without stats.
 - The pruning engine SHOULD grow an execution path (read only kept row groups,
@@ -334,7 +335,7 @@ reflake --repo <path|s3://bucket/prefix> [--json] <command> [args]
 | Branch | `branch`, `checkout`, `merge` | checkout is a pointer switch only |
 | Mutate | `rm`, `mv`, `restore`, `gc [--prune]` | rm/mv are staged metadata ops |
 | Sync | `push`, `pull`, `fetch` | one local + one S3 endpoint |
-| Analyze | `query build`, `query prune` | derived, disposable |
+| Analyze | `query build`, `query scan` | derived, disposable |
 | Config | `config init/set/list` | client-local; MUST be documented as such |
 
 Exit codes: `0` ok · `1` usage/validation · `2` retryable conflict (CAS race,
@@ -438,7 +439,19 @@ integration tests; and a reproducible scale harness committed to the repo
 
 ---
 
-## Appendix — Status vs. this spec (2026-09-24, after the 0.2.1 hardening)
+## Appendix — Status vs. this spec (2026-10-21, after the 0.5.0 format change)
+
+**Format change in 0.5.0:** tree/manifest entries no longer carry `mtime_ns`
+(a node's hash depends only on content and source identity), `MAX_TREE_ENTRIES`
+is 2 048, pointer identity is `BLAKE3("<source-version-marker>\n<size>")`, and
+`repo.json` in the shared scope carries the repository-wide ingest policy
+(`identity`, `parquet_footer`, `default_branch`). Worktree mtimes live in a
+client-local stat cache instead, which is what makes `status`/`commit`
+O(changes). `rm`/`mv` now update the worktree by default (`--keep-worktree`
+for pure metadata changes) so a later full commit cannot resurrect a deletion.
+I6 is therefore satisfied for *metadata* reads; `status` still walks the
+worktree, but without reading unchanged files.
+
 
 Shipped and matching: tree model + sharding with locality, content-only commit
 ids, CAS-only refs, worktree-optional CLI, plan-then-batch sync, identity

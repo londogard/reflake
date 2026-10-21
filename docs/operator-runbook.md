@@ -19,7 +19,8 @@ S3-compatible object storage. It assumes you are already familiar with the
   trees/          # Merkle tree nodes (sorted JSONL, content-addressed)
   footers/        # Parquet footer-stats objects (only when parquet_footer=true)
   commits/        # Commit objects {tree, parents[], message, generation}
-  refs/heads/     # Branch pointers (the ONLY mutable state, CAS-updated)
+  refs/heads/     # Branch pointers (the only mutable state, CAS-updated)
+  refs/tags/      # Tag pointers (immutable: create-only, explicit delete)
 ```
 
 Client-local state (`state/`, `staging/`, `cache/`, `index/`, `reflog/`)
@@ -222,7 +223,7 @@ can see what the window held back.
 Footer-stats objects (`footers/`) exist only for repos with
 `config set parquet_footer true` at ingest time. Older parquet entries
 gain footers on the next commit that touches them, or via
-`reflake identity promote`. `query prune` keeps row groups conservatively when
+`reflake identity promote`. `query scan` keeps row groups conservatively when
 stats are absent — missing footers never cause wrong query results.
 
 ---
@@ -290,4 +291,4 @@ corruption implies disk failure, not torn writes.
 | Audit orphaned objects | `reflake --repo <URI> gc` (`--prune` deletes, age-guarded) |
 | List branches with heads | `reflake --repo <URI> branches` |
 | Branch history | `reflake --repo <URI> reflog` |
-| Row-group pruning check | `reflake --repo <URI> query prune <ref> <path> --where "..."` |
+| Row-group pruning check | `reflake --repo <URI> query scan --explain "<where>" --ref <ref> --path <path>` |

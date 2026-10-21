@@ -53,6 +53,8 @@ class FakeS3Client:
         self.fixed_etag: str | None = None
         #: Sizes of every ``delete_objects`` batch received, in order.
         self.delete_calls: list[int] = []
+        #: Ranged GET requests received, as ``(Key, start, end)`` inclusive.
+        self.range_requests: list[tuple[str, int, int]] = []
         #: Multipart lifecycle events, in order: (operation, key).
         self.multipart_calls: list[tuple[str, str]] = []
         self._uploads: dict[tuple[str, str], dict[int, bytes]] = {}
@@ -79,6 +81,7 @@ class FakeS3Client:
             start_raw, end_raw = byte_range.split("-", maxsplit=1)
             start = int(start_raw)
             end = int(end_raw)
+            self.range_requests.append((Key, start, end))
             payload = payload[start : end + 1]
         return {
             "Body": FakeStreamingBody(payload),
@@ -307,3 +310,35 @@ def s3_repo_root(ministack_client) -> Generator[str, None, None]:
                 break
             continuation_token = response.get("NextContinuationToken")
         ministack_client.delete_bucket(Bucket=bucket)
+
+
+COMMIT_VARIABLES = {
+    "commit_id",
+    "commit_a",
+    "commit_b",
+    "first_commit",
+    "second_commit",
+    "base_commit",
+    "feature_commit",
+    "main_commit",
+    "initial_commit",
+    "c1",
+    "c2",
+    "first",
+}
+
+
+def head_commit(capsys, repo_root, *, uri: str | None = None) -> str:
+    """Drain CLI output and return the current branch head.
+
+    Tests assert on commit *identity*, not on the human-readable summary line,
+    so they read the ref instead of parsing stdout (a summary line prints a
+    short id on purpose).
+    """
+    from reflake import open_repository
+
+    capsys.readouterr()
+    repo = open_repository(uri or str(repo_root), worktree=repo_root)
+    head = repo.head_commit()
+    assert head is not None
+    return head

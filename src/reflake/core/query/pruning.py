@@ -17,6 +17,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ..entry_codec import Entry
 from ..objects.base import ContentQueryStore
 from ..objects.footer import FooterCache, FooterStats, RowGroupStats, parse_footer_stats
 
@@ -31,8 +32,7 @@ _CLAUSE_SPLIT = re.compile(
     r"'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\"|\s+AND\s+", re.IGNORECASE
 )
 _NULL_CLAUSE = re.compile(
-    r"^\s*(?P<col>[A-Za-z_][A-Za-z0-9_.]*)\s+"
-    r"(?P<op>IS\s+NOT\s+NULL|IS\s+NULL)\s*$",
+    r"^\s*(?P<col>[A-Za-z_][A-Za-z0-9_.]*)\s+" r"(?P<op>IS\s+NOT\s+NULL|IS\s+NULL)\s*$",
     re.IGNORECASE,
 )
 _COMPARISON_CLAUSE = re.compile(
@@ -236,6 +236,42 @@ def prune_row_groups(
     )
 
 
+def plan_pruned_file(
+    store: ContentQueryStore,
+    entry: Entry,
+    predicates: Sequence[Predicate],
+    *,
+    footer_cache: FooterCache | None = None,
+) -> PrunedFileScan | None:
+    """Plan one entry; ``None`` when it has no usable footer stats.
+
+    Shared by ``plan_pruned_scan`` (report-only) and ``execute_scan``
+    (execution) so both make identical keep/prune decisions.
+    """
+    if entry.footer is None:
+        return None
+    if footer_cache is not None:
+        stats = footer_cache.get(store, entry.footer)
+    else:
+        payload = store.read_footer_bytes(entry.footer)
+        if payload is None:
+            return None
+        try:
+            stats = parse_footer_stats(payload)
+        except (ValueError, KeyError, TypeError):
+            return None
+    if stats is None:
+        return None
+    result = prune_row_groups(stats, predicates)
+    return PrunedFileScan(
+        path=entry.path,
+        footer_hash=entry.footer,
+        total_row_groups=result.total_row_groups,
+        kept_row_groups=result.kept_row_groups,
+        pruned_row_groups=result.pruned_row_groups,
+    )
+
+
 def plan_pruned_scan(
     store: ContentQueryStore,
     tree_hash: str,
@@ -255,25 +291,6 @@ def plan_pruned_scan(
     already seen: content-addressed, so cached entries can never be stale.
     """
     for entry in store.iter_entries_for_prefix(tree_hash, prefix):
-        if entry.footer is None:
-            continue
-        if footer_cache is not None:
-            stats = footer_cache.get(store, entry.footer)
-        else:
-            payload = store.read_footer_bytes(entry.footer)
-            if payload is None:
-                continue
-            try:
-                stats = parse_footer_stats(payload)
-            except (ValueError, KeyError, TypeError):
-                continue
-        if stats is None:
-            continue
-        result = prune_row_groups(stats, predicates)
-        yield PrunedFileScan(
-            path=entry.path,
-            footer_hash=entry.footer,
-            total_row_groups=result.total_row_groups,
-            kept_row_groups=result.kept_row_groups,
-            pruned_row_groups=result.pruned_row_groups,
-        )
+        scan = plan_pruned_file(store, entry, predicates, footer_cache=footer_cache)
+        if scan is not None:
+            yield scan

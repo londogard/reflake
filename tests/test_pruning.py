@@ -59,9 +59,7 @@ def test_parse_where_clause_null_ops() -> None:
 
 
 def test_parse_where_clause_ignores_and_inside_string_literals() -> None:
-    predicates = parse_where_clause(
-        "name = 'research AND development' AND id > 5"
-    )
+    predicates = parse_where_clause("name = 'research AND development' AND id > 5")
     assert predicates == [
         Predicate(column="name", op="=", value="research AND development"),
         Predicate(column="id", op=">", value=5),
@@ -248,7 +246,9 @@ def test_plan_pruned_scan_prefix_filters_files(tmp_path: Path) -> None:
         assert scan.pruned_row_groups == (1, 2)
 
 
-def test_cli_query_prune(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_query_scan_explain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     _write_parquet_groups(tmp_path / "data.parquet", groups=3)
     LocalConfig(identity="content", parquet_footer=True).save(tmp_path)
     ReflakeRepository(tmp_path).commit("captured")
@@ -260,11 +260,13 @@ def test_cli_query_prune(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
             "--repo",
             str(tmp_path),
             "query",
-            "prune",
-            "main",
-            "data.parquet",
-            "--where",
+            "scan",
             "id >= 4096",
+            "--ref",
+            "main",
+            "--path",
+            "data.parquet",
+            "--explain",
         ]
     )
     captured = capsys.readouterr()
@@ -276,7 +278,7 @@ def test_cli_query_prune(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     )
 
 
-def test_cli_query_prune_json(
+def test_cli_query_scan_explain_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _write_parquet_groups(tmp_path / "data.parquet", groups=3)
@@ -291,20 +293,24 @@ def test_cli_query_prune_json(
             str(tmp_path),
             "--json",
             "query",
-            "prune",
-            "main",
-            "data.parquet",
-            "--where",
+            "scan",
             "id < 0",
+            "--ref",
+            "main",
+            "--path",
+            "data.parquet",
+            "--explain",
         ]
     )
     captured = capsys.readouterr()
     assert exit_code == 0
     payload = json.loads(captured.out)
-    assert payload == [
+    assert payload["rows"] == []
+    assert payload["stats"]["bytes_fetched"] == 0
+    assert payload["plan"] == [
         {
             "path": "data.parquet",
-            "footer_hash": payload[0]["footer_hash"],
+            "footer_hash": payload["plan"][0]["footer_hash"],
             "total_row_groups": 3,
             "kept_row_groups": [],
             "pruned_row_groups": [0, 1, 2],

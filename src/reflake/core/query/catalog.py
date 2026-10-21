@@ -45,14 +45,16 @@ def build_analytical_index(
     ) as temp:
         manifest_path = Path(temp.name)
         writer = csv.writer(temp)
-        writer.writerow(["path", "hash", "size", "mtime_ns", "footer", "commit_id"])
+        writer.writerow(
+            ["path", "hash", "size", "identity_mode", "footer", "commit_id"]
+        )
         for entry in repo.store.iter_all_entries(commit.tree):
             writer.writerow(
                 [
                     entry.path,
                     entry.hash,
                     entry.size,
-                    entry.mtime_ns,
+                    entry.identity_mode,
                     entry.footer or "",
                     commit_id,
                 ]
@@ -67,7 +69,7 @@ def build_analytical_index(
                 path::VARCHAR AS path,
                 hash::VARCHAR AS hash,
                 size::BIGINT AS size,
-                mtime_ns::BIGINT AS mtime_ns,
+                identity_mode::VARCHAR AS identity_mode,
                 NULLIF(footer, '')::VARCHAR AS footer,
                 commit_id::VARCHAR AS commit_id
             FROM read_csv_auto(?, header=true)
@@ -80,7 +82,11 @@ def build_analytical_index(
         parquet_path: Path | None = None
         if export_parquet:
             parquet_path = index_root / f"{commit_id}.parquet"
-            conn.execute("COPY files TO ? (FORMAT PARQUET)", [str(parquet_path)])
+            conn.execute(
+                "COPY files TO ? "
+                "(FORMAT PARQUET, KV_METADATA {origin: 'reflake', commit_id: ?})",
+                [str(parquet_path), commit_id],
+            )
     finally:
         conn.close()
         manifest_path.unlink(missing_ok=True)

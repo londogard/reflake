@@ -10,8 +10,8 @@ from reflake import (
     ReflakeFileSystem,
     create_repository,
     open_repository,
-    run_cli,
 )
+from reflake.cli import run_cli
 from reflake.core.objects import S3ObjectStore
 
 
@@ -54,35 +54,37 @@ def test_s3_atomic_cas_conditional_write(fake_s3_installer) -> None:
     store = S3ObjectStore("demo-bucket", "repos/test", client=client)
 
     # Initial CAS: expected None -> creates ref with IfNoneMatch='*'
-    assert store.compare_and_set_branch_ref(
-        "main", "1" * 64, expected_commit_id=None
-    ) is True
+    assert (
+        store.compare_and_set_branch_ref("main", "1" * 64, expected_commit_id=None)
+        is True
+    )
     ref_state = store.read_branch_ref("main")
     assert ref_state is not None
     assert ref_state.commit_id == "1" * 64
 
     # Create-only CAS on an existing branch fails
-    assert store.compare_and_set_branch_ref(
-        "main", "2" * 64, expected_commit_id=None
-    ) is False
+    assert (
+        store.compare_and_set_branch_ref("main", "2" * 64, expected_commit_id=None)
+        is False
+    )
 
     # CAS with wrong expected commit fails
-    assert store.compare_and_set_branch_ref(
-        "main", "2" * 64, expected_commit_id="0" * 64
-    ) is False
+    assert (
+        store.compare_and_set_branch_ref("main", "2" * 64, expected_commit_id="0" * 64)
+        is False
+    )
 
     # CAS with correct expected commit succeeds
-    assert store.compare_and_set_branch_ref(
-        "main", "2" * 64, expected_commit_id="1" * 64
-    ) is True
+    assert (
+        store.compare_and_set_branch_ref("main", "2" * 64, expected_commit_id="1" * 64)
+        is True
+    )
     updated_state = store.read_branch_ref("main")
     assert updated_state is not None
     assert updated_state.commit_id == "2" * 64
 
 
-def test_vfs_s3_dataset_roots(
-    fake_s3_installer, tmp_path: Path, monkeypatch
-) -> None:
+def test_vfs_s3_dataset_roots(fake_s3_installer, tmp_path: Path, monkeypatch) -> None:
     fake_s3_installer({})
     repo_uri = "s3://demo-bucket/repos/remote_demo"
     monkeypatch.chdir(tmp_path)
@@ -98,10 +100,41 @@ def test_vfs_s3_dataset_roots(
     with fs.open("reflake://remote@main/data.txt", "rb") as handle:
         assert handle.read() == b"s3 dataset content"
 
+    # Reads are seekable ranged reads even on S3 (no whole-stream buffering).
+    with fs.open("reflake://remote@main/data.txt", "rb") as handle:
+        assert handle.seekable()
+        handle.seek(-7, 2)
+        assert handle.read(7) == b"content"
+
     # List files via fsspec
     entries = fs.ls("reflake://remote@main/")
     assert len(entries) == 1
     assert entries[0]["name"] == "reflake://remote@main/data.txt"
+
+
+def test_duckdb_reads_reflake_uris(tmp_path: Path) -> None:
+    """DuckDB can register the VFS and run SQL over reflake:// URIs."""
+    import duckdb
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.table({"id": pa.array(range(1000), pa.int64())}),
+        tmp_path / "data.parquet",
+        row_group_size=100,
+    )
+    assert run_cli(["--repo", str(tmp_path), "init"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "seed"]) == 0
+
+    duckdb.register_filesystem(ReflakeFileSystem(dataset_roots={"ds": tmp_path}))
+    try:
+        rows = duckdb.sql(
+            "SELECT count(*) FROM "
+            "read_parquet('reflake://ds@main/data.parquet') WHERE id >= 900"
+        ).fetchall()
+    finally:
+        duckdb.unregister_filesystem("reflake")
+    assert rows == [(100,)]
 
 
 def test_repository_methods_cover_convenience_operations(tmp_path: Path) -> None:

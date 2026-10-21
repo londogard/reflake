@@ -15,19 +15,17 @@ Everything else (stores, codecs, tree writers, pruning internals) lives in
 when you need it, and expect it to move between minors.
 """
 
-from .cli import build_parser, main, run_cli
+from .cli import main
 from .core import (
-    DEFAULT_CHUNK_SIZE,
-    BaseConfig,
     BlobIntegrityError,
+    CommitId,
     CommitObject,
+    CommitStats,
     CorruptCommitError,
     DiffEntry,
     EmptyBranchError,
     FetchResult,
-    FileEntry,
     GcResult,
-    LocalConfig,
     MergeConflictError,
     MergeResult,
     MoveResult,
@@ -39,16 +37,13 @@ from .core import (
     PullResult,
     PushResult,
     RefConflictError,
-    ReflakeConfig,
     ReflakeError,
     ReflakeFileSystem,
     ReflakeRepository,
     ReflakeURI,
     RemoveResult,
     ResetResult,
-    S3Config,
     SourceNotFoundError,
-    StageChange,
     StageStatus,
     StorageUnavailableError,
     TransferEndpointError,
@@ -77,10 +72,10 @@ __all__ = [
     "pull",
     "fetch",
     # types returned by the API
+    "CommitId",
     "CommitObject",
+    "CommitStats",
     "DiffEntry",
-    "FileEntry",
-    "StageChange",
     "StageStatus",
     "MergeResult",
     "ResetResult",
@@ -91,11 +86,6 @@ __all__ = [
     "FetchResult",
     "PullResult",
     "PushResult",
-    # config
-    "BaseConfig",
-    "LocalConfig",
-    "S3Config",
-    "ReflakeConfig",
     # errors
     "ReflakeError",
     "RefConflictError",
@@ -113,10 +103,6 @@ __all__ = [
     "PreconditionFailedError",
     "SourceNotFoundError",
     "CorruptCommitError",
-    # CLI entry points
+    # CLI entry point (the `reflake` console script)
     "main",
-    "run_cli",
-    "build_parser",
-    # constants
-    "DEFAULT_CHUNK_SIZE",
 ]

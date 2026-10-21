@@ -30,18 +30,33 @@ def test_write_blob_stream_verifies_hash(tmp_path: Path) -> None:
     assert not store.object_exists("blob", other)
 
 
-def test_write_blob_file_is_atomic_and_verified(tmp_path: Path) -> None:
+def test_materialize_blob_file_hashes_once_and_publishes(tmp_path: Path) -> None:
+    """One pass: the digest is computed while copying, and returned.
+
+    ``write_blob_file`` is a pure publish (the caller already knows the
+    digest); re-hashing there doubled every commit's read and CPU cost.
+    """
     repo = create_repository(str(tmp_path / "repo"))
     store = repo.store
     src = tmp_path / "src.bin"
     src.write_bytes(b"file-payload")
     digest = blake3(b"file-payload").hexdigest()
-    store.write_blob_file(digest, src)
+
+    assert store.materialize_blob_file(src) == digest
     assert store.read_blob_bytes(digest) == b"file-payload"
 
-    other = blake3(b"expected-bytes").hexdigest()
     src.write_bytes(b"other-bytes")
-    with pytest.raises(ValueError, match="hash mismatch"):
-        store.write_blob_file(other, src)
-    assert not store.object_exists("blob", other)
+    other = store.materialize_blob_file(src)
+    assert other == blake3(b"other-bytes").hexdigest()
+    assert store.read_blob_bytes(other) == b"other-bytes"
     assert store.read_blob_bytes(digest) == b"file-payload"
+
+
+def test_materialize_blob_file_reuses_a_known_digest(tmp_path: Path) -> None:
+    repo = create_repository(str(tmp_path / "repo"))
+    store = repo.store
+    src = tmp_path / "src.bin"
+    src.write_bytes(b"payload")
+    digest = blake3(b"payload").hexdigest()
+    assert store.materialize_blob_file(src, known_digest=digest) == digest
+    assert store.read_blob_bytes(digest) == b"payload"

@@ -8,7 +8,10 @@ cheap ``object_exists`` probe first to avoid the upload in the common
 deduplicated case.
 
 Parts are sized so every part except the last is at least S3's 5 MiB minimum
-and the part count never exceeds the 10 000 service limit.
+and the part count never exceeds the 10 000 service limit. A file on disk is
+uploaded with several parts in flight (a 10 GiB file is 1 280 sequential
+round trips otherwise); a non-seekable stream stays sequential because its
+bytes cannot be read out of order.
 """
 
 from __future__ import annotations
@@ -25,21 +28,29 @@ class _Readable(Protocol):
 
     def read(self, size: int | None = None, /) -> bytes: ...
 
+
 #: Files at or below this size use a single ``PutObject``.
 MULTIPART_THRESHOLD = 64 * 1024 * 1024
-#: Default part size for multipart uploads.
-MULTIPART_PART_SIZE = 64 * 1024 * 1024
+#: Default part size. Smaller parts than the old 64 MiB keep several uploads
+#: in flight without unbounded memory (16 x 8 MiB = 128 MiB per file).
+MULTIPART_PART_SIZE = 8 * 1024 * 1024
 #: S3's minimum part size (except the final part).
 MIN_PART_SIZE = 5 * 1024 * 1024
 #: S3's maximum number of parts per upload.
 MAX_PARTS = 10_000
+#: Memory budget for in-flight parts of one file.
+PART_MEMORY_BUDGET = 128 * 1024 * 1024
 
 
 def part_size_for(total_size: int) -> int:
     """A part size that respects the minimum and the 10k-part limit."""
-    if total_size <= MULTIPART_PART_SIZE:
-        return MULTIPART_PART_SIZE
-    return max(MIN_PART_SIZE, -(-total_size // MAX_PARTS))
+    return max(MULTIPART_PART_SIZE, -(-total_size // MAX_PARTS))
+
+
+def _workers_for(part_size: int, count: int) -> int:
+    """In-flight parts for one file, bounded by the memory budget."""
+    by_memory = max(2, PART_MEMORY_BUDGET // max(part_size, 1))
+    return max(1, min(count, by_memory, 16))
 
 
 def _read_parts(source: BinaryIO, part_size: int) -> Iterator[bytes]:
@@ -140,7 +151,11 @@ def upload_file(
     *,
     if_none_match: bool = False,
 ) -> None:
-    """Upload a local file, streaming it (multipart above the threshold)."""
+    """Upload a local file: one PUT below the threshold, parallel parts above.
+
+    ``os.pread`` lets worker threads read disjoint ranges without sharing a
+    file cursor, so parts are uploaded concurrently and completed in order.
+    """
     path = Path(local_path)
     size = path.stat().st_size
     if if_none_match and size <= MULTIPART_THRESHOLD:
@@ -151,15 +166,42 @@ def upload_file(
         with path.open("rb") as handle:
             client.put_object(Bucket=bucket, Key=key, Body=handle)
         return
-    with path.open("rb") as handle:
-        upload_stream(
-            client,
-            bucket,
-            key,
-            handle,
-            part_size=part_size_for(size),
-            threshold=part_size_for(size),
+
+    from ..concurrency import map_bounded
+
+    part_size = part_size_for(size)
+    count = max(1, -(-size // part_size))
+    upload = client.create_multipart_upload(Bucket=bucket, Key=key)
+    upload_id = upload["UploadId"]
+    file_descriptor = os.open(path, os.O_RDONLY)
+    try:
+
+        def put_part(number: int) -> dict[str, Any]:
+            offset = (number - 1) * part_size
+            body = os.pread(file_descriptor, min(part_size, size - offset), offset)
+            response = client.upload_part(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                PartNumber=number,
+                Body=body,
+            )
+            return {"ETag": response["ETag"], "PartNumber": number}
+
+        parts = map_bounded(
+            put_part,
+            range(1, count + 1),
+            workers=_workers_for(part_size, count),
         )
+        _complete_upload(client, bucket, key, upload_id, parts)
+    except BaseException:
+        try:
+            client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+        except Exception:  # noqa: BLE001 – best-effort cleanup
+            pass
+        raise
+    finally:
+        os.close(file_descriptor)
 
 
 def download_to_file(

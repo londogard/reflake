@@ -92,7 +92,43 @@ class ObjectIO(Protocol):
         if_missing: bool = True,
     ) -> None: ...
 
+    def materialize_blob_file(
+        self, source_path: str | Path, *, known_digest: str | None = None
+    ) -> str:
+        """Store *source_path* as a blob and return its content digest.
+
+        ``known_digest`` is a stat-cache hit: the bytes are then published
+        under that name without re-hashing. Without it the adapter hashes
+        (local: while copying) and publishes, returning the new digest. This
+        is the single entry point commit uses, so no path stores the bytes
+        twice.
+        """
+        ...
+
     def object_exists(self, kind: RepositoryObjectKind, object_id: str) -> bool: ...
+
+    # ── Shared repository format ────────────────────────────────────────
+
+    def read_repo_format_bytes(self) -> bytes | None:
+        """The shared ``repo.json`` (format + ingest policy), if any."""
+        ...
+
+    def write_repo_format_bytes(self, payload: bytes) -> None:
+        """Create the shared ``repo.json``; idempotent, never rewritten."""
+        ...
+
+
+class BlobRangeReader(Protocol):
+    """Ranged reads over immutable blobs (see ``objects/rangefile.py``, §4).
+
+    Local adapters serve these from a file handle; S3 adapters issue
+    ``Range`` GETs.  Ranges are a read optimization for ``query scan``
+    execution, never a mutation path.
+    """
+
+    def read_blob_range(self, blob_hash: str, offset: int, length: int) -> bytes:
+        """Return up to *length* blob bytes starting at *offset*."""
+        ...
 
 
 class RefCas(Protocol):
@@ -117,14 +153,31 @@ class RefCas(Protocol):
     ) -> bool: ...
 
 
+class TagRefs(Protocol):
+    """Immutable tag refs (``refs/tags/*``): created once, never moved.
+
+    A tag's content is the commit id it pins, just like a branch ref — but
+    ``create_tag_ref`` is create-only and atomic (local ref lock, S3
+    ``IfNoneMatch``), so a concurrent create yields exactly one winner and an
+    existing tag is never retargeted. Changing a tag means an explicit
+    ``delete`` followed by ``create``; there is deliberately no update path.
+    """
+
+    def read_tag_ref(self, tag: str) -> str | None: ...
+
+    def create_tag_ref(self, tag: str, commit_id: str) -> bool: ...
+
+    def delete_tag_ref(self, tag: str) -> None: ...
+
+    def iter_tags(self) -> Iterator[str]: ...
+
+
 class TreeQuery(Protocol):
     """Tree-walk lookups: exact paths, prefixes, and full walks (§3)."""
 
     def iter_all_entries(self, tree_hash: str) -> Iterator[Entry]: ...
 
-    def lookup_entry(
-        self, tree_hash: str, logical_path: str
-    ) -> Entry | None: ...
+    def lookup_entry(self, tree_hash: str, logical_path: str) -> Entry | None: ...
 
     def iter_entries_for_prefix(
         self, tree_hash: str, logical_prefix: str
@@ -190,10 +243,12 @@ class HasRemoteURI(Protocol):
 class ObjectStore(
     ObjectIO,
     RefCas,
+    TagRefs,
     TreeQuery,
     StoreInventory,
     HasLocalPath,
     HasRemoteURI,
+    BlobRangeReader,
     Protocol,
 ):
     """A complete repository object store: the composition of all capabilities."""
@@ -202,19 +257,25 @@ class ObjectStore(
 # ── Narrow compositions: annotate each consumer with what it uses ────
 
 
-class RefObjectStore(ObjectIO, RefCas, BranchLister, Protocol):
-    """Immutable content + branch refs + ref listing (e.g. ``RefManager``)."""
+class RefObjectStore(ObjectIO, RefCas, TagRefs, BranchLister, Protocol):
+    """Immutable content + refs (branches and tags) + ref listing."""
 
 
 class ContentQueryStore(ObjectIO, TreeQuery, Protocol):
     """Immutable content + tree reads (e.g. query pruning)."""
 
 
+class ScanStore(ContentQueryStore, BlobRangeReader, Protocol):
+    """Content + tree reads + ranged blob reads (query scan execution, §4)."""
+
+
 class QueryRefStore(RefCas, TreeQuery, Protocol):
     """Branch refs + tree reads (e.g. ``StagingArea``)."""
 
 
-class RepositoryStore(ObjectIO, RefCas, TreeQuery, StoreInventory, Protocol):
+class RepositoryStore(
+    ObjectIO, RefCas, TagRefs, TreeQuery, StoreInventory, BlobRangeReader, Protocol
+):
     """Everything a repository needs except transfer endpoints.
 
     ``HasLocalPath`` / ``HasRemoteURI`` stay separate: only sync planning
@@ -222,4 +283,3 @@ class RepositoryStore(ObjectIO, RefCas, TreeQuery, StoreInventory, Protocol):
     so local-only and S3-only adapters type-check without pretending to
     provide the other side's endpoint.
     """
-

@@ -19,7 +19,7 @@ from ..domain import (
     StorageUnavailableError,
 )
 from ..entry_codec import Entry
-from ..layout import object_relative_key
+from ..layout import object_relative_key, ref_relative_key
 from . import multipart
 from .backends import BlobTransferBackend
 from .query import TreeCache, TreeWalker
@@ -182,9 +182,7 @@ class S3ObjectStore:
     def iter_all_entries(self, tree_hash: str) -> Iterator[Entry]:
         yield from self._walker.iter_all_entries(tree_hash)
 
-    def lookup_entry(
-        self, tree_hash: str, logical_path: str
-    ) -> Entry | None:
+    def lookup_entry(self, tree_hash: str, logical_path: str) -> Entry | None:
         return self._walker.lookup_entry(tree_hash, logical_path)
 
     def iter_entries_for_prefix(
@@ -272,6 +270,55 @@ class S3ObjectStore:
             return False
         return True
 
+    # ── Tags ─────────────────────────────────────────────────────────────
+
+    def read_tag_ref(self, tag: str) -> str | None:
+        try:
+            response = self.client.get_object(
+                Bucket=self.bucket, Key=self._ref_key("tags", tag)
+            )
+        except ClientError as error:
+            if self._missing(error):
+                return None
+            raise self._translate(error, "read_tag_ref") from error
+        return response["Body"].read().decode("utf-8").strip() or None
+
+    def create_tag_ref(self, tag: str, commit_id: str) -> bool:
+        # Create-only: ``IfNoneMatch="*"`` makes concurrent creates atomic,
+        # so an existing tag is never retargeted (tags are immutable).
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=self._ref_key("tags", tag),
+                Body=f"{commit_id}\n".encode(),
+                IfNoneMatch="*",
+            )
+        except ClientError as error:
+            if self._precondition_failed(error):
+                return False
+            raise self._translate(error, "create_tag_ref") from error
+        return True
+
+    def delete_tag_ref(self, tag: str) -> None:
+        try:
+            self.client.delete_object(
+                Bucket=self.bucket, Key=self._ref_key("tags", tag)
+            )
+        except ClientError as error:
+            raise self._translate(error, "delete_tag_ref") from error
+
+    def iter_tags(self) -> Iterator[str]:
+        prefix = self._ref_key("tags")
+        paginator = self.client.get_paginator("list_objects_v2")
+        try:
+            pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+            for page in pages:
+                for obj in page.get("Contents", []):
+                    key = str(obj["Key"])
+                    yield key[len(prefix) :] if key.startswith(prefix) else key
+        except ClientError as error:
+            raise self._translate(error, "list_objects") from error
+
     def _blob_uri(self, blob_hash: str) -> str:
         return f"s3://{self.bucket}/{self._key('blob', blob_hash)}"
 
@@ -329,8 +376,7 @@ class S3ObjectStore:
                     Bucket=self.bucket,
                     Delete={
                         "Objects": [
-                            {"Key": self._key(kind, object_id)}
-                            for object_id in batch
+                            {"Key": self._key(kind, object_id)} for object_id in batch
                         ],
                         "Quiet": True,
                     },
@@ -384,6 +430,19 @@ class S3ObjectStore:
             raise self._translate(error, "open_blob") from error
         return response["Body"]
 
+    def read_blob_range(self, blob_hash: str, offset: int, length: int) -> bytes:
+        if length <= 0:
+            return b""
+        try:
+            response = self.client.get_object(
+                Bucket=self.bucket,
+                Key=self._key("blob", blob_hash),
+                Range=f"bytes={offset}-{offset + length - 1}",
+            )
+        except ClientError as error:
+            raise self._translate(error, "read_blob_range") from error
+        return response["Body"].read()
+
     def write_blob_file(
         self,
         blob_hash: str,
@@ -407,9 +466,10 @@ class S3ObjectStore:
         # would be harmless anyway: the bytes are identical by construction.
         if if_missing:
             try:
-                if (
-                    os.stat(source_path).st_size > multipart.MULTIPART_THRESHOLD
-                    and self.object_exists("blob", blob_hash)
+                if os.stat(
+                    source_path
+                ).st_size > multipart.MULTIPART_THRESHOLD and self.object_exists(
+                    "blob", blob_hash
                 ):
                     return
             except OSError:
@@ -499,6 +559,85 @@ class S3ObjectStore:
                 return
             raise self._translate(error, "write_blob_stream") from error
 
+    def materialize_blob_file(
+        self, source_path: str | Path, *, known_digest: str | None = None
+    ) -> str:
+        """Upload a local file as a blob, returning its digest.
+
+        A stat-cache hit skips both hashing and the upload: this client
+        already stored these exact bytes under that key. (Blob keys are
+        content-addressed, so a concurrent writer storing the same content
+        wrote the same key.)
+        """
+        if known_digest is not None:
+            return known_digest
+        from ..hashing import blake3_digest_file
+
+        digest = blake3_digest_file(source_path)
+        self.write_blob_file(digest, source_path, if_missing=True)
+        return digest
+
+    #: S3's single-request CopyObject limit; larger objects need multipart copy.
+    MAX_COPY_BYTES = 5 * 1024 * 1024 * 1024
+
+    def copy_blob_from(
+        self, source_uri: str, blob_hash: str, *, size: int | None = None
+    ) -> bool:
+        """Server-side copy of an S3 object into the content-addressed blob key.
+
+        Importing a bucket prefix is the canonical migration path, and the
+        client has already read the bytes once to compute the digest. Copying
+        server-side turns "download + re-upload" into "download only": no
+        second egress, no local temp disk, no client CPU. Returns ``False``
+        (caller falls back to a normal upload) when S3 cannot copy directly.
+        """
+        from .source import parse_s3_uri
+
+        if size is not None and size > self.MAX_COPY_BYTES:
+            return False
+        bucket, key = parse_s3_uri(source_uri)
+        if not key:
+            return False
+        try:
+            self.client.copy_object(
+                Bucket=self.bucket,
+                Key=self._key("blob", blob_hash),
+                CopySource={"Bucket": bucket, "Key": key},
+            )
+            return True
+        except ClientError:
+            return False
+
+    def _repo_format_key(self) -> str:
+        from ..repo_format import REPO_FORMAT_KEY
+
+        return f"{self.prefix}/{REPO_FORMAT_KEY}" if self.prefix else REPO_FORMAT_KEY
+
+    def read_repo_format_bytes(self) -> bytes | None:
+        try:
+            response = self.client.get_object(
+                Bucket=self.bucket, Key=self._repo_format_key()
+            )
+        except ClientError as error:
+            if self._missing(error):
+                return None
+            raise self._translate(error, "read_repo_format_bytes") from error
+        return response["Body"].read()
+
+    def write_repo_format_bytes(self, payload: bytes) -> None:
+        # Create-only: concurrent `init`s must not retarget an existing
+        # repository's format, and identical payloads are harmless.
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=self._repo_format_key(),
+                Body=payload,
+                IfNoneMatch="*",
+            )
+        except ClientError as error:
+            if not self._precondition_failed(error):
+                raise self._translate(error, "write_repo_format_bytes") from error
+
     def object_exists(self, kind: RepositoryObjectKind, object_id: str) -> bool:
         if kind == "blob" and self._blob_transfer is not None:
             return self._blob_transfer.exists(self._blob_uri(object_id))
@@ -512,6 +651,12 @@ class S3ObjectStore:
 
     def _key(self, kind: RepositoryObjectKind, object_id: str) -> str:
         relative_path = self._relative_path(kind, object_id)
+        if self.prefix:
+            return f"{self.prefix}/{relative_path}"
+        return relative_path
+
+    def _ref_key(self, namespace: str, name: str = "") -> str:
+        relative_path = ref_relative_key(namespace, name)
         if self.prefix:
             return f"{self.prefix}/{relative_path}"
         return relative_path

@@ -158,6 +158,10 @@ def describe_source_uri(
         source_uri=path.as_uri(),
         size=stat.st_size,
         mtime_ns=stat.st_mtime_ns,
+        # A local file's only cheap version marker. Recording it as the
+        # "etag" makes pointer identity and drift detection uniform across
+        # local and S3 sources.
+        etag=f"mtime:{stat.st_mtime_ns}",
     )
 
 

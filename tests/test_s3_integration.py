@@ -4,9 +4,18 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from reflake.core import RefConflictError, ReflakeRepository, create_repository
+from reflake.core import (
+    RefConflictError,
+    ReflakeRepository,
+    create_repository,
+    execute_scan,
+    parse_where_clause,
+)
+from reflake.core.config import LocalConfig
 
 pytestmark = pytest.mark.integration
 
@@ -153,6 +162,49 @@ def test_s3_integration_metadata_import_verify_remove_and_move(
     assert sorted(final_entries) == ["photos/cat.jpg", "photos/dog.jpg"]
     assert final_entries["photos/cat.jpg"].blob_hash is not None
     assert final_entries["photos/dog.jpg"].blob_hash is None
+
+
+def test_s3_integration_query_scan_reads_only_kept_row_groups(
+    tmp_path: Path,
+    ministack_client,
+    s3_repo_root: str,
+) -> None:
+    """Pruned scans execute against real S3 range reads (measured)."""
+    worktree = tmp_path / "scan-worktree"
+    client_root = tmp_path / "scan-client"
+    worktree.mkdir(parents=True)
+    client_root.mkdir(parents=True)
+
+    rows = 40_000
+    parquet_path = worktree / "events.parquet"
+    table = pa.table(
+        {
+            "id": pa.array(range(rows), pa.int64()),
+            "lbl": [f"v{i}" for i in range(rows)],
+        }
+    )
+    pq.write_table(table, parquet_path, row_group_size=5_000)
+    size = parquet_path.stat().st_size
+
+    LocalConfig(identity="content", parquet_footer=True).save(worktree)
+    repo = _open_remote_repo(
+        s3_repo_root,
+        worktree=worktree,
+        client_root=client_root,
+        s3_client=ministack_client,
+    )
+    repo.commit("scan seed")
+    commit = repo.read_commit(repo.resolve_ref("main"))
+
+    scan = execute_scan(repo.store, commit.tree, "", parse_where_clause("id >= 35000"))
+    returned = list(scan.rows)
+    assert [row["id"] for row in returned] == list(range(35000, 40000))
+
+    stats = scan.stats
+    assert stats.row_groups_kept == 1
+    assert stats.row_groups_total == 8
+    assert stats.requests >= 1
+    assert stats.bytes_fetched < size * 0.5
 
 
 def test_s3_integration_reports_optimistic_concurrency_conflicts(

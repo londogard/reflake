@@ -7,7 +7,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from reflake import run_cli
+from conftest import head_commit
+
+from reflake.cli import run_cli
 from reflake.core import ReflakeFileSystem, create_repository
 from reflake.core.objects.tree import parse_tree_object
 
@@ -21,7 +23,7 @@ def test_cli_supports_command_local_repo_flag_for_s3_repositories(
 
     (tmp_path / "a.txt").write_text("one")
     assert run_cli(["--repo", repo_uri, "commit", "-m", "initial"]) == 0
-    commit_a = capsys.readouterr().out.strip()
+    commit_a = head_commit(capsys, tmp_path, uri=repo_uri)
     assert len(commit_a) == 64
 
     assert run_cli(["--repo", repo_uri, "branch", "feature"]) == 0
@@ -30,7 +32,7 @@ def test_cli_supports_command_local_repo_flag_for_s3_repositories(
 
     (tmp_path / "a.txt").write_text("two")
     assert run_cli(["--repo", repo_uri, "commit", "-m", "update"]) == 0
-    commit_b = capsys.readouterr().out.strip()
+    commit_b = head_commit(capsys, tmp_path, uri=repo_uri)
     assert len(commit_b) == 64
     assert commit_a != commit_b
 
@@ -63,7 +65,7 @@ def test_cli_metadata_only_rm_and_mv_work_for_s3_repositories(
     (tmp_path / "dir" / "b.txt").write_text("two")
 
     assert run_cli(["--repo", repo_uri, "commit", "-m", "initial"]) == 0
-    initial_commit = capsys.readouterr().out.strip()
+    initial_commit = head_commit(capsys, tmp_path, uri=repo_uri)
     assert initial_commit
 
     (tmp_path / "a.txt").unlink()
@@ -79,7 +81,7 @@ def test_cli_metadata_only_rm_and_mv_work_for_s3_repositories(
     assert rm_payload["removed"] == ["a.txt", "dir"]
 
     assert run_cli(["--repo", repo_uri, "commit", "-m", "rename and remove"]) == 0
-    commit_id = capsys.readouterr().out.strip()
+    commit_id = head_commit(capsys, tmp_path, uri=repo_uri)
     assert len(commit_id) == 64
 
     assert (
@@ -102,12 +104,12 @@ def test_cli_commit_branch_and_diff(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "initial"]) == 0
-    commit_a = capsys.readouterr().out.strip()
+    commit_a = head_commit(capsys, tmp_path)
     assert len(commit_a) == 64
 
     (tmp_path / "a.txt").write_text("two")
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "update"]) == 0
-    commit_b = capsys.readouterr().out.strip()
+    commit_b = head_commit(capsys, tmp_path)
     assert len(commit_b) == 64
 
     assert run_cli(["--repo", str(tmp_path), "branch", "exp"]) == 0
@@ -137,10 +139,12 @@ def test_cli_cat_reads_file_bytes(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "seed"]) == 0
     capsys.readouterr()
 
-    assert run_cli(["--repo", str(tmp_path), "cat", "main", "a.txt"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "cat", "a.txt", "--ref", "main"]) == 0
     assert capsys.readouterr().out == "hello cat"
 
-    assert run_cli(["--repo", str(tmp_path), "cat", "main", "missing.txt"]) == 3
+    assert (
+        run_cli(["--repo", str(tmp_path), "cat", "missing.txt", "--ref", "main"]) == 3
+    )
     assert "cat error: Path not found" in capsys.readouterr().err
 
 
@@ -154,10 +158,10 @@ def test_cli_virtual_ops_work_without_local_repo(
 
     (tmp_path / "a.txt").write_text("alpha")
     assert run_cli(["--repo", repo_uri, "commit", "-m", "seed"]) == 0
-    commit_id = capsys.readouterr().out.strip()
+    commit_id = head_commit(capsys, tmp_path, uri=repo_uri)
     assert len(commit_id) == 64
 
-    assert run_cli(["--repo", repo_uri, "cat", "main", "a.txt"]) == 0
+    assert run_cli(["--repo", repo_uri, "cat", "a.txt", "--ref", "main"]) == 0
     assert capsys.readouterr().out == "alpha"
 
     assert run_cli(["--repo", repo_uri, "--json", "list", ""]) == 0
@@ -227,9 +231,7 @@ def test_cli_verify_on_content_commit_is_clean(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "meta"]) == 0
     capsys.readouterr()
 
-    assert (
-        run_cli(["--repo", str(tmp_path), "--json", "identity", "verify"]) == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "--json", "identity", "verify"]) == 0
     verify_payload = json.loads(capsys.readouterr().out)
     assert verify_payload["verified_entries"] == 0
     assert verify_payload["unverifiable_entries"] == 0
@@ -256,7 +258,7 @@ def test_cli_verify_reports_pointer_candidates_and_fails(
     )
     capsys.readouterr()
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "import"]) == 0
-    first_commit = capsys.readouterr().out.strip()
+    first_commit = head_commit(capsys, tmp_path)
 
     # Read-only audit: reports the candidate and exits non-zero.
     assert run_cli(["--repo", str(tmp_path), "--json", "identity", "verify"]) == 1
@@ -287,7 +289,7 @@ def test_cli_promote_on_pointer_entry_promotes_it(
     )
     capsys.readouterr()
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "import"]) == 0
-    first_commit = capsys.readouterr().out.strip()
+    first_commit = head_commit(capsys, tmp_path)
 
     assert run_cli(["--repo", str(tmp_path), "--json", "identity", "promote"]) == 0
     promote_payload = json.loads(capsys.readouterr().out)
@@ -304,9 +306,7 @@ def test_cli_promote_on_pointer_entry_promotes_it(
     latest_entries = parse_tree_object(tree_path.read_bytes())
     assert latest_entries[0].kind == "b"
 
-    assert (
-        run_cli(["--repo", str(tmp_path), "--json", "identity", "verify"]) == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "--json", "identity", "verify"]) == 0
     verify_again_payload = json.loads(capsys.readouterr().out)
     assert verify_again_payload["unverifiable_entries"] == 0
     assert verify_again_payload["verified_entries"] == 0
@@ -317,7 +317,7 @@ def test_cli_staging_commit_is_branch_scoped(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "base"]) == 0
-    base_commit = capsys.readouterr().out.strip()
+    base_commit = head_commit(capsys, tmp_path)
     assert base_commit
 
     assert run_cli(["--repo", str(tmp_path), "branch", "feature"]) == 0
@@ -344,7 +344,7 @@ def test_cli_staging_commit_is_branch_scoped(tmp_path: Path, capsys) -> None:
         assert handle.read() == b"feature"
 
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "feature only"]) == 0
-    feature_commit = capsys.readouterr().out.strip()
+    feature_commit = head_commit(capsys, tmp_path)
     assert feature_commit and feature_commit != base_commit
 
     assert run_cli(["--repo", str(tmp_path), "--json", "status"]) == 0
@@ -394,7 +394,7 @@ def test_cli_add_supports_arbitrary_local_source_with_logical_destination(
     assert add_payload["added"] == ["imports/external.txt"]
 
     assert run_cli(["--repo", str(repo_root), "commit", "-m", "ingest external"]) == 0
-    commit_id = capsys.readouterr().out.strip()
+    commit_id = head_commit(capsys, repo_root)
     assert len(commit_id) == 64
 
     repo = create_repository(repo_root)
@@ -440,7 +440,7 @@ def test_cli_add_supports_s3_source_with_staged_read_and_logical_destination(
         assert handle.read() == b"remote payload"
 
     assert run_cli(["--repo", str(repo_root), "commit", "-m", "ingest remote"]) == 0
-    commit_id = capsys.readouterr().out.strip()
+    commit_id = head_commit(capsys, repo_root)
     assert len(commit_id) == 64
 
     repo = create_repository(repo_root)
@@ -551,7 +551,7 @@ def test_cli_remote_staged_add_preserves_existing_entries_and_uploads_one_blob(
 
     (tmp_path / "a.txt").write_text("alpha")
     assert run_cli(["--repo", repo_uri, "commit", "-m", "initial"]) == 0
-    first_commit = capsys.readouterr().out.strip()
+    first_commit = head_commit(capsys, tmp_path, uri=repo_uri)
     assert len(first_commit) == 64
 
     initial_blob_keys = {
@@ -567,7 +567,7 @@ def test_cli_remote_staged_add_preserves_existing_entries_and_uploads_one_blob(
     assert add_payload["added"] == ["b.txt"]
 
     assert run_cli(["--repo", repo_uri, "commit", "-m", "add b"]) == 0
-    second_commit = capsys.readouterr().out.strip()
+    second_commit = head_commit(capsys, tmp_path, uri=repo_uri)
     assert len(second_commit) == 64
     assert second_commit != first_commit
 
@@ -609,7 +609,7 @@ def test_cli_remote_commit_ignores_stale_lock_objects(
 
     (tmp_path / "a.txt").write_text("alpha")
     assert run_cli(["--repo", repo_uri, "commit", "-m", "initial"]) == 0
-    commit_id = capsys.readouterr().out.strip()
+    commit_id = head_commit(capsys, tmp_path, uri=repo_uri)
 
     assert len(commit_id) == 64
     # Locks are never consulted or created; the pre-seeded object is inert.
@@ -622,7 +622,7 @@ def test_cli_merge_fast_forwards_target_branch(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "base"]) == 0
-    base_commit = capsys.readouterr().out.strip()
+    base_commit = head_commit(capsys, tmp_path)
     assert base_commit
 
     assert run_cli(["--repo", str(tmp_path), "branch", "feature"]) == 0
@@ -635,7 +635,7 @@ def test_cli_merge_fast_forwards_target_branch(tmp_path: Path, capsys) -> None:
     capsys.readouterr()
 
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "feature commit"]) == 0
-    feature_commit = capsys.readouterr().out.strip()
+    feature_commit = head_commit(capsys, tmp_path)
     assert feature_commit and feature_commit != base_commit
 
     assert run_cli(["--repo", str(tmp_path), "checkout", "main"]) == 0
@@ -666,7 +666,7 @@ def test_cli_merge_three_way_succeeds(tmp_path: Path, capsys) -> None:
 
     (tmp_path / "main.txt").write_text("main")
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "main commit"]) == 0
-    main_commit = capsys.readouterr().out.strip()
+    main_commit = head_commit(capsys, tmp_path)
     assert main_commit
 
     (tmp_path / "feature.txt").write_text("feature")
@@ -676,7 +676,7 @@ def test_cli_merge_three_way_succeeds(tmp_path: Path, capsys) -> None:
     capsys.readouterr()
 
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "feature commit"]) == 0
-    feature_commit = capsys.readouterr().out.strip()
+    feature_commit = head_commit(capsys, tmp_path)
     assert feature_commit and feature_commit != main_commit
 
     # Diverged branches with disjoint files: metadata-only 3-way merge succeeds.
@@ -702,12 +702,12 @@ def test_cli_log_command(tmp_path: Path, capsys, monkeypatch) -> None:
     # 2. Make first commit
     (tmp_path / "a.txt").write_text("one")
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "initial seed"]) == 0
-    commit_a = capsys.readouterr().out.strip()
+    commit_a = head_commit(capsys, tmp_path)
 
     # 3. Make second commit
     (tmp_path / "a.txt").write_text("two")
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "update progress"]) == 0
-    commit_b = capsys.readouterr().out.strip()
+    commit_b = head_commit(capsys, tmp_path)
 
     # 4. Run log with default format
     assert run_cli(["--repo", str(tmp_path), "log"]) == 0
@@ -845,12 +845,12 @@ def test_cli_list_command(tmp_path: Path, capsys, monkeypatch) -> None:
 
     assert run_cli(["list"]) == 0
     out = capsys.readouterr().out.strip().splitlines()
-    assert "a.txt" in out
-    assert "nested/b.txt" in out
+    assert "a.txt" in [line.split()[-1] for line in out]
+    assert "nested/b.txt" in [line.split()[-1] for line in out]
 
     assert run_cli(["list", "nested"]) == 0
     out = capsys.readouterr().out.strip()
-    assert out == "nested/b.txt"
+    assert out.split()[-1] == "nested/b.txt"
 
 
 def test_cli_list_command_json(tmp_path: Path, capsys, monkeypatch) -> None:
@@ -879,7 +879,7 @@ def test_cli_list_with_ref(tmp_path: Path, capsys, monkeypatch) -> None:
 
     assert run_cli(["list"]) == 0
     out = capsys.readouterr().out.strip()
-    assert out == "a.txt"
+    assert out.split()[-1] == "a.txt"
 
 
 def test_cli_checkout_command(tmp_path: Path, capsys, monkeypatch) -> None:
@@ -927,7 +927,7 @@ def test_cli_checkout_restore_all_files(tmp_path: Path, capsys) -> None:
     assert not (tmp_path / "a.txt").exists()
     assert not (tmp_path / "sub" / "b.txt").exists()
 
-    assert run_cli(["--repo", str(tmp_path), "restore", "main"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "restore", "--ref", "main"]) == 0
     out = capsys.readouterr().out
     assert "Restored 2 file(s) from 'main'" in out
     assert (tmp_path / "a.txt").read_text() == "alpha"
@@ -945,7 +945,7 @@ def test_cli_checkout_restore_specific_paths(tmp_path: Path, capsys) -> None:
     (tmp_path / "x.txt").unlink()
     (tmp_path / "y.txt").unlink()
 
-    assert run_cli(["--repo", str(tmp_path), "restore", "main", "--path", "x.txt"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "restore", "x.txt", "--ref", "main"]) == 0
     out = capsys.readouterr().out
     assert "Restored 1 file(s) from 'main'" in out
     assert (tmp_path / "x.txt").read_text() == "x"
@@ -961,7 +961,9 @@ def test_cli_checkout_restore_force_overwrite(tmp_path: Path, capsys) -> None:
 
     (tmp_path / "f.txt").write_text("modified")
 
-    assert run_cli(["--repo", str(tmp_path), "restore", "main", "--force"]) == 0
+    assert (
+        run_cli(["--repo", str(tmp_path), "restore", "--ref", "main", "--force"]) == 0
+    )
     out = capsys.readouterr().out
     assert "Restored 1 file(s) from 'main'" in out
     assert (tmp_path / "f.txt").read_text() == "original"
@@ -976,32 +978,35 @@ def test_cli_checkout_restore_safe_skips_existing(tmp_path: Path, capsys) -> Non
 
     (tmp_path / "f.txt").write_text("modified")
 
-    assert run_cli(["--repo", str(tmp_path), "restore", "main"]) == 0
+    assert run_cli(["--repo", str(tmp_path), "restore", "--ref", "main"]) == 0
     out = capsys.readouterr().out
     assert "Nothing to restore" in out
     assert (tmp_path / "f.txt").read_text() == "modified"
 
 
-def test_cli_restore_requires_ref(tmp_path: Path, capsys) -> None:
+def test_cli_restore_defaults_to_current_branch(tmp_path: Path, capsys) -> None:
+    (tmp_path / "a.txt").write_text("alpha")
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
-    # Missing required argument is a usage error → exit 1 (2 is reserved for
-    # retryable conflicts).
-    assert run_cli(["--repo", str(tmp_path), "restore"]) == 1
-    err_out = capsys.readouterr().err.strip()
-    assert "the following arguments are required" in err_out
+    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "seed"]) == 0
+    capsys.readouterr()
+    (tmp_path / "a.txt").unlink()
+
+    # No ref given: restore from the current branch (git-like ergonomics).
+    assert run_cli(["--repo", str(tmp_path), "restore"]) == 0
+    assert (tmp_path / "a.txt").read_text() == "alpha"
 
 
 def test_cli_restore_unknown_ref(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
-    assert run_cli(["--repo", str(tmp_path), "restore", "nonexistent"]) == 3
+    assert run_cli(["--repo", str(tmp_path), "restore", "--ref", "nonexistent"]) == 3
     err_out = capsys.readouterr().err.strip()
     assert "Unknown" in err_out
 
 
 def test_blob_stream_read_via_filesystem(tmp_path: Path) -> None:
-    from reflake.core.vfs import _BlobReadFile
+    from reflake.core.objects.rangefile import RangeFile
 
     (tmp_path / "data.bin").write_bytes(b"streaming test content")
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
@@ -1009,7 +1014,7 @@ def test_blob_stream_read_via_filesystem(tmp_path: Path) -> None:
 
     fs = ReflakeFileSystem(dataset_roots={"ds": tmp_path})
     handle = fs._open("reflake://ds@main/data.bin", "rb")
-    assert isinstance(handle, _BlobReadFile)
+    assert isinstance(handle, RangeFile)
     assert handle.readable()
     assert handle.read() == b"streaming test content"
     handle.close()
@@ -1084,6 +1089,6 @@ def test_blob_stream_returns_type_from_open_blob_stream(tmp_path: Path) -> None:
 
     fs = ReflakeFileSystem(dataset_roots={"ds": tmp_path})
     handle = fs._open("reflake://ds@main/f.txt", "rb")
-    assert type(handle).__name__ == "_BlobReadFile"
+    assert type(handle).__name__ == "RangeFile"
     assert not isinstance(handle, io.BytesIO)
     handle.close()

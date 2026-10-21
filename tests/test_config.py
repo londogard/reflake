@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from reflake import run_cli
+from reflake.cli import run_cli
 from reflake.core.config import (
     CURRENT_FORMAT_VERSION,
     BaseConfig,

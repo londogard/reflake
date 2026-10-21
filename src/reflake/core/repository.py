@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
@@ -10,7 +10,9 @@ from .client_state import LocalClientState
 from .config import BaseConfig, S3Config
 from .domain import (
     BlobIntegrityError,
+    CommitId,
     CommitObject,
+    CommitStats,
     DiffEntry,
     EmptyBranchError,
     GcResult,
@@ -25,7 +27,7 @@ from .domain import (
     StageStatus,
     VerifyResult,
 )
-from .entry_codec import Entry
+from .entry_codec import Entry, matches_logical_path
 from .layout import initialize_reflake_layout
 from .objects import (
     BlobTransferBackend,
@@ -37,11 +39,13 @@ from .objects import (
     build_s3_client,
     parse_s3_uri,
 )
-from .repository_support import matches_logical_path, merge_base_commit
+from .repo_format import RepoFormat, format_for_config
+from .repository_support import merge_base_commit
 from .services.entries import EntryFactory
 from .services.refs import RefManager
 from .services.staging import StagingArea
 from .services.tree import TreeWriter
+from .stat_cache import StatCache
 
 
 class ReflakeRepository:
@@ -59,28 +63,61 @@ class ReflakeRepository:
         if config is not None:
             config.validate()
         self.store = store or LocalObjectStore(self.layout.root)
+        # Shared format wins over client config: ingest policy must agree
+        # across clients, or identical bytes produce different trees.
+        try:
+            format_payload = self.store.read_repo_format_bytes()
+        except Exception:  # noqa: BLE001 – a damaged repo.json must not brick reads
+            format_payload = None
+        self.repo_format = (
+            RepoFormat.parse(format_payload) if format_payload is not None else None
+        )
+        identity_mode = (
+            self.repo_format.identity
+            if self.repo_format is not None
+            else (config.identity if config else "content")
+        )
+        parquet_footer = (
+            self.repo_format.parquet_footer
+            if self.repo_format is not None
+            else bool(config.parquet_footer) if config else False
+        )
+        default_branch = (
+            self.repo_format.default_branch
+            if self.repo_format is not None
+            else (config.default_branch if config else "main")
+        )
+        self.identity_mode = identity_mode
+        self.capture_footers = parquet_footer
         if isinstance(self.store, S3ObjectStore) and blob_transfer is not None:
             self.store.transfer_backend = blob_transfer
         self.client_state = client_state or self._default_client_state()
-        self.refs = RefManager(store=self.store, client_state=self.client_state)
-        trust_mtime = bool(config.trust_mtime) if config else False
+        self.refs = RefManager(
+            store=self.store,
+            client_state=self.client_state,
+            default_branch=default_branch,
+        )
+        self.stat_cache = StatCache(
+            self.client_state.cache_dir / "stat-cache.json",
+            enabled=bool(config.stat_cache) if config else True,
+        )
         self.tree_writer = TreeWriter(
             store=self.store,
             refs=self.refs,
             client_state=self.client_state,
-            trust_mtime=trust_mtime,
+            stat_cache=self.stat_cache,
         )
         self.entries = EntryFactory(
             root=self.layout.root,
             store=self.store,
-            capture_footers=bool(config.parquet_footer) if config else False,
+            capture_footers=parquet_footer,
         )
         self.staging = StagingArea(
             client_state=self.client_state,
             root=self.layout.root,
             store=self.store,
             refs=self.refs,
-            trust_mtime=trust_mtime,
+            stat_cache=self.stat_cache,
         )
 
     def _default_client_state(self) -> LocalClientState:
@@ -119,6 +156,18 @@ class ReflakeRepository:
     def delete_branch(self, name: str) -> str:
         """Delete a branch by CAS-ing its ref to unborn (see RefManager)."""
         return self.refs.delete_branch(name)
+
+    def tag(self, name: str, ref: str | None = None) -> str:
+        """Create an immutable tag (default target: current branch head)."""
+        return self.refs.create_tag(name, ref)
+
+    def delete_tag(self, name: str) -> str:
+        """Delete a tag; deleting is the only way to reuse its name."""
+        return self.refs.delete_tag(name)
+
+    def tags(self) -> list[dict[str, Any]]:
+        """List tags with their pinned commit and message."""
+        return self.refs.tags()
 
     def merge(self, source_ref: str, target_ref: str) -> MergeResult:
         if not source_ref:
@@ -169,13 +218,21 @@ class ReflakeRepository:
             target_obj.tree,
             source_obj.tree,
         )
-        branch_state = self.refs.require_branch_state(target_ref)
+        current = self.store.read_branch_ref(target_ref)
+        current_commit = current.commit_id if current else None
+        if current_commit != target_commit:
+            raise RefConflictError(
+                branch=target_ref,
+                operation="merge",
+                expected_commit_id=target_commit,
+                current_commit_id=current_commit,
+            )
         commit_id = self.tree_writer.write_commit_object(
             branch=target_ref,
             message=f"merge {source_ref} into {target_ref}",
             parents=[target_commit, source_commit],
             tree_hash=merged_tree,
-            expected_commit_id=branch_state.commit_id,
+            expected_commit_id=target_commit,
             operation="merge",
         )
         return MergeResult(
@@ -243,15 +300,12 @@ class ReflakeRepository:
         message: str,
         *,
         staged_only: bool = False,
-    ) -> str:
+    ) -> CommitId:
         if not message.strip():
             raise ValueError("Commit message cannot be empty")
 
-        config = BaseConfig.load(self.root)
-        identity_mode = config.identity if config else "content"
-        if identity_mode not in ("content", "pointer"):
-            identity_mode = "content"
-        capture_footers = bool(config.parquet_footer) if config else False
+        identity_mode = self.identity_mode
+        capture_footers = self.capture_footers
 
         branch = self.current_branch()
         self.refs.ensure_branch_exists(branch)
@@ -339,8 +393,46 @@ class ReflakeRepository:
                 expected_commit_id=None,
                 current_commit_id=None,
             )
+        stats = self._commit_stats(
+            parent_commit_id=parent_commit,
+            parent_tree=parent_tree,
+            root_tree=root_tree,
+        )
         self.staging.save(branch, {})
-        return commit_id
+        return CommitId(commit_id, stats)
+
+    def _commit_stats(
+        self,
+        *,
+        parent_commit_id: str | None,
+        parent_tree: str | None,
+        root_tree: str,
+    ) -> CommitStats:
+        """Count what changed; O(changed subtrees), never O(tree)."""
+        if parent_tree is None:
+            added = sum(1 for _ in self.store.iter_all_entries(root_tree))
+            return CommitStats(
+                added=added,
+                removed=0,
+                modified=0,
+                parent_commit_id=None,
+                tree=root_tree,
+            )
+        added = removed = modified = 0
+        for change in self.tree_writer.diff_trees(parent_tree, root_tree):
+            if change.change == "added":
+                added += 1
+            elif change.change == "removed":
+                removed += 1
+            else:
+                modified += 1
+        return CommitStats(
+            added=added,
+            removed=removed,
+            modified=modified,
+            parent_commit_id=parent_commit_id,
+            tree=root_tree,
+        )
 
     def import_s3(
         self,
@@ -369,6 +461,7 @@ class ReflakeRepository:
         ref: str | None = None,
         identity_mode: str = "content",
         destination_path: str | None = None,
+        progress: Callable[[int], None] | None = None,
     ) -> StageStatus:
         from .repository_ops import repo_add
 
@@ -378,12 +471,19 @@ class ReflakeRepository:
             ref=ref,
             identity_mode=identity_mode,
             destination_path=destination_path,
+            progress=progress,
         )
 
-    def rm(self, paths: list[str], *, ref: str | None = None) -> StageStatus:
+    def rm(
+        self,
+        paths: list[str],
+        *,
+        ref: str | None = None,
+        worktree: bool = True,
+    ) -> StageStatus:
         from .repository_ops import repo_rm
 
-        return repo_rm(self, paths, ref=ref)
+        return repo_rm(self, paths, ref=ref, worktree=worktree)
 
     def remove_paths(
         self,
@@ -414,11 +514,18 @@ class ReflakeRepository:
         destination_path: str,
         *,
         ref: str | None = None,
+        worktree: bool = True,
     ) -> StageStatus:
         """Stage a move operation without committing."""
         from .repository_ops import repo_move_staged
 
-        return repo_move_staged(self, source_path, destination_path, ref=ref)
+        return repo_move_staged(
+            self,
+            source_path,
+            destination_path,
+            ref=ref,
+            worktree=worktree,
+        )
 
     def status(
         self, *, ref: str | None = None, working_tree: bool = False
@@ -646,11 +753,11 @@ class ReflakeRepository:
         """Compute reachable objects from all refs and report (or prune) orphans.
 
         Audit-only by default (docs/architecture.md §11): reachable set = the
-        commit DAG from every branch head, their tree DAGs, and the blob and
-        footer objects those trees reference.  ``dry_run=False`` deletes the
-        orphans, but never objects younger than the grace window: a concurrent
-        writer publishes immutable objects *before* it CASes its ref, so a
-        mark-and-sweep that ignored age could delete live data.
+        commit DAG from every branch head and tag, their tree DAGs, and the
+        blob and footer objects those trees reference.  ``dry_run=False``
+        deletes the orphans, but never objects younger than the grace window:
+        a concurrent writer publishes immutable objects *before* it CASes its
+        ref, so a mark-and-sweep that ignored age could delete live data.
 
         The sweep streams the existence source (*inventory*, defaulting to
         the repository store) and deletes as it goes, so peak memory is the
@@ -692,6 +799,13 @@ class ReflakeRepository:
             state = self.store.read_branch_ref(branch)
             if state and state.commit_id:
                 pending.append(state.commit_id)
+        # Tags are roots too: deleting/moving a branch must not collect a
+        # commit that a tag still pins (immutability means the tag outlives
+        # the branch it was taken from).
+        for tag in self.store.iter_tags():
+            tagged_commit = self.store.read_tag_ref(tag)
+            if tagged_commit:
+                pending.append(tagged_commit)
         seen_trees: set[str] = set()
         while pending:
             commit_id = pending.pop()
@@ -699,9 +813,7 @@ class ReflakeRepository:
                 continue
             reachable_commits.add(commit_id)
             commit = self.refs.read_commit(commit_id)
-            for tree_hash in inspector.iter_tree_hashes(
-                commit.tree, _seen=seen_trees
-            ):
+            for tree_hash in inspector.iter_tree_hashes(commit.tree, _seen=seen_trees):
                 reachable_trees.add(tree_hash)
             pending.extend(commit.parents)
 
@@ -862,6 +974,10 @@ def init_repository(
             repo_root
         )
     store = LocalObjectStore(repo_root)
+    if store.read_repo_format_bytes() is None:
+        store.write_repo_format_bytes(
+            format_for_config(BaseConfig.load(repo_root)).to_json()
+        )
     if store.read_branch_ref(default_branch) is None:
         store.compare_and_set_branch_ref(default_branch, None, expected_commit_id=None)
     return repo_root

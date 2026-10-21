@@ -9,9 +9,10 @@ manifests; unchanged subtrees are reused by content-addressing.
 from __future__ import annotations
 
 import shlex
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Literal
 
+from .concurrency import map_bounded
 from .domain import (
     MoveResult,
     RemoveResult,
@@ -19,12 +20,12 @@ from .domain import (
     StageStatus,
     VerifyResult,
 )
-from .entry_codec import Entry
+from .entry_codec import Entry, matches_logical_path
 from .repository_support import (
-    matches_logical_path,
     move_logical_path,
     normalize_logical_paths,
     normalize_repository_path,
+    pointer_identity,
     relocate_manifest_entry,
 )
 
@@ -74,6 +75,7 @@ def repo_add(
     ref: str | None = None,
     identity_mode: str = "content",
     destination_path: str | None = None,
+    progress: Callable[[int], None] | None = None,
 ) -> StageStatus:
     if identity_mode not in {"content", "pointer"}:
         raise ValueError("identity_mode must be one of: content, pointer")
@@ -82,20 +84,37 @@ def repo_add(
     staged = repo.staging.load(branch)
     if destination_path is not None and len(paths) != 1:
         raise ValueError("--as can only be used when staging exactly one source")
+    staged_count = 0
     for raw_source in paths:
         for logical_path, source_uri in repo.staging.expand_stage_source(
             raw_source,
             destination_path=destination_path,
         ):
-            size, mtime_ns = _source_stat(source_uri)
+            # `add` materializes content-mode sources now (hash + store the
+            # blob) so `commit` never re-reads the worktree, and the staged
+            # set is a real snapshot rather than a promise. Pointer mode only
+            # records source metadata: no bytes move until `promote`.
+            entry = repo.entries.entry_from_source_uri(
+                logical_path=logical_path,
+                source_uri=source_uri,
+                identity_mode=identity_mode,
+                store_blob=identity_mode == "content",
+            )
+            _, mtime_ns = _source_stat(source_uri)
             staged[logical_path] = StageChange(
                 path=logical_path,
                 action="add",
                 identity_mode=identity_mode,
                 source_uri=source_uri,
-                size=size,
+                blob_hash=entry.hash if identity_mode == "content" else None,
+                size=entry.size,
                 mtime_ns=mtime_ns,
+                footer=entry.footer,
+                source_etag=entry.source_etag,
             )
+            staged_count += 1
+            if progress is not None:
+                progress(staged_count)
     _reject_conflicting_adds(staged)
     repo.staging.save(branch, staged)
     return repo.status(ref=branch)
@@ -150,16 +169,73 @@ def repo_import_s3(
     )
 
 
+def _drop_from_worktree(
+    repo: ReflakeRepository, normalized_paths: list[str]
+) -> list[str]:
+    """Delete staged-removal paths from the worktree (deepest first)."""
+    import shutil
+
+    removed: list[str] = []
+    for path in sorted(normalized_paths, key=len, reverse=True):
+        target = repo.root / path
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.exists() or target.is_symlink():
+            target.unlink(missing_ok=True)
+        else:
+            continue
+        repo.stat_cache.forget(path)
+        removed.append(path)
+    return removed
+
+
 def repo_rm(
-    repo: ReflakeRepository, paths: list[str], *, ref: str | None = None
+    repo: ReflakeRepository,
+    paths: list[str],
+    *,
+    ref: str | None = None,
+    worktree: bool = True,
 ) -> StageStatus:
+    """Stage removals, and delete them from the worktree by default.
+
+    A metadata-only deletion is undone by the next full ``commit`` (which
+    overlays the worktree onto the parent): the file is still on disk, so it
+    is simply re-added. Deleting the worktree copy too — what ``git rm``
+    does — removes that trap. ``worktree=False`` keeps a pure metadata
+    deletion for virtual datasets with no checkout.
+    """
     branch = ref or repo.current_branch()
     repo.refs.ensure_branch_exists(branch)
     staged = repo.staging.load(branch)
+    commit = repo.read_commit(repo.resolve_ref(branch))
+    normalized_paths: list[str] = []
 
     for path in paths:
         normalized = normalize_repository_path(path)
+        known = repo.store.lookup_entry(commit.tree, normalized) is not None
+        if not known:
+            known = (
+                next(
+                    repo.store.iter_entries_for_prefix(commit.tree, normalized),
+                    None,
+                )
+                is not None
+            )
+        if not known:
+            # Cancelling a staged add (or a whole staged prefix) is a valid
+            # `rm` even when nothing is committed at that path yet.
+            known = normalized in staged or any(
+                matches_logical_path(staged_path, normalized) for staged_path in staged
+            )
+        if not known:
+            raise FileNotFoundError(
+                f"Path not found in branch '{branch}': {normalized}"
+            )
         staged[normalized] = StageChange(path=normalized, action="remove")
+        normalized_paths.append(normalized)
+
+    if ref is None and worktree:
+        _drop_from_worktree(repo, normalized_paths)
     repo.staging.save(branch, staged)
     return repo.status(ref=branch)
 
@@ -314,6 +390,7 @@ def repo_move_staged(
     destination_path: str,
     *,
     ref: str | None = None,
+    worktree: bool = True,
 ) -> StageStatus:
     """Stage a move operation without committing."""
     branch = ref or repo.current_branch()
@@ -353,16 +430,40 @@ def repo_move_staged(
             action="add",
             identity_mode=entry.identity_mode,
             source_uri=entry.source_uri,
-            blob_hash=entry.blob_hash,
+            blob_hash=entry.hash,
             size=entry.size,
+            footer=entry.footer,
+            source_etag=entry.source_etag,
         )
         moved_count += 1
 
     if moved_count == 0:
         raise FileNotFoundError(f"Path not found in branch '{branch}': {source}")
 
+    if ref is None and worktree:
+        _move_in_worktree(repo, source, destination)
+
     repo.staging.save(branch, stage)
     return repo.status(ref=branch)
+
+
+def _move_in_worktree(
+    repo: ReflakeRepository, source: str, destination: str
+) -> None:
+    """Rename the source in the worktree, so the move is not undone later.
+
+    Without this, ``mv a b`` + commit leaves ``a`` on disk; the next full
+    commit re-adds it alongside ``b`` and the dataset silently gains a copy.
+    """
+    import shutil
+
+    source_path = repo.root / source
+    destination_path = repo.root / destination
+    if not source_path.exists() or destination_path.exists():
+        return
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source_path), str(destination_path))
+    repo.stat_cache.forget(source)
 
 
 def _pointer_drifted(entry: Entry, client: object) -> bool:
@@ -381,12 +482,10 @@ def _pointer_drifted(entry: Entry, client: object) -> bool:
         metadata = describe_source_uri(entry.source_uri, client=client)
     except (SourceNotFoundError, ValueError, OSError):
         return True
-    if metadata.size != entry.size:
+    expected = pointer_identity(size=entry.size, marker=entry.source_etag)
+    observed = pointer_identity(size=metadata.size, marker=metadata.etag)
+    if expected != observed:
         return True
-    if entry.source_etag and metadata.etag:
-        return metadata.etag != entry.source_etag
-    if entry.mtime_ns and metadata.mtime_ns:
-        return metadata.mtime_ns != entry.mtime_ns
     return False
 
 
@@ -435,9 +534,7 @@ def repo_verify(
             return
         seen: set[str] = set()
         for prefix in normalized_prefixes:
-            for entry in repo.store.iter_entries_for_prefix(
-                base_commit.tree, prefix
-            ):
+            for entry in repo.store.iter_entries_for_prefix(base_commit.tree, prefix):
                 if entry.path in seen:
                     continue
                 seen.add(entry.path)
@@ -483,7 +580,6 @@ def repo_verify(
                 entry.path,
                 digest,
                 entry.size,
-                entry.mtime_ns,
                 "content",
                 footer=entry.footer,
             )
@@ -549,14 +645,10 @@ def _write_entry_to_file(repo: ReflakeRepository, entry: Entry, target: Path) ->
                 )
             elif entry.source_uri:
                 source = stack.enter_context(
-                    open_source_uri(
-                        entry.source_uri, client=source_client(repo.store)
-                    )
+                    open_source_uri(entry.source_uri, client=source_client(repo.store))
                 )
             else:
-                raise FileNotFoundError(
-                    f"Entry has no readable content: {entry.path}"
-                )
+                raise FileNotFoundError(f"Entry has no readable content: {entry.path}")
             with NamedTemporaryFile(dir=target.parent, delete=False) as temp:
                 temp_path = Path(temp.name)
                 while chunk := source.read(1024 * 1024):
@@ -577,6 +669,39 @@ def _write_entry_to_file(repo: ReflakeRepository, entry: Entry, target: Path) ->
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
         raise
+
+
+def _record_restored(
+    repo: ReflakeRepository, logical_path: str, entry: Entry, target: Path
+) -> None:
+    """Teach the client about a file it just wrote, so ``status`` stays clean.
+
+    Restored files differ from the worktree facts of any previous state (new
+    inode, new mtime), so without this every restored file would be re-hashed
+    on the next ``status``/``commit``. A restored *pointer* entry also gets
+    the source's mtime, because a local pointer's revision identity is its
+    source version marker.
+    """
+    import os
+    from urllib.parse import unquote, urlparse
+
+    if entry.blob_hash is not None:
+        stat = target.stat()
+        repo.stat_cache.record(
+            logical_path,
+            size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+            digest=entry.hash,
+        )
+        return
+    source_uri = entry.source_uri or ""
+    if not source_uri.startswith("file:"):
+        return
+    try:
+        source_stat = Path(unquote(urlparse(source_uri).path)).stat()
+        os.utime(target, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+    except OSError:
+        return
 
 
 def repo_restore_files(
@@ -611,20 +736,23 @@ def repo_restore_files(
             )
     else:
         entries = {
-            entry.path: entry
-            for entry in repo.store.iter_all_entries(commit.tree)
+            entry.path: entry for entry in repo.store.iter_all_entries(commit.tree)
         }
 
-    restored: list[str] = []
-    for logical_path, entry in sorted(entries.items()):
+    def restore_one(item: tuple[str, Entry]) -> str | None:
+        logical_path, entry = item
         target = repo.root / logical_path
         if target.exists() and not force:
-            continue
+            return None
         target.parent.mkdir(parents=True, exist_ok=True)
-        if entry.blob_hash or entry.source_uri:
-            _write_entry_to_file(repo, entry, target)
-            restored.append(logical_path)
-    return restored
+        if not (entry.blob_hash or entry.source_uri):
+            return None
+        _write_entry_to_file(repo, entry, target)
+        _record_restored(repo, logical_path, entry, target)
+        return logical_path
+
+    written = map_bounded(restore_one, sorted(entries.items()))
+    return [path for path in written if path is not None]
 
 
 def repo_generate_transfer_commands(

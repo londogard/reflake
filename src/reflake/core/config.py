@@ -22,11 +22,16 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
     identity: str = "content"
     transfer_backend: str | None = None
     parquet_footer: bool = False
-    #: Skip re-hashing worktree files whose size *and* mtime match the
-    #: committed entry. Big ingest speedup; weakens the guarantee that a
-    #: commit proves the bytes it references (a same-size, same-mtime edit
-    #: would go unnoticed). Off by default.
-    trust_mtime: bool = False
+    #: Use the client-local stat cache (path -> size, mtime, digest) to skip
+    #: re-reading unchanged worktree files in ``status``/``commit``. This is
+    #: what makes both O(changes) instead of O(bytes); ``false`` re-hashes
+    #: every file on every command. A same-size, same-mtime edit is not
+    #: detected while enabled (the same trade every stat-based VCS makes).
+    stat_cache: bool = True
+    #: Copy large local blobs with a copy-on-write clone when the filesystem
+    #: supports it (APFS clonefile / btrfs/XFS FICLONE) instead of a full
+    #: byte copy. Set false to force plain copies.
+    reflink_blobs: bool = True
     #: ``gc --prune`` never deletes objects younger than this many seconds.
     #: Protects objects a concurrent writer published between its object
     #: writes and its ref CAS (mark-and-sweep races with no coordination).

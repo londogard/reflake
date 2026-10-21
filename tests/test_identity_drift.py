@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from reflake import run_cli
+from reflake.cli import run_cli
 from reflake.core import create_repository, open_repository
 
 
@@ -34,10 +34,7 @@ def test_verify_drift_detects_changed_local_source(tmp_path: Path, capsys) -> No
         == 0
     )
     assert (
-        run_cli(
-            ["--repo", str(repo_root), "commit", "--staged", "-m", "pointer"]
-        )
-        == 0
+        run_cli(["--repo", str(repo_root), "commit", "--staged", "-m", "pointer"]) == 0
     )
     capsys.readouterr()
 
@@ -50,9 +47,7 @@ def test_verify_drift_detects_changed_local_source(tmp_path: Path, capsys) -> No
     assert drifted.drifted_paths == ["imports/incoming.txt"]
 
     # Read-only audit reports drift and exits 1.
-    exit_code = run_cli(
-        ["--repo", str(repo_root), "identity", "verify", "--drift"]
-    )
+    exit_code = run_cli(["--repo", str(repo_root), "identity", "verify", "--drift"])
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "drifted" in captured.err

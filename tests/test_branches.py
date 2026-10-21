@@ -6,8 +6,9 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import head_commit
 
-from reflake import run_cli
+from reflake.cli import run_cli
 from reflake.core import EmptyBranchError, UnknownRefError, create_repository
 
 
@@ -100,24 +101,19 @@ def test_cli_branch_json_and_delete(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "first"]) == 0
-    commit_id = capsys.readouterr().out.strip()
+    commit_id = head_commit(capsys, tmp_path)
 
-    assert (
-        run_cli(["--repo", str(tmp_path), "--json", "branch", "feature/x"]) == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "--json", "branch", "feature/x"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"branch": "feature/x", "commit_id": commit_id}
 
-    assert (
-        run_cli(["--repo", str(tmp_path), "--json", "checkout", "feature/x"]) == 0
-    )
+    assert run_cli(["--repo", str(tmp_path), "--json", "checkout", "feature/x"]) == 0
     assert json.loads(capsys.readouterr().out) == {"branch": "feature/x"}
 
     assert run_cli(["--repo", str(tmp_path), "checkout", "main"]) == 0
     capsys.readouterr()
 
     assert (
-        run_cli(["--repo", str(tmp_path), "--json", "branch", "-d", "feature/x"])
-        == 0
+        run_cli(["--repo", str(tmp_path), "--json", "branch", "-d", "feature/x"]) == 0
     )
     assert json.loads(capsys.readouterr().out) == {"deleted": "feature/x"}

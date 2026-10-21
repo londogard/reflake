@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import io
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import IO, Any, BinaryIO
+from typing import Any
 
 import fsspec
 from fsspec.spec import AbstractFileSystem
 
 from ..entry_codec import Entry
-from ..objects import open_source_uri, source_client
+from ..objects import RangeFile, open_source_range_file, source_client
 from ..repository import ReflakeRepository, open_repository
 from ..repository_support import _validate_no_binary, normalize_repository_path
 
@@ -52,26 +52,46 @@ class ReflakeFileSystem(AbstractFileSystem):
         mode: str = "rb",
         block_size: int | None = None,
         **kwargs: object,
-    ) -> IO[bytes]:
+    ) -> Any:
         if mode != "rb":
             raise NotImplementedError(
                 "ReflakeFileSystem currently supports read-only binary mode"
             )
         resolved = self._resolve_entry(path)
-        if resolved.entry.blob_hash:
-            repo = self._repository(resolved.root)
-            return _BlobReadFile(repo.open_blob_stream(resolved.entry.blob_hash))  # type: ignore[bad-return]
-        if resolved.entry.source_uri:
-            repo = self._repository(resolved.root)
-            return _SourceURIFile(  # type: ignore[bad-return]
-                open_source_uri(
-                    resolved.entry.source_uri,
-                    client=source_client(repo.store),
-                )
+        repo = self._repository(resolved.root)
+        entry = resolved.entry
+        if entry.blob_hash is not None:
+            blob_hash = entry.blob_hash
+            return RangeFile(
+                lambda offset, length: repo.store.read_blob_range(
+                    blob_hash, offset, length
+                ),
+                entry.size,
+            )
+        if entry.source_uri is not None:
+            return open_source_range_file(
+                entry.source_uri,
+                entry.size,
+                client=source_client(repo.store),
             )
         raise FileNotFoundError(
             "Entry has no canonical blob hash and no readable source URI"
         )
+
+    def modified(self, path: str, **kwargs: object) -> datetime:
+        """Commit time, for fsspec consumers.
+
+        Reflake records no per-file mtime in the tree (a Merkle node must not
+        depend on filesystem facts), so the only meaningful timestamp for a
+        virtual path is the commit that produced it.
+        """
+        resolved = self._resolve_entry(path)
+        repo = self._repository(resolved.root)
+        commit = repo.read_commit(resolved.commit_id)
+        try:
+            return datetime.fromisoformat(commit.created_at)
+        except ValueError:
+            return datetime.fromtimestamp(0)
 
     def exists(self, path: str, **kwargs: object) -> bool:
         try:
@@ -88,7 +108,6 @@ class ReflakeFileSystem(AbstractFileSystem):
             "size": resolved.entry.size,
             "hash": resolved.entry.hash,
             "identity_mode": resolved.entry.identity_mode,
-            "mtime_ns": resolved.entry.mtime_ns,
             "commit": resolved.commit_id,
             "staged": resolved.uri.include_staging,
             "dataset": resolved.uri.dataset,
@@ -212,68 +231,6 @@ class ResolvedEntry:
     root: str | Path
     commit_id: str
     entry: Entry
-
-
-class _SourceURIFile(io.IOBase):
-    def __init__(self, context_manager: Any) -> None:
-        self._context_manager = context_manager
-        self._handle = context_manager.__enter__()
-
-    def read(self, size: int = -1) -> bytes:
-        return self._handle.read(size)
-
-    def readable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return bool(getattr(self._handle, "seekable", lambda: False)())
-
-    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        return self._handle.seek(offset, whence)
-
-    def tell(self) -> int:
-        return self._handle.tell()
-
-    def close(self) -> None:
-        if self.closed:
-            return
-        try:
-            close = getattr(self._handle, "close", None)
-            if callable(close):
-                close()
-        finally:
-            self._context_manager.__exit__(None, None, None)
-            super().close()
-
-
-class _BlobReadFile(io.IOBase):
-    def __init__(self, handle: BinaryIO) -> None:
-        self._handle = handle
-
-    def read(self, size: int = -1) -> bytes:
-        return self._handle.read(size)
-
-    def readable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return bool(getattr(self._handle, "seekable", lambda: False)())
-
-    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        return self._handle.seek(offset, whence)
-
-    def tell(self) -> int:
-        return self._handle.tell()
-
-    def close(self) -> None:
-        if self.closed:
-            return
-        try:
-            close = getattr(self._handle, "close", None)
-            if callable(close):
-                close()
-        finally:
-            super().close()
 
 
 fsspec.register_implementation("reflake", ReflakeFileSystem)

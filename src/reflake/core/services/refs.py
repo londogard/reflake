@@ -7,6 +7,7 @@ read and every mutation flows through one consistent place.
 from __future__ import annotations
 
 from collections import OrderedDict
+from typing import Any
 
 import msgspec
 
@@ -22,7 +23,12 @@ from ..domain import (
     UnknownRefError,
 )
 from ..objects import RefObjectStore
-from ..repository_support import _GenerationProvider, is_ancestor_commit
+from ..repository_support import (
+    _GenerationProvider,
+    is_ancestor_commit,
+    validate_branch_name,
+    validate_tag_name,
+)
 
 
 class _BoundedCache(OrderedDict[str, CommitObject]):
@@ -85,14 +91,28 @@ class RefManager:
         return branch_ref.commit_id
 
     def resolve_ref(self, branch_or_commit: str) -> str:
+        """Resolve a name to a commit id.
+
+        Resolution order is branch, then tag, then raw commit id.  Branches
+        win when a branch and a tag share a name: adding tags must not change
+        what an existing name meant.  An *unborn* branch (ref exists, no
+        commits) falls through to tags — deleting a branch leaves its empty
+        ref behind, and that must not shadow a same-named tag forever; a name
+        with neither a born branch nor a tag still raises ``EmptyBranchError``.
+        Tag targets are always commits (resolved at creation), so a tag never
+        needs further resolution.
+        """
         # Read-through on every call: ref reads are cheap (local file, one
         # S3 GET) and a validated cache would need the version tokens we
         # deleted. Commit objects stay cached — they are immutable.
         branch_ref = self.store.read_branch_ref(branch_or_commit)
-        if branch_ref is not None:
-            if not branch_ref.commit_id:
-                raise EmptyBranchError(branch_or_commit)
+        if branch_ref is not None and branch_ref.commit_id:
             return branch_ref.commit_id
+        tag_commit = self.store.read_tag_ref(branch_or_commit)
+        if tag_commit is not None:
+            return tag_commit
+        if branch_ref is not None:
+            raise EmptyBranchError(branch_or_commit)
         if self.store.object_exists("commit", branch_or_commit):
             return branch_or_commit
         raise UnknownRefError(branch_or_commit)
@@ -106,8 +126,6 @@ class RefManager:
         directory.  The check runs on every backend so S3 and local repos
         behave identically.
         """
-        from ..repository_support import validate_branch_name
-
         name = validate_branch_name(name)
         self._reject_namespace_conflict(name)
         existing = self.store.read_branch_ref(name)
@@ -128,16 +146,19 @@ class RefManager:
             )
         return name
 
-    def _reject_namespace_conflict(self, name: str) -> None:
+    def _reject_namespace_conflict(self, name: str, *, kind: str = "branch") -> None:
         prefix = f"{name}/"
-        for other in self.store.iter_branches():
+        others = (
+            self.store.iter_branches() if kind == "branch" else self.store.iter_tags()
+        )
+        for other in others:
             if other == name:
                 continue
             if other.startswith(prefix) or name.startswith(f"{other}/"):
                 raise ValueError(
-                    f"Branch name '{name}' conflicts with existing branch "
-                    f"'{other}': a branch cannot be both a branch and a "
-                    "directory of branches"
+                    f"{kind.capitalize()} name '{name}' conflicts with existing "
+                    f"{kind} '{other}': a {kind} cannot be both a {kind} and a "
+                    f"directory of {kind}s"
                 )
 
     def delete_branch(self, name: str) -> str:
@@ -161,6 +182,45 @@ class RefManager:
             operation="branch delete",
         )
         return name
+
+    def create_tag(self, name: str, target: str | None = None) -> str:
+        """Create an immutable tag, returning the commit id it pins.
+
+        ``target`` is any ref (branch, tag, or commit id); ``None`` means the
+        current branch head.  Tags live in their own namespace (``refs/tags``
+        vs ``refs/heads``), but tag names are hierarchical like branch names
+        and cannot be both a tag and a directory of tags.  The target is
+        resolved *before* the ref is written, so a tag never points at a
+        missing object; the write itself is create-only and atomic.
+        """
+        name = validate_tag_name(name)
+        self._reject_namespace_conflict(name, kind="tag")
+        if target is None:
+            commit_id = self.head_commit()
+            if commit_id is None:
+                raise EmptyBranchError(self.current_branch())
+        else:
+            commit_id = self.resolve_ref(target)
+        if not self.store.create_tag_ref(name, commit_id):
+            raise ValueError(f"Tag already exists: {name}")
+        return commit_id
+
+    def delete_tag(self, name: str) -> str:
+        """Delete a tag; this is the only way to reuse its name."""
+        if self.store.read_tag_ref(name) is None:
+            raise UnknownRefError(name)
+        self.store.delete_tag_ref(name)
+        return name
+
+    def tags(self) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for tag_name in sorted(self.store.iter_tags()):
+            commit_id = self.store.read_tag_ref(tag_name)
+            message = self.read_commit(commit_id).message if commit_id else None
+            entries.append(
+                {"tag": tag_name, "commit_id": commit_id, "message": message}
+            )
+        return entries
 
     def read_commit(self, commit_id: str) -> CommitObject:
         try:

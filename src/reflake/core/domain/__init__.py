@@ -20,7 +20,9 @@ from .errors import (
 )
 from .models import (
     BranchRefState,
+    CommitId,
     CommitObject,
+    CommitStats,
     DiffEntry,
     FetchResult,
     GcResult,
@@ -39,7 +41,9 @@ from .models import (
 __all__ = [
     "BlobIntegrityError",
     "BranchRefState",
+    "CommitId",
     "CommitObject",
+    "CommitStats",
     "CorruptCommitError",
     "DiffEntry",
     "EmptyBranchError",

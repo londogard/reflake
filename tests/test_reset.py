@@ -6,8 +6,9 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import head_commit
 
-from reflake import run_cli
+from reflake.cli import run_cli
 from reflake.core import UnknownRefError, create_repository
 
 
@@ -59,9 +60,7 @@ def test_reset_uses_fresh_ref_read_and_cas(
     (tmp_path / "b.txt").write_text("two")
     repo.commit("second")
 
-    monkeypatch.setattr(
-        repo.store, "compare_and_set_branch_ref", lambda *a, **k: False
-    )
+    monkeypatch.setattr(repo.store, "compare_and_set_branch_ref", lambda *a, **k: False)
     with pytest.raises(RefConflictError):
         repo.reset(first)
 
@@ -71,7 +70,7 @@ def test_cli_reset_json_and_staged_warning(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "init"]) == 0
     capsys.readouterr()
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "first"]) == 0
-    first = capsys.readouterr().out.strip()
+    first = head_commit(capsys, tmp_path)
     (tmp_path / "b.txt").write_text("two")
     assert run_cli(["--repo", str(tmp_path), "commit", "-m", "second"]) == 0
     capsys.readouterr()

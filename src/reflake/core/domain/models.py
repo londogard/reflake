@@ -32,6 +32,36 @@ class CommitObject:
 
 
 @dataclass(frozen=True)
+class CommitStats:
+    """What a commit changed, for human output and `--json`."""
+
+    added: int
+    removed: int
+    modified: int
+    parent_commit_id: str | None
+    tree: str
+
+    @property
+    def total(self) -> int:
+        return self.added + self.removed + self.modified
+
+
+class CommitId(str):
+    """A commit id (a plain ``str``) that also carries its change summary.
+
+    Subclassing keeps every existing consumer working (it *is* the id) while
+    letting callers report what happened without walking the tree again.
+    """
+
+    stats: CommitStats
+
+    def __new__(cls, value: str, stats: CommitStats) -> CommitId:
+        instance = super().__new__(cls, value)
+        instance.stats = stats
+        return instance
+
+
+@dataclass(frozen=True)
 class DiffEntry:
     path: str
     change: str
@@ -105,17 +135,24 @@ class MoveResult:
 
 
 class StageChange(msgspec.Struct):
+    """One staged change.
+
+    In ``content`` mode ``add`` fills ``blob_hash``/``size``/``footer`` (the
+    blob is already in the store), so ``commit`` never touches the source
+    again. In ``pointer`` mode the source is recorded and read at commit time.
+    ``mtime_ns`` is used only to warn when the worktree file drifted from the
+    snapshot since ``add``.
+    """
+
     path: str
     action: str
     identity_mode: str | None = None
     source_uri: str | None = None
     blob_hash: str | None = None
     size: int | None = None
-    #: Source size/mtime observed when the change was staged. Staging is a
-    #: recipe (content is read at commit time); these let the CLI warn when
-    #: the recipe no longer matches the source instead of silently
-    #: committing different bytes.
     mtime_ns: int | None = None
+    footer: str | None = None
+    source_etag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +163,9 @@ class StageStatus:
     working_tree_added: list[str] = field(default_factory=list)
     working_tree_removed: list[str] = field(default_factory=list)
     working_tree_modified: list[str] = field(default_factory=list)
+    #: Symbolic links found in the worktree. They are not versioned; reported
+    #: so an omission is visible rather than silent.
+    skipped_symlinks: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "added", list(self.added))
@@ -137,12 +177,14 @@ class StageStatus:
         object.__setattr__(
             self, "working_tree_modified", list(self.working_tree_modified)
         )
+        object.__setattr__(self, "skipped_symlinks", list(self.skipped_symlinks))
 
 
 @dataclass(frozen=True)
 class FetchResult:
     remote_uri: str
     branch: str
+    commit_id: str
     fetched_commits: int
     fetched_blobs: int
 

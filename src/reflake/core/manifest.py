@@ -29,6 +29,7 @@ def walk_files(
     *,
     ignore: IgnoreRules | None = None,
     rel_prefix: str = "",
+    skipped: list[str] | None = None,
 ) -> Iterator[FileEntry]:
     """Yield files under *root* in sorted order, skipping ignored paths.
 
@@ -36,6 +37,10 @@ def walk_files(
     *rel_prefix* is the position of *root* relative to the tree the rules
     were loaded from, so an ignored anchored pattern still applies when
     staging a subdirectory of the worktree.
+
+    Symbolic links are not versioned; when *skipped* is given, every skipped
+    link is appended to it so callers can report the omission instead of
+    silently dropping data.
     """
     root_path = Path(root).resolve()
     rules = ignore if ignore is not None else IgnoreRules.load(root_path)
@@ -66,5 +71,7 @@ def walk_files(
                     size=stat.st_size,
                     mtime_ns=stat.st_mtime_ns,
                 )
+            elif entry.is_symlink() and skipped is not None:
+                skipped.append(full)
 
     yield from iter_dir(root_path, ())

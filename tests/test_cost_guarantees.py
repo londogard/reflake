@@ -13,7 +13,6 @@ from pathlib import Path
 import duckdb
 import pytest
 
-import reflake.core.services.tree as tree_module
 from reflake.core import create_repository
 from reflake.core.config import LocalConfig
 from reflake.core.objects import LocalObjectStore
@@ -116,36 +115,38 @@ def _head_tree(repo: ReflakeRepository) -> str:
     return repo.read_commit(repo.resolve_ref("main")).tree
 
 
-def test_trust_mtime_skips_hashing_unchanged_files(
+def test_stat_cache_skips_reading_unchanged_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With ``trust_mtime`` nothing is re-hashed unless size/mtime moved."""
-    repo = _seed(tmp_path, identity="content", trust_mtime=True)
-    hashes: list[Path] = []
-    real_digest = tree_module.blake3_digest_file
+    """With the stat cache, an unchanged worktree is never read again."""
+    repo = _seed(tmp_path, identity="content")
+    hashed: list[Path] = []
+    store_type = type(repo.store)
+    real = store_type.materialize_blob_file
 
-    def counting_digest(path: Path) -> str:
-        hashes.append(path)
-        return real_digest(path)
+    def counting(self, source_path, *, known_digest=None):  # type: ignore[no-untyped-def]
+        if known_digest is None:
+            hashed.append(Path(source_path))
+        return real(self, source_path, known_digest=known_digest)
 
-    monkeypatch.setattr(tree_module, "blake3_digest_file", counting_digest)
+    monkeypatch.setattr(store_type, "materialize_blob_file", counting)
 
     repo.commit("no changes at all")
-    assert hashes == [], f"re-hashed {len(hashes)} unchanged files"
+    assert hashed == [], f"re-hashed {len(hashed)} unchanged files"
 
-    # Same size, new mtime: the file must be re-hashed (and only it).
+    # Same size, new mtime: only that file is read (and re-hashed).
     changed = tmp_path / "dir_003" / "file_0.txt"
     original_length = len(changed.read_text())
     changed.write_text("X" * original_length)
     repo.commit("same size, different bytes")
-    assert [path.name for path in hashes] == ["file_0.txt"]
+    assert [path.name for path in hashed] == ["file_0.txt"]
     entry = repo.resolve_entry("main", "dir_003/file_0.txt")
     assert entry is not None and entry.size == original_length
 
 
-def test_default_mode_still_rehashes_same_size_files(tmp_path: Path) -> None:
-    """``trust_mtime`` off: a same-size file is verified by hashing (v1 rule)."""
-    repo = _seed(tmp_path, identity="content")
+def test_stat_cache_disabled_rehashes_every_file(tmp_path: Path) -> None:
+    """``stat_cache false`` trades speed for a full content check."""
+    repo = _seed(tmp_path, identity="content", stat_cache=False)
     before = repo.resolve_entry("main", "dir_003/file_0.txt")
     changed = tmp_path / "dir_003" / "file_0.txt"
     changed.write_text("Y" * len(changed.read_text()))

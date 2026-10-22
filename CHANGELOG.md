@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and Reflake currently tracks changes before its first public alpha release.
 
+## [0.5.1] - 2026-10-21
+
+### Added
+
+- **`reflake fsck`** — integrity audit over refs → commits → trees → leaves:
+  every node is re-parsed (sorted, duplicate-free, valid names), every
+  referenced commit/tree/blob/footer is checked for existence (adaptive:
+  probes for small sets, one inventory listing per kind above 64), and
+  `--verify-blobs` re-hashes the stored bytes. Exits 1 and lists
+  `missing:`/`corrupt:`/byte-mismatch objects; never mutates. Pointer entries
+  are counted, not flagged.
+- **`scripts/bench_scale.py`** — committed, reproducible scale harness
+  (generate/commit/no-op/status/lookup/prefix-listing plus structural object
+  counts). `tests/test_scale_budgets.py` (`-m benchmark`) turns it into a
+  nightly gate: a no-op commit must write **0** tree objects and a cold
+  lookup/prefix listing must read ≤ root + path depth + one shard. The nightly
+  workflow also publishes the numbers.
+- **Format version 2** in `repo.json`/`config.json`: a repository written by
+  0.4.x now fails with "this repository was written by Reflake 0.4.x … tree
+  entries changed" instead of a JSON decode error inside a tree walk.
+
+### Changed
+
+- **Optional backends are extras.** Core installs only `blake3`, `msgspec`,
+  and `simple-parsing`; `boto3` is `reflake[s3]`, `duckdb`+`pyarrow` are
+  `reflake[query]`, `fsspec` is `reflake[vfs]`, and `reflake[all]` is
+  everything. `import reflake` imports none of them (asserted by a test), so a
+  local-only install drops from ~250 MB of wheels to a few megabytes. A
+  command that needs a missing extra reports one actionable line, e.g.
+  `S3 object storage needs the optional dependency 'boto3'. Install it with:
+  pip install 'reflake[s3]'`.
+- `repo.json` is also written by `push` into an empty destination, so a
+  repository created by pushing carries its format marker from the first
+  commit. `config set identity|parquet_footer|default_branch` now mirrors the
+  change into the shared marker (it decides what commits write, so a
+  client-local edit would have been silently ineffective).
+
 ## [0.5.0] - 2026-10-21
 
 **Format break.** Entry lines, tree fanout, and pointer identity changed.

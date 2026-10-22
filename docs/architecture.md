@@ -501,6 +501,12 @@ coordination. Unknown ages count as young. Leaking garbage is always allowed;
 deleting live data never is. Client-local state (staging, reflog, caches) cannot
 participate — which is another reason the window exists.
 
+**Audit.** `reflake fsck` reuses the same reachability walk read-only: it
+re-parses every node and checks the reachable set against the store, with
+optional byte verification. Mark-and-sweep answers "what is unreachable";
+`fsck` answers "is anything reachable missing or unreadable" — run it before
+`--prune`, after a restore, or when a read fails.
+
 **Shape.** The sweep streams an existence source (`ObjectInventory`, implemented
 by both stores; the seam an S3 Inventory adapter plugs into), tests membership
 against the reachable sets as it lists, and deletes in ≤1000-key batches on the

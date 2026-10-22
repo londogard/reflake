@@ -35,8 +35,9 @@ Reflake stays client-driven with a shared object-storage repository:
 
 0. **Format 2 follow-ups** — `reflake migrate` from 0.4.x (entry lines, tree
    fanout, pointer identity all changed); an S3 Inventory-backed existence
-   source for `gc`/sync planning; object-store-level audit that a cached
-   stat-cache digest still has its blob (cheap today only for local stores).
+   source for `gc`/sync planning. **Landed in 0.5.1:** a format-2 marker with
+   a clear pre-2 error, `reflake fsck` (including `--verify-blobs`), and the
+   committed scale harness + nightly structural gate.
 1. **Docs split** — architecture (current model), roadmap (this file), ADRs
    for past decisions; README stays user-facing.
 2. **Tags/releases** — immutable named refs (`refs/tags/*`) so "dataset

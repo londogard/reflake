@@ -60,6 +60,7 @@ command: `reflake --repo <uri> commit -m x` and `reflake commit -m x --repo
 | Inspect | `status`, `log`, `diff`, `list` (`ls`), `cat`, `branches`, `reflog` |
 | Branch | `branch [-d]`, `tag <name> [-d] [-l]`, `checkout`, `merge` (fast-forward + 3-way metadata merge), `reset` (undo/redo) |
 | Mutate | `rm [--keep-worktree]`, `mv [--keep-worktree]`, `gc [--prune] [--grace-seconds N]`, `restore [<path>...] [--ref]` |
+| Audit | `fsck [--ref] [--verify-blobs]` — refs → commits → trees → leaves, object existence, optional byte verification |
 | Sync | `push`, `pull [--metadata-only]`, `fetch [--metadata-only]`, `clone`, `transfer` |
 | Analyze | `query build` (DuckDB/Parquet), `query scan` (pruned reads; `--explain` for the plan only) |
 
@@ -68,7 +69,8 @@ unless a path is named explicitly. Symbolic links are not versioned; `status`
 and `commit` report how many were skipped.
 
 Exit codes: `0` ok · `1` usage/validation (unknown/missing **source** inputs,
-`identity verify` with remaining pointer entries or detected drift) · `2`
+`identity verify` with remaining pointer entries or detected drift, `fsck`
+with integrity problems) · `2`
 conflict, retryable (CAS race, non-fast-forward, merge conflict) · `3` missing
 repository ref/object. Every command with structured output honors `--json`.
 
@@ -83,22 +85,31 @@ repository ref/object. Every command with structured output honors `--json`.
 ## Technical Stack
 
 - Python 3.11+
-- `blake3` for hashing
+- `blake3` for hashing, `msgspec` for the object codec
 - Merkle trees + JSONL commit/tree objects
-- `fsspec` for URI access abstraction
-- `duckdb` for disposable analytical indexing
+- Optional: `boto3` (S3), `duckdb` + `pyarrow` (query), `fsspec` (VFS)
 
 ## Install
 
 ```bash
-uv pip install reflake
+uv pip install reflake            # core: local repositories + the full CLI
+uv pip install 'reflake[s3]'      # + S3 adapter, push/pull/fetch/clone
+uv pip install 'reflake[query]'   # + DuckDB catalog and pruned parquet scans
+uv pip install 'reflake[vfs]'     # + fsspec / `reflake://` URIs
+uv pip install 'reflake[all]'     # everything
 ```
+
+The core install is a few megabytes: `import reflake` and the whole local
+workflow never import an optional backend, and a command that needs one says
+which extra provides it (`S3 object storage needs the optional dependency
+'boto3'. Install it with: pip install 'reflake[s3]'`).
 
 ### Developer mode in repo
 
 ```bash
-uv sync
+uv sync                            # dev group installs all extras
 uv run reflake --help
+uv run python scripts/bench_scale.py --files 10000   # reproducible numbers
 ```
 
 ## Quickstart
@@ -610,6 +621,31 @@ Every object kind has exactly one physical location, defined by
 guaranteed to stay in sync because both derive from that single mapping.
 Client-state filenames encode branch names (`feature/x` → `feature%2Fx`), so
 hierarchical branches can never collide with each other on disk.
+
+## Integrity Check (`fsck`)
+
+```bash
+uv run reflake --repo /tmp/reflake-demo fsck
+# Checked 1 ref(s): 12 commits, 340 trees, 51 000 leaves (51 000 blobs, 0 footers, 0 pointer entries)
+# OK
+
+uv run reflake --repo /tmp/reflake-demo fsck --verify-blobs   # also re-hash every blob
+```
+
+`fsck` resolves every branch and tag, walks the commit and tree DAGs,
+re-parses every node (sorted, duplicate-free, single-component names), and
+checks that every referenced commit/tree/blob/footer object exists. Existence
+checks adapt like sync planning: per-object probes for small reachable sets,
+one inventory listing per kind above 64 objects.
+
+- `--verify-blobs` re-hashes the stored bytes of every reachable blob (reads
+  the whole dataset; catches bit rot and hand-copied objects).
+- Pointer entries are *counted*, not flagged: they are unverifiable by design
+  (`identity promote` makes them content).
+- Exits `1` and lists `missing:`, `corrupt:`, or byte-mismatch objects;
+  `--json` returns the same data for automation.
+
+Unlike `gc`, `fsck` never mutates anything.
 
 ## Garbage Collection Safety
 

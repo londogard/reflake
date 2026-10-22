@@ -38,9 +38,7 @@ from .core import (
     PushResult,
     RefConflictError,
     ReflakeError,
-    ReflakeFileSystem,
     ReflakeRepository,
-    ReflakeURI,
     RemoveResult,
     ResetResult,
     SourceNotFoundError,
@@ -57,6 +55,21 @@ from .core import (
     pull,
     push,
 )
+
+#: Names that need an optional extra (`reflake[vfs]`), resolved on first use.
+_LAZY_NAMES = frozenset({"ReflakeFileSystem", "ReflakeURI"})
+
+
+def __getattr__(name: str) -> object:
+    """Resolve optional-extra exports lazily (PEP 562)."""
+    if name in _LAZY_NAMES:
+        from . import core
+
+        value = getattr(core, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # construction / repository

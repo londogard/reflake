@@ -10,22 +10,20 @@ from __future__ import annotations
 import itertools
 import json
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ..core import (
-    PrunedFileScan,
-    ScanStats,
-    build_analytical_index,
-    execute_scan,
-    open_repository,
-    parse_where_clause,
-    plan_pruned_scan,
-)
-from ..core.objects.footer import FooterCache
+from ..core import open_repository
 from .args import QueryBuildArgs, QueryScanArgs
+
+if TYPE_CHECKING:
+    from ..core.query import PrunedFileScan, ScanStats
 
 
 def handle_query_build(command: QueryBuildArgs, repo_root: str, as_json: bool) -> int:
+    # Imported here: query needs the `query` extra (duckdb), so loading the
+    # CLI (and therefore `import reflake`) must not import it.
+    from ..core.query import build_analytical_index
+
     paths = build_analytical_index(
         root=repo_root,
         output_dir=command.output_dir,
@@ -53,6 +51,14 @@ def handle_query_build(command: QueryBuildArgs, repo_root: str, as_json: bool) -
 
 
 def handle_query_scan(command: QueryScanArgs, repo_root: str, as_json: bool) -> int:
+    from ..core.objects.footer import FooterCache
+    from ..core.query import (
+        ScanStats,
+        execute_scan,
+        parse_where_clause,
+        plan_pruned_scan,
+    )
+
     repo = open_repository(repo_root)
     commit_id = repo.resolve_ref(command.ref or repo.current_branch())
     commit_obj = repo.read_commit(commit_id)

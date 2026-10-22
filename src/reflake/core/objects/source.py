@@ -20,10 +20,6 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import unquote, urlparse
 
-import boto3
-import fsspec
-from botocore.exceptions import ClientError
-
 from ..domain import (
     ObjectMissingError,
     PreconditionFailedError,
@@ -32,38 +28,35 @@ from ..domain import (
 )
 from . import multipart
 from .backends import S3ObjectMetadata, SourceObjectMetadata
+from .uris import is_s3_uri as is_s3_uri
+from .uris import parse_s3_uri as parse_s3_uri
 
 
-def _s3_is_404(error: ClientError) -> bool:
-    return error.response.get("Error", {}).get("Code", "") in {
-        "404",
-        "NoSuchKey",
-        "NotFound",
-    }
+def _s3_error_code(error: object) -> str:
+    """Error code from a botocore ``ClientError``, without importing botocore."""
+    response = getattr(error, "response", None)
+    if not isinstance(response, dict):
+        return ""
+    detail = response.get("Error")
+    return str(detail.get("Code", "")) if isinstance(detail, dict) else ""
+
+
+def _s3_is_404(error: object) -> bool:
+    return _s3_error_code(error) in {"404", "NoSuchKey", "NotFound"}
 
 
 def build_s3_client(endpoint_url: str | None = None) -> Any:
     """Create a boto3 S3 client, honoring an explicit endpoint when given."""
     if endpoint_url:
-        return boto3.client("s3", endpoint_url=endpoint_url)
-    return boto3.client("s3")
+        return _boto3().client("s3", endpoint_url=endpoint_url)
+    return _boto3().client("s3")
 
 
-def _s3_is_precondition_failed(error: ClientError) -> bool:
-    return error.response.get("Error", {}).get("Code", "") in {
-        "PreconditionFailed",
-        "412",
-    }
+def _s3_is_precondition_failed(error: object) -> bool:
+    return _s3_error_code(error) in {"PreconditionFailed", "412"}
 
 
-def parse_s3_uri(uri: str) -> tuple[str, str]:
-    parsed = urlparse(uri)
-    if parsed.scheme != "s3" or not parsed.netloc:
-        raise ValueError(f"Invalid S3 URI: {uri}")
-    return parsed.netloc, parsed.path.lstrip("/")
-
-
-def _translate_s3_error(error: ClientError, operation: str) -> Exception:
+def _translate_s3_error(error: object, operation: str) -> Exception:
     if _s3_is_404(error):
         return ObjectMissingError(f"{operation}: object not found")
     if _s3_is_precondition_failed(error):
@@ -79,6 +72,25 @@ def source_client(store: object) -> Any | None:
     ambient AWS configuration chain.
     """
     return getattr(store, "client", None)
+
+
+def _client_error() -> type[BaseException]:
+    """The botocore exception class, imported only when S3 is used."""
+    from ..extras import optional_import
+
+    return optional_import("botocore.exceptions", extra="s3").ClientError
+
+
+def _boto3():  # type: ignore[no-untyped-def]
+    from ..extras import optional_import
+
+    return optional_import("boto3", extra="s3")
+
+
+def _fsspec():  # type: ignore[no-untyped-def]
+    from ..extras import optional_import
+
+    return optional_import("fsspec", extra="vfs")
 
 
 def _clean_etag(value: object) -> str | None:
@@ -117,7 +129,7 @@ def iter_s3_objects(
                     mtime_ns=_mtime_ns(obj.get("LastModified")),
                     etag=_clean_etag(obj.get("ETag")),
                 )
-    except ClientError as error:
+    except _client_error() as error:
         raise _translate_s3_error(error, "list_objects") from error
 
 
@@ -133,7 +145,7 @@ def describe_source_uri(
         s3_client = client or build_s3_client()
         try:
             response = s3_client.head_object(Bucket=bucket, Key=key)
-        except ClientError as error:
+        except _client_error() as error:
             if _s3_is_404(error):
                 raise SourceNotFoundError(
                     f"Cannot stage missing file: {source_uri}"
@@ -176,7 +188,7 @@ def open_source_uri(
         s3_client = client or build_s3_client()
         try:
             response = s3_client.get_object(Bucket=bucket, Key=key)
-        except ClientError as error:
+        except _client_error() as error:
             raise _translate_s3_error(error, "get_object") from error
         body = response["Body"]
         try:
@@ -190,7 +202,7 @@ def open_source_uri(
         with path.open("rb") as handle:
             yield handle
         return
-    with fsspec.open(source_uri, mode="rb") as handle:
+    with _fsspec().open(source_uri, mode="rb") as handle:
         yield handle  # type: ignore[invalid-yield]
 
 
@@ -216,7 +228,7 @@ class S3StorageBackend:
             response = self.client.get_object(
                 Bucket=self.bucket, Key=self._key(relative_path)
             )
-        except ClientError as error:
+        except _client_error() as error:
             raise _translate_s3_error(error, "read_bytes") from error
         return response["Body"].read()
 
@@ -236,7 +248,7 @@ class S3StorageBackend:
             kwargs["IfNoneMatch"] = "*"
         try:
             self.client.put_object(**kwargs)
-        except ClientError as error:
+        except _client_error() as error:
             if if_none_match and _s3_is_precondition_failed(error):
                 raise PreconditionFailedError(
                     f"Path already exists: {relative_path}"
@@ -259,7 +271,7 @@ class S3StorageBackend:
                 local_path,
                 if_none_match=if_none_match,
             )
-        except ClientError as error:
+        except _client_error() as error:
             if if_none_match and _s3_is_precondition_failed(error):
                 raise PreconditionFailedError(
                     f"Path already exists: {relative_path}"
@@ -272,14 +284,14 @@ class S3StorageBackend:
             multipart.download_to_file(
                 self.client, self.bucket, self._key(relative_path), local_path
             )
-        except ClientError as error:
+        except _client_error() as error:
             raise _translate_s3_error(error, "download_to_file") from error
 
     def exists(self, relative_path: str) -> bool:
         try:
             self.client.head_object(Bucket=self.bucket, Key=self._key(relative_path))
             return True
-        except ClientError as error:
+        except _client_error() as error:
             if _s3_is_404(error):
                 return False
             raise _translate_s3_error(error, "exists") from error
@@ -298,13 +310,13 @@ class S3StorageBackend:
                     if self.prefix and key.startswith(f"{self.prefix}/"):
                         key = key[len(self.prefix) + 1 :]
                     yield key
-        except ClientError as error:
+        except _client_error() as error:
             raise _translate_s3_error(error, "list_objects") from error
 
     def delete(self, relative_path: str) -> None:
         try:
             self.client.delete_object(Bucket=self.bucket, Key=self._key(relative_path))
-        except ClientError as error:
+        except _client_error() as error:
             raise _translate_s3_error(error, "delete") from error
 
     def etag(self, relative_path: str) -> str | None:
@@ -312,7 +324,7 @@ class S3StorageBackend:
             response = self.client.head_object(
                 Bucket=self.bucket, Key=self._key(relative_path)
             )
-        except ClientError as error:
+        except _client_error() as error:
             if _s3_is_404(error):
                 return None
             raise _translate_s3_error(error, "etag") from error

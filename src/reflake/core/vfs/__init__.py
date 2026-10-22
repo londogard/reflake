@@ -5,8 +5,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import fsspec
-from fsspec.spec import AbstractFileSystem
+from ..domain import ReflakeError
+from ..extras import EXTRAS
+
+try:
+    import fsspec
+    from fsspec.spec import AbstractFileSystem
+except ModuleNotFoundError as error:  # pragma: no cover – minimal installs
+    raise ReflakeError(
+        f"{EXTRAS['vfs']} needs the optional dependency 'fsspec'. "
+        "Install it with: pip install 'reflake[vfs]'"
+    ) from error
 
 from ..entry_codec import Entry
 from ..objects import RangeFile, open_source_range_file, source_client

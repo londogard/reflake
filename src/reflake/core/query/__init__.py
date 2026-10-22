@@ -10,13 +10,8 @@ row groups and returns the matching rows (docs/architecture.md §4).
 
 from __future__ import annotations
 
-from .catalog import (
-    AnalyticalIndexPaths,
-    build_analytical_index,
-    drop_analytical_index,
-    query_analytical_index,
-)
-from .execute import Scan, ScanStats, execute_scan
+from ..domain import ReflakeError
+from ..extras import EXTRAS
 from .pruning import (
     Predicate,
     PrunedFileScan,
@@ -26,6 +21,21 @@ from .pruning import (
     plan_pruned_scan,
     prune_row_groups,
 )
+
+try:
+    from .catalog import (
+        AnalyticalIndexPaths,
+        build_analytical_index,
+        drop_analytical_index,
+        query_analytical_index,
+    )
+    from .execute import Scan, ScanStats, execute_scan
+except ModuleNotFoundError as error:  # pragma: no cover – minimal installs
+    raise ReflakeError(
+        f"{EXTRAS['query']} needs the optional dependency "
+        f"'{(error.name or '').split('.', 1)[0]}'. "
+        "Install it with: pip install 'reflake[query]'"
+    ) from error
 
 __all__ = [
     "AnalyticalIndexPaths",

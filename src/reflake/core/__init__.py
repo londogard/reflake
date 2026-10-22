@@ -46,32 +46,10 @@ from .objects import (
     ObjectIO,
     ObjectStore,
     RefCas,
-    S3BlobTransferBackend,
     S3ObjectMetadata,
-    S3ObjectStore,
-    S5CmdBlobTransferBackend,
     StoreInventory,
     TreeQuery,
-    build_blob_transfer_backend,
-    build_s3_client,
-    iter_s3_objects,
-    open_source_uri,
     parse_s3_uri,
-)
-from .query import (
-    AnalyticalIndexPaths,
-    Predicate,
-    PrunedFileScan,
-    PruneResult,
-    Scan,
-    ScanStats,
-    build_analytical_index,
-    drop_analytical_index,
-    execute_scan,
-    parse_where_clause,
-    plan_pruned_scan,
-    prune_row_groups,
-    query_analytical_index,
 )
 from .repository import (
     ReflakeRepository,
@@ -80,7 +58,58 @@ from .repository import (
     open_repository,
 )
 from .repository_sync import fetch, pull, push
-from .vfs import ReflakeFileSystem, ReflakeURI
+
+#: Optional extras resolved on first use:
+#:   `reflake[query]` -> duckdb + pyarrow, `reflake[vfs]` -> fsspec.
+_LAZY_OPTIONAL_NAMES: dict[str, str] = {
+    "AnalyticalIndexPaths": ".query",
+    "Predicate": ".query",
+    "PrunedFileScan": ".query",
+    "PruneResult": ".query",
+    "Scan": ".query",
+    "ScanStats": ".query",
+    "build_analytical_index": ".query",
+    "drop_analytical_index": ".query",
+    "execute_scan": ".query",
+    "parse_where_clause": ".query",
+    "plan_pruned_scan": ".query",
+    "prune_row_groups": ".query",
+    "query_analytical_index": ".query",
+    "ReflakeFileSystem": ".vfs",
+    "ReflakeURI": ".vfs",
+}
+
+
+def __getattr__(name: str) -> object:
+    """Import query/VFS helpers only when they are actually used.
+
+    `import reflake` must not require pyarrow, duckdb, or fsspec: they are
+    extras, and the CLI only needs them for `query`/VFS commands.
+    """
+    module_name = _LAZY_OPTIONAL_NAMES.get(name)
+    if module_name is None:
+        # S3 adapter/transfer/source names live in `.objects` (also lazy,
+        # because they need the `s3` extra).
+        from . import objects as _objects
+
+        value = getattr(_objects, name)
+    else:
+        from importlib import import_module
+
+        extra = "vfs" if module_name == ".vfs" else "query"
+        try:
+            module = import_module(module_name, __name__)
+        except ModuleNotFoundError as error:
+            from .extras import EXTRAS
+
+            package = (error.name or "").split(".", 1)[0]
+            raise ReflakeError(
+                f"{EXTRAS[extra]} needs the optional dependency '{package}'. "
+                f"Install it with: pip install 'reflake[{extra}]'"
+            ) from error
+        value = getattr(module, name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "DEFAULT_CHUNK_SIZE",

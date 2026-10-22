@@ -20,7 +20,6 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Protocol
 
-import pyarrow.parquet as pq
 from blake3 import blake3
 
 from .base import ObjectIO
@@ -95,6 +94,10 @@ def parse_parquet_footer(source: SeekableReader) -> FooterStats:
     Raises ``ValueError`` (pyarrow's ``ArrowInvalid``) when *source* is not a
     readable parquet file.
     """
+    from ..extras import optional_import
+
+    pq = optional_import("pyarrow.parquet", extra="query")
+
     parquet_file = pq.ParquetFile(source)
     metadata = parquet_file.metadata
     schema_columns = [

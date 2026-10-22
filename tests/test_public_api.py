@@ -184,3 +184,40 @@ def test_commit_json_flag(tmp_path: Path, capsys) -> None:
     out = json.loads(capsys.readouterr().out)
     assert "commit_id" in out
     assert len(out["commit_id"]) == 64
+
+
+def test_import_reflake_does_not_pull_optional_backends() -> None:
+    """`import reflake` must stay cheap: extras load on first use only.
+
+    A local-only install (`pip install reflake`) does not have boto3,
+    duckdb, pyarrow, or fsspec. Importing the package, and therefore the CLI's
+    module graph, must not require them. Run in a subprocess so the check is
+    not polluted by modules other tests have already imported.
+    """
+    import subprocess
+    import sys
+
+    program = (
+        "import sys, reflake\n"
+        "heavy = {'boto3', 'botocore', 'duckdb', 'pyarrow', 'fsspec'}\n"
+        "print(sorted(m for m in heavy if m in sys.modules))\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "[]", completed.stdout
+
+
+def test_optional_exports_resolve_on_access() -> None:
+    """Lazy exports behave like real attributes (and are in `__all__`)."""
+    import reflake
+
+    assert "ReflakeFileSystem" in reflake.__all__
+    assert reflake.ReflakeFileSystem.protocol == "reflake"
+    # Accessing it a second time hits the memoized global.
+    assert reflake.ReflakeFileSystem is reflake.ReflakeFileSystem
+
+    from reflake.core import S3ObjectStore
+
+    assert S3ObjectStore.__name__ == "S3ObjectStore"

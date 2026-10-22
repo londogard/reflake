@@ -25,15 +25,23 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Version Control",
 ]
+# Core: versioning, the local store, and the CLI. Everything else is an extra,
+# so a local-only `pip install reflake` is a few megabytes instead of ~250.
 dependencies = [
     "blake3>=1.0.8",
-    "boto3>=1.42.57",
-    "duckdb>=1.4.4",
-    "fsspec>=2026.2.0",
     "msgspec>=0.19.0",
-    "pyarrow>=25.0.1",
     "simple-parsing>=0.1.7",
 ]
+
+[project.optional-dependencies]
+# S3/GCS-compatible object store adapter and push/pull/fetch/clone.
+s3 = ["boto3>=1.42.57"]
+# DuckDB catalog and pruned parquet scans (`query build`, `query scan`).
+query = ["duckdb>=1.4.4", "pyarrow>=25.0.1"]
+# `reflake://` URIs for fsspec consumers (DuckDB, pandas, pyarrow datasets).
+vfs = ["fsspec>=2026.2.0"]
+# Everything above.
+all = ["boto3>=1.42.57", "duckdb>=1.4.4", "fsspec>=2026.2.0", "pyarrow>=25.0.1"]
 
 [project.urls]
 Repository = "https://github.com/londogard/reflake"
@@ -60,7 +68,16 @@ include = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=9.0.2", "pyrefly>=0.3.0", "ruff>=0.12.0"]
+# The test suite exercises every backend, so dev installs all extras.
+dev = [
+    "pytest>=9.0.2",
+    "pyrefly>=0.3.0",
+    "ruff>=0.12.0",
+    "boto3>=1.42.57",
+    "duckdb>=1.4.4",
+    "fsspec>=2026.2.0",
+    "pyarrow>=25.0.1",
+]
 
 [tool.ruff]
 target-version = "py311"

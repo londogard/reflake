@@ -365,16 +365,34 @@ version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "blake3" },
+    { name = "msgspec" },
+    { name = "simple-parsing" },
+]
+
+[package.optional-dependencies]
+all = [
     { name = "boto3" },
     { name = "duckdb" },
     { name = "fsspec" },
-    { name = "msgspec" },
     { name = "pyarrow" },
-    { name = "simple-parsing" },
+]
+query = [
+    { name = "duckdb" },
+    { name = "pyarrow" },
+]
+s3 = [
+    { name = "boto3" },
+]
+vfs = [
+    { name = "fsspec" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "boto3" },
+    { name = "duckdb" },
+    { name = "fsspec" },
+    { name = "pyarrow" },
     { name = "pyrefly" },
     { name = "pytest" },
     { name = "ruff" },
@@ -383,16 +401,25 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "blake3", specifier = ">=1.0.8" },
-    { name = "boto3", specifier = ">=1.42.57" },
-    { name = "duckdb", specifier = ">=1.4.4" },
-    { name = "fsspec", specifier = ">=2026.2.0" },
+    { name = "boto3", marker = "extra == 'all'", specifier = ">=1.42.57" },
+    { name = "boto3", marker = "extra == 's3'", specifier = ">=1.42.57" },
+    { name = "duckdb", marker = "extra == 'all'", specifier = ">=1.4.4" },
+    { name = "duckdb", marker = "extra == 'query'", specifier = ">=1.4.4" },
+    { name = "fsspec", marker = "extra == 'all'", specifier = ">=2026.2.0" },
+    { name = "fsspec", marker = "extra == 'vfs'", specifier = ">=2026.2.0" },
     { name = "msgspec", specifier = ">=0.19.0" },
-    { name = "pyarrow", specifier = ">=25.0.1" },
+    { name = "pyarrow", marker = "extra == 'all'", specifier = ">=25.0.1" },
+    { name = "pyarrow", marker = "extra == 'query'", specifier = ">=25.0.1" },
     { name = "simple-parsing", specifier = ">=0.1.7" },
 ]
+provides-extras = ["s3", "query", "vfs", "all"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "boto3", specifier = ">=1.42.57" },
+    { name = "duckdb", specifier = ">=1.4.4" },
+    { name = "fsspec", specifier = ">=2026.2.0" },
+    { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "pyrefly", specifier = ">=0.3.0" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "ruff", specifier = ">=0.12.0" },

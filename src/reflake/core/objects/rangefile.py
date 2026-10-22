@@ -20,10 +20,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from botocore.exceptions import ClientError
-
 from ..domain import SourceNotFoundError
-from .source import _s3_is_404, _translate_s3_error, build_s3_client, parse_s3_uri
+from .source import _s3_is_404, _translate_s3_error, build_s3_client
+from .uris import parse_s3_uri as parse_s3_uri  # noqa: F401 – re-exported
+
+
+def _client_error() -> type[BaseException]:
+    """botocore's exception class, imported only for S3 range reads."""
+    from ..extras import optional_import
+
+    return optional_import("botocore.exceptions", extra="s3").ClientError
 
 
 class RangeFile:
@@ -159,7 +165,7 @@ def open_s3_range_file(
                 Key=key,
                 Range=f"bytes={offset}-{offset + length - 1}",
             )
-        except ClientError as error:
+        except _client_error() as error:
             if _s3_is_404(error):
                 raise SourceNotFoundError(
                     f"Cannot scan missing source: {context}"

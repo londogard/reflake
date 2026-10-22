@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, BinaryIO, Literal
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, cast
 
 from blake3 import blake3
 
@@ -34,11 +34,9 @@ from .objects import (
     LocalObjectStore,
     ObjectInventory,
     RepositoryStore,
-    S3ObjectStore,
-    build_blob_transfer_backend,
-    build_s3_client,
     parse_s3_uri,
 )
+from .objects.uris import is_s3_uri
 from .repo_format import RepoFormat, format_for_config
 from .repository_support import merge_base_commit
 from .services.entries import EntryFactory
@@ -46,6 +44,18 @@ from .services.refs import RefManager
 from .services.staging import StagingArea
 from .services.tree import TreeWriter
 from .stat_cache import StatCache
+
+if TYPE_CHECKING:  # pragma: no cover - static surface only, never imported
+    from .objects.s3 import S3ObjectStore
+
+
+def _is_s3_store(store: object | None) -> bool:
+    """True for a remote (S3) object store, without importing boto3.
+
+    The S3 adapter is an optional extra, so the facade cannot use
+    ``isinstance`` against it on the import path of ``import reflake``.
+    """
+    return store is not None and hasattr(store, "bucket") and hasattr(store, "prefix")
 
 
 class ReflakeRepository:
@@ -57,7 +67,7 @@ class ReflakeRepository:
         client_state: LocalClientState | None = None,
         blob_transfer: BlobTransferBackend | None = None,
     ) -> None:
-        is_remote_store = isinstance(store, S3ObjectStore)
+        is_remote_store = _is_s3_store(store)
         self.layout = initialize_reflake_layout(root, create_dirs=not is_remote_store)
         config = BaseConfig.load(root)
         if config is not None:
@@ -89,8 +99,8 @@ class ReflakeRepository:
         )
         self.identity_mode = identity_mode
         self.capture_footers = parquet_footer
-        if isinstance(self.store, S3ObjectStore) and blob_transfer is not None:
-            self.store.transfer_backend = blob_transfer
+        if _is_s3_store(self.store) and blob_transfer is not None:
+            cast("S3ObjectStore", self.store).transfer_backend = blob_transfer
         self.client_state = client_state or self._default_client_state()
         self.refs = RefManager(
             store=self.store,
@@ -127,8 +137,9 @@ class ReflakeRepository:
         namespace it under ``.reflake/clients/<repo-id>`` so opening a remote
         repository never creates a bare local ``.reflake`` storage tree.
         """
-        if isinstance(self.store, S3ObjectStore):
-            repo_uri = f"s3://{self.store.bucket}/{self.store.prefix}"
+        if _is_s3_store(self.store):
+            store = cast("S3ObjectStore", self.store)
+            repo_uri = f"s3://{store.bucket}/{store.prefix}"
             return LocalClientState(
                 _default_remote_client_root(self.layout.root, repo_uri)
             )
@@ -993,7 +1004,7 @@ def create_repository(
 
     S3 URIs skip the local init step — remote opens stay lazy.
     """
-    if not (isinstance(root, str) and root.startswith("s3://")):
+    if not (isinstance(root, str) and is_s3_uri(root)):
         init_repository(root, default_branch=default_branch)
     return open_repository(root, **open_kwargs)
 
@@ -1008,7 +1019,11 @@ def open_repository(
     blob_transfer: BlobTransferBackend | str | None = None,
     must_exist: bool = True,
 ) -> ReflakeRepository:
-    if isinstance(root, str) and root.startswith("s3://"):
+    if isinstance(root, str) and is_s3_uri(root):
+        from .objects.s3 import S3ObjectStore
+        from .objects.source import build_s3_client
+        from .objects.transfer import build_blob_transfer_backend
+
         bucket, prefix = parse_s3_uri(root)
         worktree_root = Path(worktree or ".").resolve()
         resolved_client_root = (
@@ -1051,15 +1066,22 @@ def open_repository(
         endpoint = config.endpoint_url
 
     if blob_transfer is None and config is not None and config.transfer_backend:
+        from .objects.transfer import build_blob_transfer_backend
+
         blob_transfer = build_blob_transfer_backend(
             config.transfer_backend, endpoint_url=endpoint
         )
     elif isinstance(blob_transfer, str):
+        from .objects.transfer import build_blob_transfer_backend
+
         blob_transfer = build_blob_transfer_backend(
             blob_transfer, endpoint_url=endpoint
         )
 
     if isinstance(config, S3Config):
+        from .objects.s3 import S3ObjectStore
+        from .objects.source import build_s3_client
+
         bucket = config.bucket
         prefix = config.prefix
         worktree_root = Path(worktree or repo_root)

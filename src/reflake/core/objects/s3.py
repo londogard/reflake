@@ -7,7 +7,6 @@ from tempfile import NamedTemporaryFile
 from typing import Any, BinaryIO
 
 from blake3 import blake3
-from botocore.exceptions import ClientError
 
 from ..domain import (
     BlobIntegrityError,
@@ -29,6 +28,13 @@ from .source import (
     _s3_is_precondition_failed,
     build_s3_client,
 )
+
+
+def _client_error() -> type[BaseException]:
+    """botocore's ClientError, imported only when S3 is actually used."""
+    from ..extras import optional_import
+
+    return optional_import("botocore.exceptions", extra="s3").ClientError
 
 
 class S3ObjectStore:
@@ -67,7 +73,7 @@ class S3ObjectStore:
                 Bucket=self.bucket,
                 Key=self._key("commit", commit_id),
             )
-        except ClientError as error:
+        except _client_error() as error:
             if self._missing(error):
                 return None
             raise self._translate(error, "read_commit_bytes") from error
@@ -89,7 +95,7 @@ class S3ObjectStore:
             kwargs["IfNoneMatch"] = "*"
         try:
             self.client.put_object(**kwargs)
-        except ClientError as error:
+        except _client_error() as error:
             if if_missing and self._precondition_failed(error):
                 raise OptimisticLockError(
                     f"Commit already exists: {commit_id}"
@@ -102,7 +108,7 @@ class S3ObjectStore:
                 Bucket=self.bucket,
                 Key=self._key("tree", tree_hash),
             )
-        except ClientError as error:
+        except _client_error() as error:
             if self._missing(error):
                 return None
             raise self._translate(error, "read_tree_bytes") from error
@@ -153,7 +159,7 @@ class S3ObjectStore:
                 Bucket=self.bucket,
                 Key=self._key("footer", footer_hash),
             )
-        except ClientError as error:
+        except _client_error() as error:
             if self._missing(error):
                 return None
             raise self._translate(error, "read_footer_bytes") from error
@@ -194,7 +200,7 @@ class S3ObjectStore:
         key = self._key("ref", branch)
         try:
             response = self.client.get_object(Bucket=self.bucket, Key=key)
-        except ClientError as error:
+        except _client_error() as error:
             if self._missing(error):
                 return None
             raise self._translate(error, "read_branch_ref") from error
@@ -224,7 +230,7 @@ class S3ObjectStore:
 
         try:
             self.client.put_object(**kwargs)
-        except ClientError as error:
+        except _client_error() as error:
             if self._precondition_failed(error):
                 raise PreconditionFailedError(
                     f"Branch ref '{branch}' update failed "
@@ -245,7 +251,7 @@ class S3ObjectStore:
         key = self._key("ref", branch)
         try:
             response = self.client.get_object(Bucket=self.bucket, Key=key)
-        except ClientError as error:
+        except _client_error() as error:
             if not self._missing(error):
                 raise self._translate(error, "compare_and_set_branch_ref") from error
             response = None
@@ -277,7 +283,7 @@ class S3ObjectStore:
             response = self.client.get_object(
                 Bucket=self.bucket, Key=self._ref_key("tags", tag)
             )
-        except ClientError as error:
+        except _client_error() as error:
             if self._missing(error):
                 return None
             raise self._translate(error, "read_tag_ref") from error
@@ -293,7 +299,7 @@ class S3ObjectStore:
                 Body=f"{commit_id}\n".encode(),
                 IfNoneMatch="*",
             )
-        except ClientError as error:
+        except _client_error() as error:
             if self._precondition_failed(error):
                 return False
             raise self._translate(error, "create_tag_ref") from error
@@ -304,7 +310,7 @@ class S3ObjectStore:
             self.client.delete_object(
                 Bucket=self.bucket, Key=self._ref_key("tags", tag)
             )
-        except ClientError as error:
+        except _client_error() as error:
             raise self._translate(error, "delete_tag_ref") from error
 
     def iter_tags(self) -> Iterator[str]:
@@ -316,7 +322,7 @@ class S3ObjectStore:
                 for obj in page.get("Contents", []):
                     key = str(obj["Key"])
                     yield key[len(prefix) :] if key.startswith(prefix) else key
-        except ClientError as error:
+        except _client_error() as error:
             raise self._translate(error, "list_objects") from error
 
     def _blob_uri(self, blob_hash: str) -> str:
@@ -334,7 +340,7 @@ class S3ObjectStore:
                     key = str(obj["Key"])
                     relative = key[len(prefix) :] if key.startswith(prefix) else key
                     yield relative
-        except ClientError as error:
+        except _client_error() as error:
             raise self._translate(error, "list_objects") from error
 
     def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]:
@@ -381,7 +387,7 @@ class S3ObjectStore:
                         "Quiet": True,
                     },
                 )
-            except ClientError as error:
+            except _client_error() as error:
                 raise self._translate(error, "delete_objects") from error
             deleted += len(batch)
         return deleted
@@ -416,7 +422,7 @@ class S3ObjectStore:
                 Bucket=self.bucket,
                 Key=self._key("blob", blob_hash),
             )
-        except ClientError as error:
+        except _client_error() as error:
             raise self._translate(error, "read_blob_bytes") from error
         return response["Body"].read()
 
@@ -426,7 +432,7 @@ class S3ObjectStore:
                 Bucket=self.bucket,
                 Key=self._key("blob", blob_hash),
             )
-        except ClientError as error:
+        except _client_error() as error:
             raise self._translate(error, "open_blob") from error
         return response["Body"]
 
@@ -439,7 +445,7 @@ class S3ObjectStore:
                 Key=self._key("blob", blob_hash),
                 Range=f"bytes={offset}-{offset + length - 1}",
             )
-        except ClientError as error:
+        except _client_error() as error:
             raise self._translate(error, "read_blob_range") from error
         return response["Body"].read()
 
@@ -482,7 +488,7 @@ class S3ObjectStore:
                 source_path,
                 if_none_match=if_missing,
             )
-        except ClientError as error:
+        except _client_error() as error:
             if if_missing and self._precondition_failed(error):
                 return
             raise self._translate(error, "write_blob_file") from error
@@ -554,7 +560,7 @@ class S3ObjectStore:
                 pre_complete=_verify,
                 if_none_match=if_missing,
             )
-        except ClientError as error:
+        except _client_error() as error:
             if if_missing and self._precondition_failed(error):
                 return
             raise self._translate(error, "write_blob_stream") from error
@@ -605,7 +611,7 @@ class S3ObjectStore:
                 CopySource={"Bucket": bucket, "Key": key},
             )
             return True
-        except ClientError:
+        except _client_error():
             return False
 
     def _repo_format_key(self) -> str:
@@ -618,7 +624,7 @@ class S3ObjectStore:
             response = self.client.get_object(
                 Bucket=self.bucket, Key=self._repo_format_key()
             )
-        except ClientError as error:
+        except _client_error() as error:
             if self._missing(error):
                 return None
             raise self._translate(error, "read_repo_format_bytes") from error
@@ -634,7 +640,7 @@ class S3ObjectStore:
                 Body=payload,
                 IfNoneMatch="*",
             )
-        except ClientError as error:
+        except _client_error() as error:
             if not self._precondition_failed(error):
                 raise self._translate(error, "write_repo_format_bytes") from error
 
@@ -644,7 +650,7 @@ class S3ObjectStore:
         try:
             self.client.head_object(Bucket=self.bucket, Key=self._key(kind, object_id))
             return True
-        except ClientError as error:
+        except _client_error() as error:
             if self._missing(error):
                 return False
             raise self._translate(error, "object_exists") from error
@@ -681,18 +687,18 @@ class S3ObjectStore:
             kwargs["IfNoneMatch"] = "*"
         try:
             self.client.put_object(**kwargs)
-        except ClientError as error:
+        except _client_error() as error:
             if if_missing and self._precondition_failed(error):
                 raise OptimisticLockError(error_message) from error
             raise self._translate(error, "put_object") from error
 
-    def _missing(self, error: ClientError) -> bool:
+    def _missing(self, error: object) -> bool:
         return _s3_is_404(error)
 
-    def _precondition_failed(self, error: ClientError) -> bool:
+    def _precondition_failed(self, error: object) -> bool:
         return _s3_is_precondition_failed(error)
 
-    def _translate(self, error: ClientError, operation: str) -> Exception:
+    def _translate(self, error: object, operation: str) -> Exception:
         """Map a botocore error to a domain error (adapter boundary, §8)."""
         if self._missing(error):
             return ObjectMissingError(f"{operation}: object not found")

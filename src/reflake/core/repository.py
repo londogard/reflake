@@ -15,6 +15,7 @@ from .domain import (
     CommitStats,
     DiffEntry,
     EmptyBranchError,
+    FsckResult,
     GcResult,
     MergeResult,
     MoveResult,
@@ -651,6 +652,17 @@ class ReflakeRepository:
         from_commit = self.refs.read_commit(self.refs.resolve_ref(from_ref))
         to_commit = self.refs.read_commit(self.refs.resolve_ref(to_ref))
         return self.tree_writer.diff_trees(from_commit.tree, to_commit.tree)
+
+    def fsck(
+        self,
+        *,
+        ref: str | None = None,
+        verify_blobs: bool = False,
+    ) -> FsckResult:
+        """Audit refs -> commits -> trees -> leaves and object existence."""
+        from .repository_fsck import repo_fsck
+
+        return repo_fsck(self, ref=ref, verify_blobs=verify_blobs)
 
     def verify(
         self,

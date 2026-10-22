@@ -19,6 +19,7 @@ from .args import (
     ConfigInitArgs,
     ConfigListArgs,
     ConfigSetArgs,
+    FsckArgs,
     GcArgs,
     InitArgs,
 )
@@ -176,6 +177,66 @@ def _apply_shared_policy(repo_root: str, key: str, value: str) -> None:
         )
     else:
         repo.set_repository_policy(default_branch=value)
+
+
+def handle_fsck(command: FsckArgs, repo_root: str, as_json: bool) -> int:
+    result = open_repository(repo_root).fsck(
+        ref=command.ref,
+        verify_blobs=command.verify_blobs,
+    )
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": result.ok,
+                    "refs": result.refs,
+                    "commits": result.commits,
+                    "trees": result.trees,
+                    "leaves": result.leaves,
+                    "blobs": result.blobs,
+                    "footers": result.footers,
+                    "pointer_entries": result.pointer_entries,
+                    "missing_objects": result.missing_objects,
+                    "corrupt_objects": result.corrupt_objects,
+                    "verified_blobs": result.verified_blobs,
+                    "corrupt_blobs": result.corrupt_blobs,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(
+            f"Checked {result.refs} ref(s): {result.commits} commits, "
+            f"{result.trees} trees, {result.leaves} leaves "
+            f"({result.blobs} blobs, {result.footers} footers, "
+            f"{result.pointer_entries} pointer entries)"
+        )
+        if result.verified_blobs:
+            print(f"Re-hashed {result.verified_blobs} blob(s)")
+        sys.stdout.flush()
+        if result.corrupt_objects:
+            print("Corrupt objects:", file=sys.stderr)
+            for item in result.corrupt_objects[:20]:
+                print(f"  {item}", file=sys.stderr)
+        if result.missing_objects:
+            print("Missing objects:", file=sys.stderr)
+            for item in result.missing_objects[:20]:
+                print(f"  {item}", file=sys.stderr)
+        if result.corrupt_blobs:
+            print("Blob bytes do not match their hash:", file=sys.stderr)
+            for item in result.corrupt_blobs[:20]:
+                print(f"  {item}", file=sys.stderr)
+        if result.ok:
+            print("OK")
+            return 0
+        total = (
+            len(result.corrupt_objects)
+            + len(result.missing_objects)
+            + len(result.corrupt_blobs)
+        )
+        print(f"fsck found {total} problem(s)", file=sys.stderr)
+        return 1
+    return 0 if result.ok else 1
 
 
 def handle_gc(command: GcArgs, repo_root: str, as_json: bool) -> int:

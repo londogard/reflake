@@ -88,6 +88,27 @@ class GcResult:
 
 
 @dataclass(frozen=True)
+class FsckResult:
+    """Result of `reflake fsck`: an integrity audit, never a mutation."""
+
+    refs: int
+    commits: int
+    trees: int
+    leaves: int
+    blobs: int
+    footers: int
+    pointer_entries: int
+    missing_objects: list[str] = field(default_factory=list)
+    corrupt_objects: list[str] = field(default_factory=list)
+    verified_blobs: int = 0
+    corrupt_blobs: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not (self.missing_objects or self.corrupt_objects or self.corrupt_blobs)
+
+
+@dataclass(frozen=True)
 class VerifyResult:
     commit_id: str
     verified_entries: int

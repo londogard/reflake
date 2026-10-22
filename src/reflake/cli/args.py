@@ -328,6 +328,19 @@ class GcArgs:
 
 
 @dataclass
+class FsckArgs:
+    # Ref to audit (default: every branch and tag).
+    ref: str | None = field(default=None, alias="--ref")
+    # Re-hash every blob's bytes (reads the whole dataset; slow but definitive).
+    verify_blobs: bool = flag(  # type: ignore[no-matching-overload]
+        False,
+        alias="--verify-blobs",
+        action="store_true",
+        help="Re-hash every blob's bytes (slow; reads the whole dataset)",
+    )
+
+
+@dataclass
 class QueryBuildArgs:
     # Output directory for the index.
     output_dir: str | None = field(default=None, alias="--output-dir")
@@ -370,6 +383,7 @@ class ReflakeCLI:
         | MergeArgs
         | IdentityArgs
         | GcArgs
+        | FsckArgs
         | QueryArgs
         | LogArgs
         | ListArgs
@@ -399,6 +413,7 @@ class ReflakeCLI:
             "merge": MergeArgs,
             "identity": IdentityArgs,
             "gc": GcArgs,
+            "fsck": FsckArgs,
             "query": QueryArgs,
             "log": LogArgs,
             "list": ListArgs,
@@ -503,6 +518,7 @@ _COMMAND_NAMES: dict[type, str] = {
     IdentityPromoteArgs: "identity promote",
     QueryBuildArgs: "query build",
     QueryScanArgs: "query scan",
+    FsckArgs: "fsck",
     ConfigInitArgs: "config init",
     ConfigSetArgs: "config set",
     ConfigListArgs: "config list",

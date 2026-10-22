@@ -208,5 +208,11 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
-      - name: Run benchmark suite (wall-clock/memory)
+      - name: Run benchmark suite (wall-clock/memory + structural budgets)
         run: uv run pytest tests -m benchmark -q
+
+      - name: Scale harness (reproducible numbers)
+        run: uv run python scripts/bench_scale.py --files 50000 --dirs 50
+
+      - name: Scaled sharded-directory check
+        run: uv run python scripts/bench_scale.py --files 20000 --dirs 1

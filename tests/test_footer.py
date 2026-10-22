@@ -108,8 +108,10 @@ def test_commit_captures_footer_only_when_enabled(tmp_path: Path) -> None:
     entry = repo.resolve_entry("main", "data.parquet")
     assert entry.footer is None
 
-    # Enable capture; an unchanged file gets its footer backfilled.
-    LocalConfig(identity="content", parquet_footer=True).save(tmp_path)
+    # Enable capture repository-wide; an unchanged file is backfilled.
+    # (`parquet_footer` lives in the shared repo.json: it decides whether a
+    # commit writes `b` or `bp`, so every client must agree.)
+    repo.set_repository_policy(parquet_footer=True)
     repo2 = ReflakeRepository(tmp_path)
     repo2.commit("captured")
     entry = repo2.resolve_entry("main", "data.parquet")

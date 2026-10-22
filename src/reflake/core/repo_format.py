@@ -23,7 +23,7 @@ import msgspec
 #: File name, relative to the shared scope root.
 REPO_FORMAT_KEY = "repo.json"
 
-CURRENT_FORMAT_VERSION = 1
+CURRENT_FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,13 @@ class RepoFormat:
             raise ValueError(
                 f"Repository format version {self.format_version} is newer than "
                 f"this reflake ({CURRENT_FORMAT_VERSION}). Upgrade reflake."
+            )
+        if self.format_version < CURRENT_FORMAT_VERSION:
+            raise ValueError(
+                f"Repository format version {self.format_version} predates "
+                f"version {CURRENT_FORMAT_VERSION}: its trees use a different "
+                "entry layout. Recreate the repository with this version "
+                "(0.5.0 is a format break) or read it with Reflake 0.4.x."
             )
         if self.identity not in ("content", "pointer"):
             raise ValueError("identity must be one of: content, pointer")

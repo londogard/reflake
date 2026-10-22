@@ -113,8 +113,15 @@ class ObjectIO(Protocol):
         """The shared ``repo.json`` (format + ingest policy), if any."""
         ...
 
-    def write_repo_format_bytes(self, payload: bytes) -> None:
-        """Create the shared ``repo.json``; idempotent, never rewritten."""
+    def write_repo_format_bytes(
+        self, payload: bytes, *, if_missing: bool = True
+    ) -> None:
+        """Write the shared ``repo.json`` (create-only unless told otherwise).
+
+        Create-only is the default so a concurrent ``init`` cannot retarget a
+        repository's format; an explicit policy change passes
+        ``if_missing=False``.
+        """
         ...
 
 

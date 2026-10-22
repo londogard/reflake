@@ -630,19 +630,24 @@ class S3ObjectStore:
             raise self._translate(error, "read_repo_format_bytes") from error
         return response["Body"].read()
 
-    def write_repo_format_bytes(self, payload: bytes) -> None:
-        # Create-only: concurrent `init`s must not retarget an existing
-        # repository's format, and identical payloads are harmless.
+    def write_repo_format_bytes(
+        self, payload: bytes, *, if_missing: bool = True
+    ) -> None:
+        # Create-only by default: concurrent `init`s must not retarget an
+        # existing repository's format, and identical payloads are harmless.
+        kwargs: dict[str, Any] = {
+            "Bucket": self.bucket,
+            "Key": self._repo_format_key(),
+            "Body": payload,
+        }
+        if if_missing:
+            kwargs["IfNoneMatch"] = "*"
         try:
-            self.client.put_object(
-                Bucket=self.bucket,
-                Key=self._repo_format_key(),
-                Body=payload,
-                IfNoneMatch="*",
-            )
+            self.client.put_object(**kwargs)
         except _client_error() as error:
-            if not self._precondition_failed(error):
-                raise self._translate(error, "write_repo_format_bytes") from error
+            if if_missing and self._precondition_failed(error):
+                return
+            raise self._translate(error, "write_repo_format_bytes") from error
 
     def object_exists(self, kind: RepositoryObjectKind, object_id: str) -> bool:
         if kind == "blob" and self._blob_transfer is not None:

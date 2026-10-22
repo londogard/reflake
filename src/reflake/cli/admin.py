@@ -117,6 +117,7 @@ def handle_config(
             return 1
         config = _config_set_value(config, command.key, command.value)
         path = config.save(repo_root)
+        _apply_shared_policy(repo_root, command.key, command.value)
         if as_json:
             print(
                 json.dumps(
@@ -151,6 +152,30 @@ def handle_config(
             print(raw)
         return 0
     return 0
+
+
+#: Keys that decide what a commit writes, so they live in the shared scope.
+_REPOSITORY_WIDE_KEYS = frozenset({"identity", "parquet_footer", "default_branch"})
+
+
+def _apply_shared_policy(repo_root: str, key: str, value: str) -> None:
+    """Mirror a repository-wide setting into the shared ``repo.json``.
+
+    Without this, `config set identity pointer` would change the client's
+    config while the repository kept its old policy — and the shared policy
+    wins, so the command would silently do nothing.
+    """
+    if key not in _REPOSITORY_WIDE_KEYS:
+        return
+    repo = open_repository(repo_root, must_exist=False)
+    if key == "identity":
+        repo.set_repository_policy(identity=value)
+    elif key == "parquet_footer":
+        repo.set_repository_policy(
+            parquet_footer=value.strip().lower() in ("true", "1", "yes", "on")
+        )
+    else:
+        repo.set_repository_policy(default_branch=value)
 
 
 def handle_gc(command: GcArgs, repo_root: str, as_json: bool) -> int:

@@ -486,9 +486,11 @@ class LocalObjectStore:
             return None
         return path.read_bytes()
 
-    def write_repo_format_bytes(self, payload: bytes) -> None:
+    def write_repo_format_bytes(
+        self, payload: bytes, *, if_missing: bool = True
+    ) -> None:
         path = self.layout.reflake_dir / "repo.json"
-        if path.exists():
+        if if_missing and path.exists():
             return
         _atomic_write_bytes(path, payload)
 

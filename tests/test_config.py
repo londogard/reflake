@@ -175,14 +175,14 @@ def test_config_set_s3_bucket_and_list(tmp_path: Path, capsys) -> None:
 
 def test_config_default_format_version(tmp_path: Path) -> None:
     config = LocalConfig(dataset_root=str(tmp_path))
-    assert config.format_version == 1
+    assert config.format_version == CURRENT_FORMAT_VERSION
 
 
 def test_config_serialize_includes_format_version(tmp_path: Path) -> None:
     config = LocalConfig(dataset_root=str(tmp_path))
     config.save(tmp_path)
     raw = json.loads((tmp_path / ".reflake" / "config.json").read_text("utf-8"))
-    assert raw["format_version"] == 1
+    assert raw["format_version"] == CURRENT_FORMAT_VERSION
 
 
 def test_repo_rejects_unsupported_format_version(tmp_path: Path) -> None:
@@ -211,12 +211,12 @@ def test_config_missing_format_version_defaults_to_current(tmp_path: Path) -> No
     )
     config = BaseConfig.load(tmp_path)
     assert config is not None
-    assert config.format_version == 1
+    assert config.format_version == CURRENT_FORMAT_VERSION
 
 
 def test_validate_config_rejects_future_format() -> None:
     try:
-        LocalConfig(format_version=2, dataset_root="/tmp")
+        LocalConfig(format_version=CURRENT_FORMAT_VERSION + 1, dataset_root="/tmp")
         pytest.fail("Should have raised")
     except ValueError as e:
         msg = str(e)
@@ -229,7 +229,7 @@ def test_validate_config_rejects_unsupported_old_format() -> None:
         pytest.fail("Should have raised")
     except ValueError as e:
         msg = str(e)
-        assert "no longer supported" in msg and "reflake migrate" in msg
+        assert "no longer supported" in msg and "Recreate the repository" in msg
 
 
 def test_config_save_and_load_roundtrip(tmp_path: Path) -> None:

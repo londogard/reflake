@@ -369,8 +369,12 @@ def _push_tag(
     from .repository import open_repository
 
     remote_repo = open_repository(
-        remote_uri, worktree=repo.root, blob_transfer=blob_transfer
+        remote_uri,
+        worktree=repo.root,
+        blob_transfer=blob_transfer,
+        validate_format=False,
     )
+    remote_repo._ensure_repo_format_marker()
     remote_commit = remote_repo.store.read_tag_ref(tag)
     if remote_commit is not None:
         if remote_commit == commit_id:
@@ -465,12 +469,16 @@ def push(
     branch = name
     local_commit_id = branch_state.commit_id
 
-    # Open remote repo
+    # Open remote repo. A push destination is about to be written by this
+    # version, so it is not required to carry a format marker yet — the marker
+    # is written below (create-only).
     remote_repo = open_repository(
         remote_uri,
         worktree=repo.root,
         blob_transfer=blob_transfer,
+        validate_format=False,
     )
+    remote_repo._ensure_repo_format_marker()
 
     # Ensure remote branch exists (CAS: create only when still absent).
     if remote_repo.store.read_branch_ref(branch) is None:

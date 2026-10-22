@@ -66,6 +66,7 @@ class ReflakeRepository:
         store: RepositoryStore | None = None,
         client_state: LocalClientState | None = None,
         blob_transfer: BlobTransferBackend | None = None,
+        validate_format: bool = True,
     ) -> None:
         is_remote_store = _is_s3_store(store)
         self.layout = initialize_reflake_layout(root, create_dirs=not is_remote_store)
@@ -82,6 +83,8 @@ class ReflakeRepository:
         self.repo_format = (
             RepoFormat.parse(format_payload) if format_payload is not None else None
         )
+        if self.repo_format is None and validate_format:
+            self._reject_pre_v2_repository()
         identity_mode = (
             self.repo_format.identity
             if self.repo_format is not None
@@ -129,6 +132,74 @@ class ReflakeRepository:
             refs=self.refs,
             stat_cache=self.stat_cache,
         )
+
+    def _reject_pre_v2_repository(self) -> None:
+        """Fail clearly on a repository written before the 0.5 format break.
+
+        Format 2 is marked by ``repo.json``. A store that has no marker *and*
+        already has branches was written by 0.4.x, whose tree entries this
+        version cannot parse; without this check the user would see a JSON
+        decode error deep inside a tree walk. A store with no marker and no
+        branches is simply a brand-new (or hand-built) repository.
+        """
+        try:
+            has_branches = next(self.store.iter_branches(), None) is not None
+        except Exception:  # noqa: BLE001 – a probe must never block opening
+            has_branches = False
+        if has_branches:
+            raise ValueError(
+                "This repository has no repo.json and already contains branches, "
+                "so it was written by Reflake 0.4.x or older (format version 1). "
+                "0.5.0 is a format break: tree entries changed. Recreate the "
+                "repository with this version, or read it with Reflake 0.4.x to "
+                "export the data."
+            )
+
+    def set_repository_policy(
+        self,
+        *,
+        identity: str | None = None,
+        parquet_footer: bool | None = None,
+        default_branch: str | None = None,
+    ) -> RepoFormat:
+        """Change a repository-wide setting in the shared ``repo.json``.
+
+        These settings decide what a commit *writes* (``b`` vs ``bp``), so
+        they belong to the repository, not to one client. Editing client
+        config alone would silently do nothing.
+        """
+        current = self.repo_format or RepoFormat(
+            default_branch=self.current_branch(),
+            identity=self.identity_mode,
+            parquet_footer=self.capture_footers,
+        )
+        updated = RepoFormat(
+            format_version=current.format_version,
+            default_branch=default_branch or current.default_branch,
+            identity=identity or current.identity,
+            parquet_footer=(
+                current.parquet_footer
+                if parquet_footer is None
+                else parquet_footer
+            ),
+        )
+        self.store.write_repo_format_bytes(updated.to_json(), if_missing=False)
+        self.repo_format = updated
+        self.identity_mode = updated.identity
+        self.capture_footers = updated.parquet_footer
+        self.entries.capture_footers = updated.parquet_footer
+        return updated
+
+    def _ensure_repo_format_marker(self) -> None:
+        """Create the shared format marker on first write (create-only)."""
+        if self.repo_format is not None:
+            return
+        self.repo_format = RepoFormat(
+            default_branch=self.current_branch(),
+            identity=self.identity_mode,
+            parquet_footer=self.capture_footers,
+        )
+        self.store.write_repo_format_bytes(self.repo_format.to_json())
 
     def _default_client_state(self) -> LocalClientState:
         """Default client-state root, mirroring ``open_repository``.
@@ -320,6 +391,7 @@ class ReflakeRepository:
 
         branch = self.current_branch()
         self.refs.ensure_branch_exists(branch)
+        self._ensure_repo_format_marker()
 
         staged = self.staging.load(branch)
         staged_removed_paths: set[str] = {
@@ -1018,6 +1090,7 @@ def open_repository(
     s3_endpoint: str | None = None,
     blob_transfer: BlobTransferBackend | str | None = None,
     must_exist: bool = True,
+    validate_format: bool = True,
 ) -> ReflakeRepository:
     if isinstance(root, str) and is_s3_uri(root):
         from .objects.s3 import S3ObjectStore
@@ -1047,6 +1120,7 @@ def open_repository(
                 blob_transfer=blob_transfer,
             ),
             client_state=LocalClientState(resolved_client_root),
+            validate_format=validate_format,
         )
 
     if root == "." or str(root) == ".":
@@ -1098,6 +1172,7 @@ def open_repository(
                 blob_transfer=blob_transfer,
             ),
             client_state=LocalClientState(resolved_client_root),
+            validate_format=validate_format,
         )
 
     worktree_root = Path(worktree).resolve() if worktree else repo_root

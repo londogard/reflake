@@ -7,8 +7,11 @@ from typing import Literal
 
 import msgspec
 
-CURRENT_FORMAT_VERSION = 1
-SUPPORTED_FORMAT_VERSIONS: frozenset[int] = frozenset({1})
+#: Bumped whenever the on-disk model changes incompatibly. Version 2 is the
+#: canonical-entry model (no mtime in tree entries, 2 048-entry nodes,
+#: version-based pointer identity) introduced in 0.5.0.
+CURRENT_FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS: frozenset[int] = frozenset({2})
 
 BackendType = Literal["local", "s3"]
 
@@ -46,9 +49,12 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
                     f"Please upgrade reflake to access this repository."
                 )
             raise ValueError(
-                f"Repository format version {self.format_version} is no "
-                f"longer supported. "
-                f"Run 'reflake migrate' to upgrade the repository."
+                f"Repository format version {self.format_version} is no longer "
+                "supported: this repository was written by Reflake 0.4.x or "
+                "older, whose tree objects use a different entry layout. "
+                "Recreate the repository with this version (0.5.0 is a format "
+                "break; see CHANGELOG), or read it with Reflake 0.4.x to "
+                "export the data."
             )
         if not self.dataset_root:
             raise ValueError("dataset_root must not be empty")

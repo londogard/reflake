@@ -17,6 +17,7 @@ from .errors import (
     TransferEndpointError,
     UnknownCommitError,
     UnknownRefError,
+    WorktreeStaleError,
 )
 from .models import (
     BranchRefState,
@@ -73,5 +74,6 @@ __all__ = [
     "StageStatus",
     "UnknownCommitError",
     "UnknownRefError",
+    "WorktreeStaleError",
     "VerifyResult",
 ]

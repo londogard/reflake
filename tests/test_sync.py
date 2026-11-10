@@ -585,126 +585,62 @@ def test_pull_two_client_multi_commit_divergence(
 # ── Concurrent-update (CAS race) tests ───────────────────────────────────────
 
 
-def test_push_cas_race_via_stale_snapshot(
+def test_push_cas_race_is_reported(
     tmp_path: Path,
     fake_s3_installer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Simulate a CAS race: another client pushes between the pre-check
-    and the CAS.  The fast-forward pre-check passes (because the remote
-    head at the time of the check *is* an ancestor), but the final CAS
-    uses a stale version token and must raise RefConflictError."""
+    """A CAS loss is a retryable RefConflict, not a silent overwrite.
+
+    fast_forward_branch reads the *real* ref (never a cached snapshot), so a
+    lost compare-and-set is the only remaining race. Simulate it directly.
+    """
     fake_s3_installer({})
-    remote = "s3://demo-bucket/repos/test"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "base.txt").write_text("base")
+    repo = create_repository(str(repo_root))
+    repo.commit("base")
+    repo.branch("feature")
+    repo.set_current_branch("feature")
+    (repo_root / "next.txt").write_text("next")
+    target = repo.commit("next")
+    repo.set_current_branch("main")
 
-    # ── Shared base ──
-    repo_a_root = tmp_path / "repo_a"
-    repo_a_root.mkdir()
-    (repo_a_root / "base.txt").write_text("base")
-    repo_a = create_repository(str(repo_a_root))
-    repo_a.commit("base")
-    push(repo_a, remote)
-
-    # ── Client B pulls the base and builds on top ──
-    repo_b_root = tmp_path / "repo_b"
-    repo_b_root.mkdir()
-    repo_b = create_repository(str(repo_b_root))
-    pull(repo_b, remote)
-    (repo_b_root / "b.txt").write_text("b-data")
-    b_commit = repo_b.commit("b commit")
-
-    # The pre-check from _verify_push_fast_forward reads the remote head
-    # fresh from the store and confirms it is an ancestor of b_commit.
-    from reflake.core.repository import open_repository as _open
-
-    remote_repo = _open(remote, worktree=repo_b_root)
-    remote_state = remote_repo.store.read_branch_ref("main")
-    assert remote_state is not None
-    # Sanity: remote head *is* ancestor of b_commit at this point.
-    from reflake.core.repository_sync import _is_ancestor_in
-
-    assert _is_ancestor_in(remote_state.commit_id, b_commit, repo_b)
-
-    # ── Simulate a concurrent push: directly advance the remote ref ──
-    # This represents another client pushing between B's pre-check and B's CAS.
-    # We write a new commit that B doesn't know about and move the remote head.
-    concurrent_commit = "ffff" * 16  # fake commit id
-    remote_repo.store.write_commit_bytes(
-        concurrent_commit,
-        b'{"id":"'
-        + concurrent_commit.encode()
-        + b'","parents":["'
-        + remote_state.commit_id.encode()
-        + b'"],"message":"concurrent",'
-        b'"tree":"'
-        + remote_state.commit_id.encode()
-        + b'","branch":"main","generation":1,"created_at":""}',
+    monkeypatch.setattr(
+        type(repo.store),
+        "compare_and_set_branch_ref",
+        lambda *args, **kwargs: False,
     )
-    remote_repo.store.write_branch_ref("main", concurrent_commit)
-
-    # ── Now B tries to push.  The pre-check reads the new remote head
-    # (concurrent_commit) and sees it is NOT an ancestor of b_commit →
-    # NonFastForwardError.  This is the correct *divergence* path.
-    #
-    # To exercise the pure CAS-race path we need to bypass the pre-check
-    # and go straight to fast_forward_branch with a stale snapshot.
-    # We corrupt B's client_state so _require_branch_state returns stale data.
-    repo_b.client_state.write_branch_snapshot(
-        "main",
-        commit_id=remote_state.commit_id,
-    )
-    # Now fast_forward_branch will use the stale snapshot: it sees the
-    # old remote head as current, checks ancestry (passes because B's
-    # commit IS a descendant of the old head), then CAS fails because
-    # the real remote head has moved.
     with pytest.raises(RefConflictError):
-        repo_b.fast_forward_branch("main", b_commit, operation="push")
+        repo.refs.fast_forward_branch("main", target, operation="push")
 
 
-def test_pull_cas_race_via_stale_snapshot(
+def test_pull_cas_race_is_reported(
     tmp_path: Path,
     fake_s3_installer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Simulate a CAS race during pull: a stale snapshot causes the
-    optimistic lock to fail even though ancestry would permit the update."""
+    """Pull uses the same fresh-ref fast-forward and surfaces CAS conflicts."""
     fake_s3_installer({})
-    remote = "s3://demo-bucket/repos/test"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "base.txt").write_text("base")
+    repo = create_repository(str(repo_root))
+    repo.commit("base")
+    repo.branch("feature")
+    repo.set_current_branch("feature")
+    (repo_root / "next.txt").write_text("next")
+    target = repo.commit("next")
+    repo.set_current_branch("main")
 
-    # A creates and pushes base + one more commit.
-    repo_a_root = tmp_path / "repo_a"
-    repo_a_root.mkdir()
-    (repo_a_root / "base.txt").write_text("base")
-    repo_a = create_repository(str(repo_a_root))
-    repo_a.commit("base")
-    push(repo_a, remote)
-
-    (repo_a_root / "a2.txt").write_text("a2")
-    _a_c2 = repo_a.commit("a2")
-    push(repo_a, remote)
-
-    # B pulls a_c2 so B has the commit objects locally.
-    repo_b_root = tmp_path / "repo_b"
-    repo_b_root.mkdir()
-    repo_b = create_repository(str(repo_b_root))
-    pull(repo_b, remote)
-
-    # A pushes one more commit so the remote head advances.
-    (repo_a_root / "a3.txt").write_text("a3")
-    a_c3 = repo_a.commit("a3")
-    push(repo_a, remote)
-
-    # Fetch a_c3's objects into B's store so ancestry check can read them.
-    from reflake.core.repository_sync import fetch as _fetch
-
-    _fetch(repo_b, remote)
-
-    # Simulate a concurrent local writer: advance B's real head to a_c3
-    # behind the snapshot's back (snapshot still says a_c2).
-    repo_b.store.write_branch_ref("main", a_c3)
-
-    # fast_forward_branch: ancestry check passes (a_c2 is ancestor of a_c3),
-    # but CAS fails because the real head already moved past the snapshot.
+    monkeypatch.setattr(
+        type(repo.store),
+        "compare_and_set_branch_ref",
+        lambda *args, **kwargs: False,
+    )
     with pytest.raises(RefConflictError):
-        repo_b.fast_forward_branch("main", a_c3, operation="pull")
+        repo.refs.fast_forward_branch("main", target, operation="pull")
 
 
 def test_compare_and_set_branch_ref_create_is_exclusive(

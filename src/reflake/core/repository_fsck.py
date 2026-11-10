@@ -63,7 +63,12 @@ def _walk_trees(
         if tree_hash in trees:
             continue
         trees.add(tree_hash)
-        payload = store.read_tree_bytes(tree_hash)
+        try:
+            payload = store.read_tree_bytes(tree_hash)
+        except ValueError:
+            # Hash verification failure: the bytes are not what the key says.
+            corrupt.append(f"tree:{tree_hash}")
+            continue
         if payload is None:
             continue  # reported as missing by the existence pass
         try:
@@ -105,6 +110,7 @@ def repo_fsck(
 
     assert isinstance(repo, ReflakeRepository)
     store = repo.store
+    repo.refs.clear_commit_cache()
 
     corrupt: list[str] = []
     refs: list[str] = []

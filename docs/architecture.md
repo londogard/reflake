@@ -1,12 +1,12 @@
 # Reflake Architecture v2 — Design Sketch
 
-**Status:** proposal (rev. 3 — rev. 2 folded in review: lookup-path design with a client-side tree cache,
+**Status:** implemented design of record as of 0.5.1/0.6 (rev. 3 — rev. 2 folded in review: lookup-path design with a client-side tree cache,
 parquet-footer scoping, conflict-retry in P0, restore/checkout materialization, `generation`
 semantics; rev. 3 ships the two remaining rollout items — the `repository_store/` + `storage/`
 → `objects/` store unification (§1/§12) and the footer-stats query pruning engine (§4)).
 **Rev. 4 (2026-09, post 0.2.0 review):** shard-aware parent merging in full commits (sharded
 directories must be expanded before merging — see `TreeWalker.expand_shards`); opening a
-repository is side-effect free (missing branch refs are "unborn", created by the first
+repository is lazy (missing branch refs are "unborn", created by the first
 commit); `verify` is strictly read-only; path-prefix matching is component-aware
 everywhere (same rule as `rm`/`mv`); explicit download semantics are documented — `checkout` is a
 pointer switch only and never materializes a worktree (S3-first; `restore`/`pull`/`cat` are
@@ -82,6 +82,30 @@ the VFS reads through the ranged file object — which lets DuckDB query
 **Assumption:** **no backwards compatibility** with v1 on-disk formats, commit schema,
 manifest format, ref format, staging format, lock format, or module layout. We can break
 the on-disk contract freely.
+
+## 0.6 hardening notes
+
+The 0.5 review found the model sound but the seams unsafe. The 0.6 pass keeps
+the model and changes the seams:
+
+- **One store core over a KV surface** (`core/objects/kv.py`): local and S3
+  implement `_kv_get/_put/_put_file/_delete/_list/_exists` plus ranged reads;
+  commits, trees, footers, refs, tags, GC enumeration, and tree queries live
+  once. `ObjectStore` no longer pretends a single adapter has both a local
+  path and a remote URI.
+- **One commit path**: full commits build the worktree tree and then splice
+  the staged overlay on top, so a staged snapshot wins over a later edit. A
+  stale worktree after a metadata-only ref move is refused
+  (`WorktreeStaleError`) rather than silently reverted.
+- **Completeness before refs**: GC roots include staging/reflog; `commit`
+  repairs a missing staged blob or fails; push/pull/fetch plan from the tip
+  so a crashed transfer is repaired before the CAS.
+- **Verified reads**: tree/footer bytes are re-hashed against their key and
+  commit ids are re-derived from `{message, tree, parents}`.
+- **Durable local publishes**: destination-directory temps, `fsync` of file
+  and directory, and no cross-device `rename`. POSIX-only.
+- **Tree merge extracted** to `services/tree_merge.py`; the write path stays
+  in `TreeWriter`.
 
 This document sketches the full set of architectural changes to make Reflake an
 object-first **data** versioning engine rather than a git-clone-with-S3. Each section ties
@@ -366,7 +390,7 @@ v2 (format change is free):
 
 - Keep `compare_and_set_branch_ref` (commit-id CAS) as the **only** safety primitive.
   A ref's content *is* its commit id, so no version tokens travel the protocol:
-  local CAS compares under an `fcntl`/`msvcrt` lock file, S3 CAS re-reads the
+  local CAS compares under a POSIX `flock` lock file, S3 CAS re-reads the
   commit plus its ETag and conditional-Puts against it (the ETag stays an
   internal detail).
 - **Tags are refs with a create-only contract.** `refs/tags/*` are written
@@ -400,8 +424,10 @@ v2:
    or parallel boto3 multipart), with a progress callback.
 3. CAS the ref last.
 
-`generate_transfer_commands` merges into this: one "transfer plan" concept — a list of
-(src → dst) copies that can be printed or executed.
+There is exactly one "transfer plan" concept — a list of (src → dst) copies
+that can be executed by the boto3 or s5cmd backend. The old
+`generate_transfer_commands`/`transfer` CLI was removed: it emitted bare `cp`
+commands that could not write to S3.
 
 ---
 

@@ -333,12 +333,12 @@ def test_cli_staging_commit_is_branch_scoped(tmp_path: Path, capsys) -> None:
 
     fs = ReflakeFileSystem(dataset_roots={"demo": tmp_path})
     staged_root_listing = fs.ls("reflake://demo@feature+staged/", detail=False)
-    assert "reflake://demo@feature/shared.txt" in staged_root_listing
-    assert "reflake://demo@feature/feature.txt" in staged_root_listing
+    assert "reflake://demo@feature+staged/shared.txt" in staged_root_listing
+    assert "reflake://demo@feature+staged/feature.txt" in staged_root_listing
 
     staged_wildcard_listing = fs.ls("reflake://demo@feature+staged/*", detail=False)
-    assert "reflake://demo@feature/shared.txt" in staged_wildcard_listing
-    assert "reflake://demo@feature/feature.txt" in staged_wildcard_listing
+    assert "reflake://demo@feature+staged/shared.txt" in staged_wildcard_listing
+    assert "reflake://demo@feature+staged/feature.txt" in staged_wildcard_listing
 
     with fs.open("reflake://demo@feature+staged/feature.txt", "rb") as handle:
         assert handle.read() == b"feature"
@@ -675,7 +675,13 @@ def test_cli_merge_three_way_succeeds(tmp_path: Path, capsys) -> None:
     assert run_cli(["--repo", str(tmp_path), "add", "feature.txt"]) == 0
     capsys.readouterr()
 
-    assert run_cli(["--repo", str(tmp_path), "commit", "-m", "feature commit"]) == 0
+    # The worktree still contains main.txt from the previous branch; a full
+    # commit would add it to feature. Use the staged commit for branch-scoped
+    # work.
+    assert (
+        run_cli(["--repo", str(tmp_path), "commit", "--staged", "-m", "feature commit"])
+        == 0
+    )
     feature_commit = head_commit(capsys, tmp_path)
     assert feature_commit and feature_commit != main_commit
 

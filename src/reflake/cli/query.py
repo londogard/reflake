@@ -108,15 +108,18 @@ def handle_query_scan(command: QueryScanArgs, repo_root: str, as_json: bool) -> 
     if command.limit is not None:
         rows = itertools.islice(rows, command.limit)
     if as_json:
-        payload_rows = list(rows)
-        stats_payload = _scan_stats_payload(scan.stats)
-        print(
-            json.dumps(
-                {"stats": stats_payload, "rows": payload_rows},
-                indent=2,
-                default=str,
-            )
-        )
+        # Stream the envelope instead of materializing every row: `query
+        # scan` is explicitly a large-dataset path.
+        sys.stdout.write('{\n  "rows": [')
+        first = True
+        for row in rows:
+            if not first:
+                sys.stdout.write(",")
+            sys.stdout.write("\n    " + json.dumps(row, default=str))
+            first = False
+        sys.stdout.write("\n  ],\n  \"stats\": ")
+        sys.stdout.write(json.dumps(_scan_stats_payload(scan.stats), indent=2))
+        sys.stdout.write("\n}\n")
     else:
         for row in rows:
             print(json.dumps(row, default=str))

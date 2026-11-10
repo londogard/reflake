@@ -253,12 +253,15 @@ class ObjectStore(
     TagRefs,
     TreeQuery,
     StoreInventory,
-    HasLocalPath,
-    HasRemoteURI,
     BlobRangeReader,
     Protocol,
 ):
-    """A complete repository object store: the composition of all capabilities."""
+    """A complete repository object store.
+
+    Local/sync endpoints are *not* part of this composition: a local store
+    has a filesystem path, an S3 store has a URI, and no adapter has both.
+    Sync annotates the endpoint capability it needs explicitly.
+    """
 
 
 # ── Narrow compositions: annotate each consumer with what it uses ────

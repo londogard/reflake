@@ -107,6 +107,24 @@ class NotARepositoryError(ReflakeError):
         super().__init__(f"not a reflake repository: {self.root}")
 
 
+class WorktreeStaleError(ReflakeError):
+    """Raised when a full commit would overwrite a metadata-only ref move.
+
+    ``checkout``, ``merge``, ``reset``, and ``pull`` move refs without
+    materializing the worktree. Committing the stale worktree afterwards would
+    silently revert the change, so the user must either stage explicitly
+    (``commit --staged``) or materialize with ``restore --force``.
+    """
+
+    def __init__(self, branch: str) -> None:
+        self.branch = branch
+        super().__init__(
+            f"Working tree for branch '{branch}' is stale after a metadata-only "
+            "ref update. Run `reflake restore --force` (or `pull`) to "
+            "materialize it, or use `commit --staged` for a metadata-only commit."
+        )
+
+
 class UnknownRefError(ReflakeError):
     """Raised when a branch or commit reference cannot be resolved."""
 

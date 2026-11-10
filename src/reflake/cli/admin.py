@@ -26,6 +26,47 @@ from .args import (
 
 
 def handle_init(command: InitArgs, repo_root: str, as_json: bool) -> int:
+    if repo_root.startswith("s3://"):
+        # `reflake --repo s3://bucket/prefix init` initializes the *shared*
+        # remote repository and records the remote backend in the client
+        # config next to the worktree.
+        from ..core.objects import S3ObjectStore, build_s3_client, parse_s3_uri
+        from ..core.repo_format import RepoFormat
+
+        bucket, prefix = parse_s3_uri(repo_root)
+        config = init_config(
+            ".",
+            backend="s3",
+            default_branch=command.default_branch,
+            s3_bucket=command.s3_bucket or bucket,
+            s3_prefix=command.s3_prefix if command.s3_prefix is not None else prefix,
+            s3_endpoint_url=command.s3_endpoint,
+        )
+        path = config.save(".")
+        assert isinstance(config, S3Config)
+        store = S3ObjectStore(
+            config.bucket,
+            config.prefix,
+            client=build_s3_client(config.endpoint_url or command.s3_endpoint),
+        )
+        if store.read_repo_format_bytes() is None:
+            store.write_repo_format_bytes(
+                RepoFormat(
+                    default_branch=config.default_branch,
+                    identity=config.identity,
+                    parquet_footer=config.parquet_footer,
+                ).to_json()
+            )
+        if as_json:
+            print(
+                json.dumps(
+                    {"config_path": str(path), "backend": "s3", "remote": repo_root},
+                    indent=2,
+                )
+            )
+        else:
+            print(f"Repository initialized: {repo_root} (config: {path})")
+        return 0
     if command.backend == "local":
         repo_path = init_repository(repo_root, default_branch=command.default_branch)
         if as_json:
@@ -325,13 +366,20 @@ def _config_set_value(config: ReflakeConfig, key: str, value: str) -> ReflakeCon
             config.parquet_footer = False
         else:
             raise ValueError(f"parquet_footer must be a boolean, got: {value}")
-    elif key in ("stat_cache", "trust_mtime"):
+    elif key == "stat_cache":
         if value.strip().lower() in ("true", "1", "yes", "on"):
             config.stat_cache = True
         elif value.strip().lower() in ("false", "0", "no", "off"):
             config.stat_cache = False
         else:
             raise ValueError(f"{key} must be a boolean, got: {value}")
+    elif key == "fsync":
+        if value.strip().lower() in ("true", "1", "yes", "on"):
+            config.fsync = True
+        elif value.strip().lower() in ("false", "0", "no", "off"):
+            config.fsync = False
+        else:
+            raise ValueError(f"fsync must be a boolean, got: {value}")
     elif key == "reflink_blobs":
         if value.strip().lower() in ("true", "1", "yes", "on"):
             config.reflink_blobs = True

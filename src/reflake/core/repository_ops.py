@@ -8,7 +8,6 @@ manifests; unchanged subtrees are reused by content-addressing.
 
 from __future__ import annotations
 
-import shlex
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Literal
 
@@ -466,27 +465,44 @@ def _move_in_worktree(
     repo.stat_cache.forget(source)
 
 
-def _pointer_drifted(entry: Entry, client: object) -> bool:
+def _pointer_drifted(
+    entry: Entry,
+    client: object,
+    *,
+    entries: object | None = None,
+) -> bool:
     """True when a pointer entry's source no longer matches what was imported.
 
-    Metadata-only: one HEAD (or stat) per entry, never a source byte read.
-    Comparison order: size, then ETag when both sides have one, otherwise
-    last-modified; a missing source is drift too.
+    S3 sources compare ETags (metadata-only). Local/fsspec sources compare a
+    content digest, because mtime is not an identity; that necessarily reads
+    local bytes during an explicit drift audit. A legacy entry with no stored
+    marker cannot be checked honestly, so it is reported as *not* drifted
+    instead of producing a false positive.
     """
     from .domain import SourceNotFoundError
     from .objects import describe_source_uri
 
-    if not entry.source_uri:
-        return True
+    if not entry.source_uri or entry.source_etag is None:
+        return False
     try:
         metadata = describe_source_uri(entry.source_uri, client=client)
     except (SourceNotFoundError, ValueError, OSError):
         return True
-    expected = pointer_identity(size=entry.size, marker=entry.source_etag)
-    observed = pointer_identity(size=metadata.size, marker=metadata.etag)
-    if expected != observed:
-        return True
-    return False
+    marker = entry.source_etag
+    if entries is not None and not (
+        entry.source_uri.startswith("s3://") and metadata.etag
+    ):
+        from .services.entries import EntryFactory
+
+        assert isinstance(entries, EntryFactory)
+        observed_marker = entries.source_marker(
+            entry.source_uri, etag=metadata.etag, client=client
+        )
+    else:
+        observed_marker = metadata.etag or marker
+    expected = pointer_identity(size=entry.size, marker=marker)
+    observed = pointer_identity(size=metadata.size, marker=observed_marker)
+    return expected != observed
 
 
 def repo_verify(
@@ -549,7 +565,9 @@ def repo_verify(
             total_entries += 1
             if entry.blob_hash is None:
                 candidate_entries += 1
-                if drift_check and _pointer_drifted(entry, client):
+                if drift_check and _pointer_drifted(
+                    entry, client, entries=repo.entries
+                ):
                     drifted.append(entry.path)
         return VerifyResult(
             commit_id=base_commit_id,
@@ -571,15 +589,21 @@ def repo_verify(
             raise FileNotFoundError(
                 f"Cannot promote '{entry.path}' because source_uri is missing"
             )
+        from .objects import describe_source_uri, source_client
+
+        metadata = describe_source_uri(
+            entry.source_uri, client=source_client(repo.store)
+        )
         digest = repo.entries.store_blob_from_source_uri(entry.source_uri)
         additions.append(
             # Carry the footer over: promoting an `mp` (parquet, source
             # pointer) entry must produce `bp`, not `b`, or the captured
-            # row-group statistics would be silently dropped.
+            # row-group statistics would be silently dropped. The size comes
+            # from the source we just read, not the stale pointer record.
             Entry.with_identity(
                 entry.path,
                 digest,
-                entry.size,
+                metadata.size,
                 "content",
                 footer=entry.footer,
             )
@@ -752,74 +776,7 @@ def repo_restore_files(
         return logical_path
 
     written = map_bounded(restore_one, sorted(entries.items()))
+    if paths is None and ref == repo.current_branch():
+        # A full materialization makes the worktree match the branch head.
+        repo.client_state.clear_worktree_stale(ref)
     return [path for path in written if path is not None]
-
-
-def repo_generate_transfer_commands(
-    repo: ReflakeRepository,
-    ref: str | None = None,
-    *,
-    mode: str = "upload",
-    include_metadata: bool = False,
-) -> list[str]:
-    from .config import BaseConfig, S3Config
-    from .layout import blob_relpath
-    from .objects import LocalObjectStore
-
-    config = BaseConfig.load(repo.root)
-    if not isinstance(config, S3Config):
-        raise ValueError("S3 backend not configured in repo config")
-    bucket = config.bucket
-
-    branch = ref or repo.current_branch()
-    commit_id = repo.resolve_ref(branch)
-    commit = repo.read_commit(commit_id)
-    s3_prefix = config.prefix or ""
-
-    local_store = LocalObjectStore(repo.root)
-    commands: list[str] = []
-    seen: set[str] = set()
-
-    def copy_command(local_path: str, s3_uri: str) -> str:
-        # Quote both operands: paths may contain spaces or shell metacharacters.
-        if mode == "upload":
-            return f"cp {shlex.quote(local_path)} {shlex.quote(s3_uri)}"
-        return f"cp {shlex.quote(s3_uri)} {shlex.quote(local_path)}"
-
-    for entry in local_store.iter_all_entries(commit.tree):
-        if entry.blob_hash and entry.blob_hash not in seen:
-            seen.add(entry.blob_hash)
-            rel = blob_relpath(entry.blob_hash).as_posix()
-            s3_key = f"blobs/{rel}"
-            if s3_prefix:
-                s3_key = f"{s3_prefix}/{s3_key}"
-            commands.append(
-                copy_command(
-                    str(repo.layout.blobs_dir / rel),
-                    f"s3://{bucket}/{s3_key}",
-                )
-            )
-
-    if include_metadata:
-        for tree_hash in repo.tree_writer.iter_tree_hashes(commit.tree):
-            s3_key = f"trees/{tree_hash}"
-            if s3_prefix:
-                s3_key = f"{s3_prefix}/{s3_key}"
-            commands.append(
-                copy_command(
-                    str(repo.layout.trees_dir / tree_hash),
-                    f"s3://{bucket}/{s3_key}",
-                )
-            )
-
-        commit_s3_key = f"commits/{commit_id}.json"
-        if s3_prefix:
-            commit_s3_key = f"{s3_prefix}/{commit_s3_key}"
-        commands.append(
-            copy_command(
-                str(repo.layout.commits_dir / f"{commit_id}.json"),
-                f"s3://{bucket}/{commit_s3_key}",
-            )
-        )
-
-    return commands

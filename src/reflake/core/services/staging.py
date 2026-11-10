@@ -281,6 +281,7 @@ class StagingArea:
         added: list[str] = []
         removed: list[str] = []
         modified: list[str] = []
+        rules = IgnoreRules.load(self.root)
 
         working_file = next(working, None)
         tree_entry = next(tree_entries, None)
@@ -294,7 +295,10 @@ class StagingArea:
                 working_file = next(working, None)
                 continue
             if working_file is None or tree_entry.path < working_file.relative_path:
-                removed.append(tree_entry.path)
+                # A committed file hidden by the current ignore rules is not
+                # "removed": a full commit preserves parent-only entries.
+                if not rules.ignores_path(tree_entry.path):
+                    removed.append(tree_entry.path)
                 tree_entry = next(tree_entries, None)
                 continue
 
@@ -322,9 +326,27 @@ class StagingArea:
                 if digest != tree_entry.hash:
                     modified.append(working_file.relative_path)
             elif tree_entry.kind in (KIND_META, KIND_MP):
+                digest = (
+                    self.stat_cache.lookup(
+                        working_file.relative_path,
+                        size=working_file.size,
+                        mtime_ns=working_file.mtime_ns,
+                    )
+                    if self.stat_cache is not None
+                    else None
+                )
+                if digest is None:
+                    digest = blake3_digest_file(working_file.path)
+                    if self.stat_cache is not None:
+                        self.stat_cache.record(
+                            working_file.relative_path,
+                            size=working_file.size,
+                            mtime_ns=working_file.mtime_ns,
+                            digest=digest,
+                        )
                 identity = pointer_identity(
                     size=working_file.size,
-                    marker=f"mtime:{working_file.mtime_ns}",
+                    marker=f"blake3:{digest}",
                 )
                 if identity != tree_entry.hash:
                     modified.append(working_file.relative_path)

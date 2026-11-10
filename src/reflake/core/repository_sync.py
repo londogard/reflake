@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING
@@ -11,7 +12,7 @@ if TYPE_CHECKING:
     from .repository import ReflakeRepository
 
 
-from .concurrency import map_bounded
+from .concurrency import run_bounded
 from .domain import (
     FetchResult,
     PullResult,
@@ -134,11 +135,6 @@ def _build_plan(
     candidates = _collect_candidates(src_repo, commit_ids)
     if not include_blobs:
         candidates["blob"] = set()
-    missing = [
-        (kind, object_id)
-        for kind, object_ids in candidates.items()
-        for object_id in sorted(_missing_ids(dst_repo.store, kind, object_ids))
-    ]
 
     if direction == "upload":
         local_store = _require_local_path(src_repo.store, role="source")
@@ -147,16 +143,23 @@ def _build_plan(
         local_store = _require_local_path(dst_repo.store, role="target")
         remote_store = _require_remote_uri(src_repo.store, role="source")
 
-    items = tuple(
-        TransferItem(
-            kind=kind,
-            object_id=object_id,
-            local_path=str(local_store.object_path(kind, object_id)),
-            remote_uri=remote_store.object_uri(kind, object_id),
-        )
-        for kind, object_id in missing
-    )
-    return TransferPlan(direction=direction, items=items)
+    counts: Counter[str] = Counter()
+
+    def iter_items() -> Iterator[TransferItem]:
+        """Stream missing objects; the plan is never fully materialized."""
+        for kind, object_ids in candidates.items():
+            for object_id in sorted(
+                _missing_ids(dst_repo.store, kind, object_ids)
+            ):
+                counts[kind] += 1
+                yield TransferItem(
+                    kind=kind,
+                    object_id=object_id,
+                    local_path=str(local_store.object_path(kind, object_id)),
+                    remote_uri=remote_store.object_uri(kind, object_id),
+                )
+
+    return TransferPlan(direction=direction, items=iter_items(), counts=counts)
 
 
 def _copy_item(
@@ -223,13 +226,12 @@ def execute_transfer_plan(
 
     Returns the number of transferred items.
     """
-    items = list(plan.items)
-    if not items:
+    if plan.total == 0:
         return 0
     if batch_backend is not None and batch_backend.supports_batch():
         transferred = batch_backend.transfer(plan)
         if progress is not None:
-            progress(transferred, len(items))
+            progress(transferred, plan.total or transferred)
         return transferred
 
     def copy(item: TransferItem) -> None:
@@ -240,10 +242,10 @@ def execute_transfer_plan(
             direction=plan.direction,
         )
 
-    map_bounded(copy, items)
+    count = run_bounded(copy, plan.items)
     if progress is not None:
-        progress(len(items), len(items))
-    return len(items)
+        progress(count, plan.total or count)
+    return count
 
 
 def _collect_commits_to_push(
@@ -373,6 +375,7 @@ def _push_tag(
         worktree=repo.root,
         blob_transfer=blob_transfer,
         validate_format=False,
+        must_exist=False,
     )
     remote_repo._ensure_repo_format_marker()
     remote_commit = remote_repo.store.read_tag_ref(tag)
@@ -392,16 +395,19 @@ def _push_tag(
 
     commits_to_push = _collect_commits_to_push(repo, remote_repo, commit_id)
     pushed_blobs = 0
-    if commits_to_push:
-        plan = _build_plan(repo, remote_repo, commits_to_push, direction="upload")
-        execute_transfer_plan(
-            plan,
-            local_store=repo.store,
-            remote_store=remote_repo.store,
-            batch_backend=getattr(remote_repo.store, "transfer_backend", None),
-            progress=progress,
-        )
-        pushed_blobs = sum(1 for item in plan.items if item.kind == "blob")
+    # Even when every commit already exists remotely, the tip's tree may
+    # reference objects a crashed transfer never copied. Always plan from the
+    # tag's tip, then transfer only what is actually missing.
+    plan_ids = commits_to_push or [commit_id]
+    plan = _build_plan(repo, remote_repo, plan_ids, direction="upload")
+    execute_transfer_plan(
+        plan,
+        local_store=repo.store,
+        remote_store=remote_repo.store,
+        batch_backend=getattr(remote_repo.store, "transfer_backend", None),
+        progress=progress,
+    )
+    pushed_blobs = plan.counts["blob"]
 
     if not remote_repo.store.create_tag_ref(tag, commit_id):
         winner = remote_repo.store.read_tag_ref(tag)
@@ -477,6 +483,7 @@ def push(
         worktree=repo.root,
         blob_transfer=blob_transfer,
         validate_format=False,
+        must_exist=False,
     )
     remote_repo._ensure_repo_format_marker()
 
@@ -503,27 +510,14 @@ def push(
         )
 
     commits_to_push = _collect_commits_to_push(repo, remote_repo, local_commit_id)
-    if not commits_to_push:
-        # All objects already exist; CAS the branch ref for idempotency.
-        updated = remote_repo.fast_forward_branch(
-            branch, local_commit_id, operation="push"
-        )
-        return PushResult(
-            source_branch=branch,
-            remote_uri=remote_uri,
-            pushed_commits=0,
-            pushed_blobs=0,
-            updated=updated,
-        )
 
-    # Publish immutable objects first (plan-then-batch, §7). The ref moves
-    # last, after the remote verifies that the update is a fast-forward.
-    plan = _build_plan(
-        repo,
-        remote_repo,
-        commits_to_push,
-        direction="upload",
-    )
+    # Plan from the new commits when there are any. When every commit already
+    # exists (a previous transfer crashed before the ref CAS), plan from the
+    # tip instead: its tree still references every blob the branch needs, so a
+    # retry can repair the incomplete transfer instead of advancing the ref
+    # over missing content.
+    plan_ids = commits_to_push or [local_commit_id]
+    plan = _build_plan(repo, remote_repo, plan_ids, direction="upload")
     execute_transfer_plan(
         plan,
         local_store=repo.store,
@@ -531,7 +525,7 @@ def push(
         batch_backend=getattr(remote_repo.store, "transfer_backend", None),
         progress=progress,
     )
-    pushed_blobs = sum(1 for item in plan.items if item.kind == "blob")
+    pushed_blobs = plan.counts["blob"]
 
     updated = remote_repo.fast_forward_branch(branch, local_commit_id, operation="push")
 
@@ -575,17 +569,16 @@ def _pull_tag(
         )
 
     commits_to_pull = _collect_commits_to_push(remote_repo, repo, commit_id)
-    pulled_blobs = 0
-    if commits_to_pull:
-        plan = _build_plan(remote_repo, repo, commits_to_pull, direction="download")
-        execute_transfer_plan(
-            plan,
-            local_store=repo.store,
-            remote_store=remote_repo.store,
-            batch_backend=getattr(remote_repo.store, "transfer_backend", None),
-            progress=progress,
-        )
-        pulled_blobs = sum(1 for item in plan.items if item.kind == "blob")
+    plan_ids = commits_to_pull or [commit_id]
+    plan = _build_plan(remote_repo, repo, plan_ids, direction="download")
+    execute_transfer_plan(
+        plan,
+        local_store=repo.store,
+        remote_store=remote_repo.store,
+        batch_backend=getattr(remote_repo.store, "transfer_backend", None),
+        progress=progress,
+    )
+    pulled_blobs = plan.counts["blob"]
 
     if not repo.store.create_tag_ref(tag, commit_id):
         winner = repo.store.read_tag_ref(tag)
@@ -668,7 +661,8 @@ def pull(
         branch,
         remote_commit_id,
     )
-    if not can_fast_forward:
+    partial = repo.client_state.is_partial(branch)
+    if not can_fast_forward and not partial:
         return PullResult(
             source_branch=branch,
             remote_uri=remote_uri,
@@ -678,7 +672,7 @@ def pull(
         )
 
     commits_to_pull = _collect_commits_to_push(remote_repo, repo, remote_commit_id)
-    if not commits_to_pull:
+    if not commits_to_pull and not partial:
         updated = repo.fast_forward_branch(branch, remote_commit_id, operation="pull")
         return PullResult(
             source_branch=branch,
@@ -688,10 +682,15 @@ def pull(
             updated=updated,
         )
 
+    # A metadata-only pull leaves the branch at the right commit but without
+    # blobs. Planning the tip's reachable graph (not just "new commits") is
+    # what makes the next ordinary pull hydrate it; the partial marker tells
+    # us to do that even when the heads already match.
+    plan_ids = commits_to_pull or [remote_commit_id]
     plan = _build_plan(
         remote_repo,
         repo,
-        commits_to_pull,
+        plan_ids,
         direction="download",
         include_blobs=not metadata_only,
     )
@@ -702,10 +701,20 @@ def pull(
         batch_backend=getattr(remote_repo.store, "transfer_backend", None),
         progress=progress,
     )
-    pulled_blobs = sum(1 for item in plan.items if item.kind == "blob")
+    pulled_blobs = plan.counts["blob"]
+    if metadata_only:
+        repo.client_state.mark_partial(branch)
+    else:
+        repo.client_state.clear_partial(branch)
 
     # CAS the local branch ref (branch was ensured to exist during pre-check).
+    previous_state = repo.store.read_branch_ref(branch)
+    previous_commit = previous_state.commit_id if previous_state else None
     updated = repo.fast_forward_branch(branch, remote_commit_id, operation="pull")
+    if repo.current_branch() == branch:
+        repo.client_state.mark_worktree_stale(
+            branch, previous_commit_id=previous_commit
+        )
 
     return PullResult(
         source_branch=branch,
@@ -743,10 +752,14 @@ def fetch(
 
     commits_to_fetch = _collect_commits_to_push(remote_repo, repo, remote_commit_id)
 
+    # Fetch is also the repair command: always plan from the remote tip so a
+    # previous interrupted transfer can be completed, and a metadata-only
+    # fetch can be hydrated later.
+    plan_ids = commits_to_fetch or [remote_commit_id]
     plan = _build_plan(
         remote_repo,
         repo,
-        commits_to_fetch,
+        plan_ids,
         direction="download",
         include_blobs=not metadata_only,
     )
@@ -757,7 +770,11 @@ def fetch(
         batch_backend=getattr(remote_repo.store, "transfer_backend", None),
         progress=progress,
     )
-    fetched_blobs = sum(1 for item in plan.items if item.kind == "blob")
+    fetched_blobs = plan.counts["blob"]
+    if metadata_only:
+        repo.client_state.mark_partial(branch)
+    else:
+        repo.client_state.clear_partial(branch)
 
     return FetchResult(
         remote_uri=remote_uri,

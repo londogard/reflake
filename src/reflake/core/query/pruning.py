@@ -131,11 +131,17 @@ def parse_where_clause(text: str) -> list[Predicate]:
         raw_op = comparison_match.group("op")
         if raw_op == "<>":
             raw_op = "!="
+        value = _parse_value(comparison_match.group("val"))
+        if value is None:
+            raise ValueError(
+                "Use IS NULL / IS NOT NULL for null checks; "
+                "comparisons against NULL never match"
+            )
         predicates.append(
             Predicate(
                 column=comparison_match.group("col"),
                 op=raw_op,  # type: ignore[arg-type]
-                value=_parse_value(comparison_match.group("val")),
+                value=value,
             )
         )
     if not predicates:

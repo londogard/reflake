@@ -8,30 +8,137 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import BinaryIO
 
-from ..domain import BranchRefState, OptimisticLockError, RepositoryObjectKind
+from ..domain import (
+    BlobIntegrityError,
+    RepositoryObjectKind,
+)
 from ..entry_codec import Entry
 from ..layout import initialize_reflake_layout, object_relative_key, ref_relative_key
+from .kv import KeyValueObjectStore
 from .query import TreeCache, TreeWalker
 
 
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(dir=path.parent, delete=False) as temp:
+def _fsync_fd(fd: int) -> None:
+    """Flush one descriptor to stable storage (best effort on odd filesystems)."""
+    try:
+        os.fsync(fd)
+    except OSError:
+        # Some network/overlay filesystems reject fsync on directories or
+        # report EINVAL for descriptors they cannot flush. The rename is still
+        # atomic; we do not turn a durability hint into a failed command.
+        return
+
+
+def _fsync_dir(path: Path) -> None:
+    """Make a directory entry rename durable (POSIX)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        _fsync_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _ensure_parent_dir(path: Path) -> None:
+    """Create a ref's parent, replacing ancestor tombstones.
+
+    Deleting ``feature`` leaves an empty ref file; creating ``feature/x``
+    must turn that tombstone into a directory. A non-empty ref is a real
+    namespace conflict and is left untouched.
+    """
+    while True:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return
+        except (FileExistsError, NotADirectoryError):
+            blocker = path
+            while not blocker.exists() and blocker != blocker.parent:
+                blocker = blocker.parent
+            if blocker.is_file() and blocker.stat().st_size == 0:
+                blocker.unlink()
+                continue
+            raise
+
+
+def _atomic_write_bytes(path: Path, payload: bytes, *, fsync: bool = True) -> None:
+    _ensure_parent_dir(path.parent)
+    with NamedTemporaryFile(
+        dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as temp:
         temp_path = Path(temp.name)
         temp.write(payload)
+        temp.flush()
+        if fsync:
+            _fsync_fd(temp.fileno())
     try:
         try:
             os.replace(temp_path, path)
         except OSError:
             # A ref that used to be a namespace directory (``v1/`` after the
-            # last tag below it was deleted) blocks the file path; remove the
-            # now-empty directory and retry. Non-empty directories still fail.
+            # last tag below it was deleted) blocks the file path. Remove the
+            # directory if it contains only deleted-ref tombstones; a live ref
+            # below it is a real namespace conflict and still fails.
             if not path.is_dir():
                 raise
+            _prune_tombstone_tree(path)
             path.rmdir()
             os.replace(temp_path, path)
+        if fsync:
+            _fsync_dir(path.parent)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _prune_tombstone_tree(path: Path) -> None:
+    """Remove empty ref files/dirs below a namespace path.
+
+    Deleted branches/tags are CAS tombstones (empty files); they must not
+    prevent a parent name from being reused. Any non-empty ref is live and
+    aborts the operation.
+    """
+    for child in path.iterdir():
+        if child.is_dir():
+            _prune_tombstone_tree(child)
+            child.rmdir()
+        elif child.is_file() and child.stat().st_size == 0:
+            child.unlink()
+        else:
+            raise OSError(f"ref namespace is not empty: {child}")
+
+
+def _publish_file(
+    source: Path,
+    target: Path,
+    *,
+    if_missing: bool,
+    fsync: bool,
+) -> None:
+    """Atomically publish *source* at *target* by copying into the target dir.
+
+    The copy always happens in the destination directory, so a source on a
+    different filesystem (notably ``/tmp`` on tmpfs) never triggers ``EXDEV``.
+    Tree and footer objects are small, so the extra copy is cheaper than a
+    cross-device failure. The source is left in place for the caller to
+    clean up.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if if_missing and target.exists():
+        return
+    with NamedTemporaryFile(dir=target.parent, delete=False) as temp:
+        temp_path = Path(temp.name)
+        try:
+            with source.open("rb") as src:
+                shutil.copyfileobj(src, temp, 1024 * 1024)
+            temp.flush()
+            if fsync:
+                _fsync_fd(temp.fileno())
+            os.replace(temp_path, target)
+            if fsync:
+                _fsync_dir(target.parent)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
 
 def _clone_file(source: Path, target: Path) -> bool:
@@ -74,103 +181,144 @@ def _clone_file(source: Path, target: Path) -> bool:
 
 
 def _lock_exclusive(fd: int) -> None:
-    """Hold an exclusive inter-process lock on an open lock file."""
-    if os.name == "nt":
-        import msvcrt
+    """Hold an exclusive inter-process lock on an open lock file (POSIX)."""
+    import fcntl
 
-        try:
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-        except OSError:
-            # Fresh (empty) lock file: grow it by one byte, then lock.
-            # Concurrent growers write the same byte; the lock serializes.
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, b"\0")
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    fcntl.flock(fd, fcntl.LOCK_EX)
 
 
 def _unlock(fd: int) -> None:
     """Release an inter-process lock held by :func:`_lock_exclusive`."""
-    if os.name == "nt":
-        import msvcrt
+    import fcntl
 
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        except OSError:
-            pass
-    else:
-        import fcntl
-
-        fcntl.flock(fd, fcntl.LOCK_UN)
+    fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-class LocalObjectStore:
-    def __init__(self, root: str | Path) -> None:
+class LocalObjectStore(KeyValueObjectStore):
+    """Local filesystem object store (POSIX; see README platform support)."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        fsync: bool = True,
+        use_reflink: bool = True,
+    ) -> None:
         self.layout = initialize_reflake_layout(root)
+        self.fsync = fsync
+        self.use_reflink = use_reflink
         self.tree_cache = TreeCache()
         self._walker = TreeWalker(
             read_tree=self.read_tree_bytes,
             cache=self.tree_cache,
         )
 
+    # ── KV primitives ──────────────────────────────────────────────────
+
+    def _kv_path(self, key: str) -> Path | None:
+        return self.layout.reflake_dir / key
+
+    def _kv_uri(self, key: str) -> str | None:
+        return None
+
+    def _kv_get(self, key: str) -> bytes | None:
+        path = self.layout.reflake_dir / key
+        if not path.is_file():
+            return None
+        return path.read_bytes()
+
+    def _kv_put(
+        self, key: str, payload: bytes, *, if_absent: bool = False
+    ) -> bool:
+        path = self.layout.reflake_dir / key
+        if not (if_absent and key.startswith("refs/")):
+            if if_absent and path.exists():
+                return False
+            _atomic_write_bytes(path, payload, fsync=self.fsync)
+            return True
+        # Create-only ref writes (tags) are atomic across processes under the
+        # same refs lock used by branch CAS.
+        lock_file_path = self.layout.refs_dir / ".lock"
+        lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_file_path, "a") as lock_file:
+            _lock_exclusive(lock_file.fileno())
+            try:
+                if path.is_file():
+                    return False
+                if path.is_dir():
+                    # A namespace containing only deleted-ref tombstones can
+                    # be reused for the parent name.
+                    try:
+                        _prune_tombstone_tree(path)
+                        path.rmdir()
+                    except OSError:
+                        return False
+                _atomic_write_bytes(path, payload, fsync=self.fsync)
+                return True
+            finally:
+                _unlock(lock_file.fileno())
+
+    def _kv_put_file(
+        self, key: str, source: Path, *, if_absent: bool = False
+    ) -> bool:
+        path = self.layout.reflake_dir / key
+        if if_absent and path.exists():
+            return False
+        _publish_file(source, path, if_missing=False, fsync=self.fsync)
+        return True
+
+    def _kv_delete(self, keys: Iterable[str]) -> int:
+        deleted = 0
+        shard_dirs: set[Path] = set()
+        for key in keys:
+            path = self.layout.reflake_dir / key
+            if path.is_file():
+                path.unlink(missing_ok=True)
+                deleted += 1
+                if key.startswith("blobs/"):
+                    shard_dirs.add(path.parent)
+        for shard_dir in shard_dirs:
+            try:
+                shard_dir.rmdir()
+            except OSError:
+                pass
+        return deleted
+
+    def _kv_list(self, prefix: str) -> Iterator[tuple[str, int]]:
+        base = self.layout.reflake_dir / prefix
+        if not base.exists():
+            return
+        if base.is_file():
+            yield prefix.rstrip("/"), base.stat().st_mtime_ns
+            return
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            relative = path.relative_to(self.layout.reflake_dir).as_posix()
+            try:
+                mtime_ns = path.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = 0
+            yield relative, mtime_ns
+
+    def _kv_exists(self, key: str) -> bool:
+        return (self.layout.reflake_dir / key).exists()
+
+    def _kv_read_range(self, key: str, offset: int, length: int) -> bytes:
+        if length <= 0:
+            return b""
+        with (self.layout.reflake_dir / key).open("rb") as handle:
+            handle.seek(offset)
+            return handle.read(length)
+
     # ── Commits ──────────────────────────────────────────────────────────
 
-    def read_commit_bytes(self, commit_id: str) -> bytes | None:
-        commit_path = self.commit_path(commit_id)
-        if not commit_path.exists():
-            return None
-        return commit_path.read_bytes()
 
-    def write_commit_bytes(
-        self,
-        commit_id: str,
-        payload: bytes,
-        *,
-        if_missing: bool = False,
-    ) -> None:
-        commit_path = self.commit_path(commit_id)
-        if if_missing and commit_path.exists():
-            raise OptimisticLockError(f"Commit already exists: {commit_id}")
-        _atomic_write_bytes(commit_path, payload)
 
     # ── Trees ────────────────────────────────────────────────────────────
 
-    def read_tree_bytes(self, tree_hash: str) -> bytes | None:
-        tree_path = self.tree_path(tree_hash)
-        if not tree_path.exists():
-            return None
-        return tree_path.read_bytes()
 
-    def write_tree_bytes(
-        self,
-        tree_hash: str,
-        payload: bytes,
-        *,
-        if_missing: bool = True,
-    ) -> None:
-        tree_path = self.tree_path(tree_hash)
-        tree_path.parent.mkdir(parents=True, exist_ok=True)
-        if if_missing and tree_path.exists():
-            return
-        _atomic_write_bytes(tree_path, payload)
 
-    def write_tree_file(
-        self,
-        tree_hash: str,
-        source_path: str | Path,
-        *,
-        if_missing: bool = True,
-    ) -> None:
-        tree_path = self.tree_path(tree_hash)
-        source = Path(source_path)
-        tree_path.parent.mkdir(parents=True, exist_ok=True)
-        if if_missing and tree_path.exists():
-            return
-        source.replace(tree_path)
 
     # ── Tree-walk queries ────────────────────────────────────────────────
 
@@ -187,40 +335,11 @@ class LocalObjectStore:
 
     # ── Footers ──────────────────────────────────────────────────────────
 
-    def read_footer_bytes(self, footer_hash: str) -> bytes | None:
-        footer_path = self.footer_path(footer_hash)
-        if not footer_path.exists():
-            return None
-        return footer_path.read_bytes()
 
-    def write_footer_file(
-        self,
-        footer_hash: str,
-        source_path: str | Path,
-        *,
-        if_missing: bool = True,
-    ) -> None:
-        footer_path = self.footer_path(footer_hash)
-        source = Path(source_path)
-        footer_path.parent.mkdir(parents=True, exist_ok=True)
-        if if_missing and footer_path.exists():
-            return
-        source.replace(footer_path)
 
     # ── Refs ─────────────────────────────────────────────────────────────
 
-    def read_branch_ref(self, branch: str) -> BranchRefState | None:
-        branch_path = self._branch_path(branch)
-        # A directory here is a *namespace* entry (some branch below it),
-        # not a ref: report "no such ref" instead of crashing on read_text.
-        if not branch_path.is_file():
-            return None
-        commit_id = branch_path.read_text(encoding="utf-8").strip() or None
-        return BranchRefState(branch=branch, commit_id=commit_id)
 
-    def write_branch_ref(self, branch: str, commit_id: str | None) -> None:
-        payload = f"{commit_id}\n".encode() if commit_id else b""
-        _atomic_write_bytes(self._branch_path(branch), payload)
 
     def compare_and_set_branch_ref(
         self,
@@ -245,13 +364,6 @@ class LocalObjectStore:
 
     # ── Tags ─────────────────────────────────────────────────────────────
 
-    def read_tag_ref(self, tag: str) -> str | None:
-        tag_path = self._tag_path(tag)
-        # A directory here is a *namespace* entry (some tag below it), not a
-        # ref: report "no such tag" instead of crashing on read_text.
-        if not tag_path.is_file():
-            return None
-        return tag_path.read_text(encoding="utf-8").strip() or None
 
     def create_tag_ref(self, tag: str, commit_id: str) -> bool:
         # Create-only under the same refs lock as branch CAS: an existing tag
@@ -264,7 +376,9 @@ class LocalObjectStore:
                 tag_path = self._tag_path(tag)
                 if tag_path.is_file():
                     return False
-                _atomic_write_bytes(tag_path, f"{commit_id}\n".encode())
+                _atomic_write_bytes(
+                    tag_path, f"{commit_id}\n".encode(), fsync=self.fsync
+                )
                 return True
             finally:
                 _unlock(lock_file.fileno())
@@ -272,28 +386,13 @@ class LocalObjectStore:
     def delete_tag_ref(self, tag: str) -> None:
         self._tag_path(tag).unlink(missing_ok=True)
 
-    def iter_tags(self) -> Iterator[str]:
-        tags_dir = self.layout.refs_dir / "tags"
-        if not tags_dir.is_dir():
-            return
-        for path in sorted(tags_dir.rglob("*")):
-            if path.is_file() and not path.name.startswith("."):
-                yield path.relative_to(tags_dir).as_posix()
 
     # ── Blobs ────────────────────────────────────────────────────────────
 
-    def read_blob_bytes(self, blob_hash: str) -> bytes:
-        return self.blob_path(blob_hash).read_bytes()
 
     def open_blob(self, blob_hash: str) -> BinaryIO:
         return self.blob_path(blob_hash).open("rb")
 
-    def read_blob_range(self, blob_hash: str, offset: int, length: int) -> bytes:
-        if length <= 0:
-            return b""
-        with self.blob_path(blob_hash).open("rb") as handle:
-            handle.seek(offset)
-            return handle.read(length)
 
     def write_blob_file(
         self,
@@ -314,17 +413,39 @@ class LocalObjectStore:
             return
         blob_path.parent.mkdir(parents=True, exist_ok=True)
         source = Path(source_path)
-        if _clone_file(source, blob_path):
-            return
+        if self.use_reflink:
+            # Clone into a temp name and rename into place: a crash during
+            # clonefile/FICLONE must never leave a partial blob at the final
+            # content-addressed path.
+            with NamedTemporaryFile(
+                dir=blob_path.parent, prefix=".clone.", delete=False
+            ) as temp:
+                clone_target = Path(temp.name)
+            clone_target.unlink(missing_ok=True)
+            try:
+                if _clone_file(source, clone_target):
+                    if self.fsync:
+                        with clone_target.open("rb") as handle:
+                            _fsync_fd(handle.fileno())
+                    os.replace(clone_target, blob_path)
+                    if self.fsync:
+                        _fsync_dir(blob_path.parent)
+                    return
+            finally:
+                clone_target.unlink(missing_ok=True)
         with NamedTemporaryFile(dir=blob_path.parent, delete=False) as temp:
             temp_path = Path(temp.name)
             try:
                 with source.open("rb") as src:
                     shutil.copyfileobj(src, temp, 1024 * 1024)
                 temp.flush()
+                if self.fsync:
+                    _fsync_fd(temp.fileno())
                 if if_missing and blob_path.exists():
                     return
                 os.replace(temp_path, blob_path)
+                if self.fsync:
+                    _fsync_dir(blob_path.parent)
             finally:
                 temp_path.unlink(missing_ok=True)
 
@@ -356,12 +477,16 @@ class LocalObjectStore:
                         hasher.update(chunk)
                         temp.write(chunk)
                 temp.flush()
+                if self.fsync:
+                    _fsync_fd(temp.fileno())
                 digest = hasher.hexdigest()
                 blob_path = self.blob_path(digest)
                 if blob_path.exists():
                     return digest
                 blob_path.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(temp_path, blob_path)
+                if self.fsync:
+                    _fsync_dir(blob_path.parent)
                 return digest
             finally:
                 temp_path.unlink(missing_ok=True)
@@ -387,120 +512,36 @@ class LocalObjectStore:
                     hasher.update(chunk)
                     temp.write(chunk)
                 temp.flush()
+                if self.fsync:
+                    _fsync_fd(temp.fileno())
                 actual = hasher.hexdigest()
                 if actual != blob_hash:
-                    raise ValueError(
-                        f"Blob hash mismatch: expected {blob_hash}, got {actual}"
+                    raise BlobIntegrityError(
+                        expected=blob_hash,
+                        actual=actual,
+                        context="write_blob_stream",
                     )
                 if if_missing and blob_path.exists():
                     return
                 os.replace(temp_path, blob_path)
+                if self.fsync:
+                    _fsync_dir(blob_path.parent)
             finally:
                 temp_path.unlink(missing_ok=True)
 
     # ── Enumeration (GC) ────────────────────────────────────────────────
 
-    def iter_branches(self) -> Iterator[str]:
-        # Nested branch names (feature/x) are directories under heads/: walk
-        # the whole tree and ignore atomic-write temp files (leading dot).
-        for path in sorted(self.layout.heads_dir.rglob("*")):
-            if path.is_file() and not path.name.startswith("."):
-                yield path.relative_to(self.layout.heads_dir).as_posix()
 
-    def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]:
-        if kind == "blob":
-            for shard in self.layout.blobs_dir.iterdir():
-                if shard.is_dir():
-                    for path in shard.iterdir():
-                        yield shard.name + path.name
-        elif kind == "tree":
-            yield from (p.name for p in self.layout.trees_dir.iterdir() if p.is_file())
-        elif kind == "footer":
-            yield from (
-                p.name for p in self.layout.footers_dir.iterdir() if p.is_file()
-            )
-        elif kind == "commit":
-            yield from (p.stem for p in self.layout.commits_dir.glob("*.json"))
 
-    def iter_object_ids_with_mtimes(
-        self, kind: RepositoryObjectKind
-    ) -> Iterator[tuple[str, int]]:
-        """Yield ``(object_id, mtime_ns)`` for stored objects of *kind*.
 
-        Blob shards are snapshotted before their entries are yielded so a GC
-        sweep may delete objects while iterating without skipping siblings on
-        filesystems whose ``readdir`` is disturbed by concurrent unlinks.
-        (Each shard holds a bounded number of files.)  The flat tree/footer/
-        commit directories are streamed lazily: a skipped entry there is a
-        leftover, never a correctness problem, and the next sweep catches it.
-        """
 
-        def _mtime_ns(path: Path) -> int:
-            try:
-                return path.stat().st_mtime_ns
-            except OSError:
-                return 0
 
-        if kind == "blob":
-            if not self.layout.blobs_dir.is_dir():
-                return
-            for shard in sorted(self.layout.blobs_dir.iterdir()):
-                if not shard.is_dir():
-                    continue
-                for path in sorted(shard.iterdir()):
-                    yield shard.name + path.name, _mtime_ns(path)
-        elif kind == "tree":
-            if self.layout.trees_dir.is_dir():
-                for path in self.layout.trees_dir.iterdir():
-                    yield path.name, _mtime_ns(path)
-        elif kind == "footer":
-            if self.layout.footers_dir.is_dir():
-                for path in self.layout.footers_dir.iterdir():
-                    yield path.name, _mtime_ns(path)
-        elif kind == "commit":
-            for path in self.layout.commits_dir.glob("*.json"):
-                yield path.stem, _mtime_ns(path)
-
-    def delete_objects(
-        self, kind: RepositoryObjectKind, object_ids: Iterable[str]
-    ) -> int:
-        deleted = 0
-        shard_dirs: set[Path] = set()
-        for object_id in object_ids:
-            path = self._path_for(kind, object_id)
-            path.unlink(missing_ok=True)
-            if kind == "blob":
-                shard_dirs.add(path.parent)
-            deleted += 1
-        # Tidy up emptied 2-hex blob shards (best effort; never fatal).
-        for shard_dir in shard_dirs:
-            try:
-                shard_dir.rmdir()
-            except OSError:
-                pass
-        return deleted
-
-    def read_repo_format_bytes(self) -> bytes | None:
-        path = self.layout.reflake_dir / "repo.json"
-        if not path.is_file():
-            return None
-        return path.read_bytes()
-
-    def write_repo_format_bytes(
-        self, payload: bytes, *, if_missing: bool = True
-    ) -> None:
-        path = self.layout.reflake_dir / "repo.json"
-        if if_missing and path.exists():
-            return
-        _atomic_write_bytes(path, payload)
 
     def object_path(self, kind: RepositoryObjectKind, object_id: str) -> Path:
         return self._path_for(kind, object_id)
 
     # ── Paths ────────────────────────────────────────────────────────────
 
-    def object_exists(self, kind: RepositoryObjectKind, object_id: str) -> bool:
-        return self._path_for(kind, object_id).exists()
 
     def blob_path(self, blob_hash: str) -> Path:
         return self._path_for("blob", blob_hash)

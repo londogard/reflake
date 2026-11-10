@@ -16,15 +16,15 @@ CommitReader = Callable[[str], CommitObject]
 def pointer_identity(*, size: int, marker: str | None) -> str:
     """Revision identity for a pointer (unverifiable) entry.
 
-    A pointer entry makes no claim about bytes; it claims "this source object
-    *version*". So the identity is a hash of the source's version marker
-    (S3 ETag, or a local file's mtime) plus its size — and **not** of the
-    repository path, so moving a pointer keeps its identity while re-importing
-    a modified source produces a new one.
+    A pointer entry makes no claim about canonical bytes; it claims "this
+    source object *version*". The identity is a hash of the source's version
+    marker (S3 ETag, or a content digest for local/fsspec sources) plus its
+    size — and **not** of the repository path, so moving a pointer keeps its
+    identity while re-importing modified content produces a new one.
 
-    Because the marker is stored on the entry (``source_etag``), drift is
-    detectable by recomputing the same hash from the source's current
-    metadata: no source bytes are read.
+    The marker is stored on the entry (``source_etag``). Drift detection
+    recomputes it from the source: metadata-only for S3, a content re-read for
+    local files (mtime is not an identity).
     """
     body = f"{marker or 'size'}\n{size}"
     return blake3(body.encode()).hexdigest()
@@ -201,6 +201,10 @@ def _sanitize_path_component(value: str, context: str) -> str:
         raise ValueError(f"{context} cannot traverse outside repository root")
     if "//" in normalized:
         raise ValueError(f"{context} contains empty components")
+    if "\\" in normalized:
+        # Logical paths are POSIX. A backslash is a path separator on
+        # Windows and a traversal vector if it reaches a filesystem join.
+        raise ValueError(f"{context} must use '/' separators")
     return normalized
 
 

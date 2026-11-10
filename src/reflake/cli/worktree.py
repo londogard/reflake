@@ -135,6 +135,13 @@ def handle_status(command: StatusArgs, repo_root: str, as_json: bool) -> int:
 
 
 def _print_status(stage: StageStatus) -> None:
+    if stage.worktree_stale:
+        print(
+            "warning: the worktree is stale after a metadata-only ref move; "
+            "a full commit would revert it. Run `reflake restore --force` or "
+            "use `reflake commit --staged`.",
+            file=sys.stderr,
+        )
     if stage.skipped_symlinks:
         shown = ", ".join(stage.skipped_symlinks[:5])
         more = "" if len(stage.skipped_symlinks) <= 5 else ", …"
@@ -183,6 +190,7 @@ def _stage_payload(stage: StageStatus) -> dict[str, object]:
         "working_tree_removed": stage.working_tree_removed,
         "working_tree_modified": stage.working_tree_modified,
         "skipped_symlinks": stage.skipped_symlinks,
+        "worktree_stale": stage.worktree_stale,
     }
 
 

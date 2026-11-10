@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
-from ..domain import ReflakeError
+from ..domain import EmptyBranchError, ReflakeError, UnknownRefError
 from ..extras import EXTRAS
 
 try:
@@ -53,7 +54,11 @@ class ReflakeFileSystem(AbstractFileSystem):
 
     @classmethod
     def _strip_protocol(cls, path: str) -> str:
-        return path[len("reflake://") :] if path.startswith("reflake://") else path
+        # fsspec's glob/find machinery builds a pattern from the stripped
+        # path and compares it against the paths returned by `ls`. Keeping
+        # the protocol here makes both sides consistent (and `_parse_uri`
+        # strips it again).
+        return path
 
     def _open(  # type: ignore[bad-override]
         self,
@@ -94,9 +99,8 @@ class ReflakeFileSystem(AbstractFileSystem):
         depend on filesystem facts), so the only meaningful timestamp for a
         virtual path is the commit that produced it.
         """
-        resolved = self._resolve_entry(path)
-        repo = self._repository(resolved.root)
-        commit = repo.read_commit(resolved.commit_id)
+        scope = self._resolve_scope(path)
+        commit = repo_commit(scope)
         try:
             return datetime.fromisoformat(commit.created_at)
         except ValueError:
@@ -104,22 +108,38 @@ class ReflakeFileSystem(AbstractFileSystem):
 
     def exists(self, path: str, **kwargs: object) -> bool:
         try:
-            self._resolve_entry(path)
+            self.info(path)
             return True
         except (FileNotFoundError, ValueError):
             return False
 
+    def isdir(self, path: str, **kwargs: object) -> bool:
+        try:
+            return self.info(path)["type"] == "directory"
+        except (FileNotFoundError, ValueError):
+            return False
+
     def info(self, path: str, **kwargs: object) -> dict[str, object]:
-        resolved = self._resolve_entry(path)
+        scope = self._resolve_scope(path)
+        entry = scope.entry
+        if entry is not None:
+            return {
+                "name": path,
+                "type": "file",
+                "size": entry.size,
+                "hash": entry.hash,
+                "identity_mode": entry.identity_mode,
+                "commit": scope.commit_id,
+                "staged": scope.uri.include_staging,
+                "dataset": scope.uri.dataset,
+            }
         return {
             "name": path,
-            "type": "file",
-            "size": resolved.entry.size,
-            "hash": resolved.entry.hash,
-            "identity_mode": resolved.entry.identity_mode,
-            "commit": resolved.commit_id,
-            "staged": resolved.uri.include_staging,
-            "dataset": resolved.uri.dataset,
+            "type": "directory",
+            "size": 0,
+            "commit": scope.commit_id,
+            "staged": scope.uri.include_staging,
+            "dataset": scope.uri.dataset,
         }
 
     def ls(
@@ -128,46 +148,167 @@ class ReflakeFileSystem(AbstractFileSystem):
         uri = self._parse_uri(path, allow_empty_path=True)
         root = self._dataset_root(uri.dataset)
         repo = self._repository(root)
-
-        normalized_prefix = uri.logical_path.strip("/")
-        if normalized_prefix == "*":
-            normalized_prefix = ""
+        prefix = uri.logical_path.strip("/")
+        if any(char in prefix for char in "*?["):
+            # fsspec's glob already handles patterns; direct `ls` calls with
+            # a wildcard should behave the same instead of treating '*' as a
+            # literal path component.
+            ref_label = f"{uri.ref}+staged" if uri.include_staging else uri.ref
+            return self.glob(
+                f"reflake://{uri.dataset}@{ref_label}/{prefix}",
+                detail=detail,
+            )
+        resolved = self._resolve_listing(uri, repo)
         entries = repo.resolve_entries_for_prefix(
-            uri.ref,
-            normalized_prefix,
+            resolved.ref,
+            resolved.path,
             include_staging=uri.include_staging,
+            commit_id=resolved.commit_id,
         )
-        results: list[dict[str, object] | str] = []
+        children: dict[str, dict[str, object]] = {}
+        base = resolved.path.strip("/")
         for entry in entries.values():
-            as_uri = f"reflake://{uri.dataset}@{uri.ref}/{entry.path}"
-            if detail:
-                results.append(
-                    {
-                        "name": as_uri,
-                        "type": "file",
-                        "size": entry.size,
-                        "hash": entry.hash,
-                        "identity_mode": entry.identity_mode,
-                    }
-                )
+            remainder = entry.path[len(base) :].lstrip("/") if base else entry.path
+            if not remainder:
+                name = entry.path
+                kind = "file"
+                size = entry.size
+                digest = entry.hash
+                identity_mode = entry.identity_mode
+            elif "/" in remainder:
+                child = remainder.split("/", 1)[0]
+                name = f"{base}/{child}" if base else child
+                kind = "directory"
+                size = 0
+                digest = None
+                identity_mode = None
             else:
-                results.append(as_uri)
-        return results
+                name = entry.path
+                kind = "file"
+                size = entry.size
+                digest = entry.hash
+                identity_mode = entry.identity_mode
+            ref_label = (
+                f"{resolved.ref}+staged" if uri.include_staging else resolved.ref
+            )
+            as_uri = f"reflake://{uri.dataset}@{ref_label}/{name}"
+            children[as_uri] = {
+                "name": as_uri,
+                "type": kind,
+                "size": size,
+                "hash": digest,
+                "identity_mode": identity_mode,
+                "commit": resolved.commit_id,
+            }
+        ordered: list[dict[str, object] | str] = [
+            children[key] for key in sorted(children)
+        ]
+        if detail:
+            return ordered
+        return [
+            str(item["name"]) for item in ordered if isinstance(item, dict)
+        ]
 
     def _resolve_entry(self, path: str) -> ResolvedEntry:
-        uri = self._parse_uri(path)
+        scope = self._resolve_scope(path, require_file=True)
+        assert scope.entry is not None
+        return ResolvedEntry(
+            uri=scope.uri,
+            root=scope.root,
+            commit_id=scope.commit_id,
+            entry=scope.entry,
+            ref=scope.ref,
+        )
+
+    def _resolve_scope(
+        self, path: str, *, require_file: bool = False
+    ) -> ResolvedScope:
+        uri = self._parse_uri(path, allow_empty_path=True)
         root = self._dataset_root(uri.dataset)
         repo = self._repository(root)
-        commit_id = repo.resolve_ref(uri.ref)
-        entry = repo.resolve_entry(
-            uri.ref,
-            uri.logical_path,
-            include_staging=uri.include_staging,
-            commit_id=commit_id,
-        )
-        if entry is None:
+        last_error: Exception | None = None
+        valid_ref = False
+        for ref, logical_path in _reference_candidates(uri):
+            try:
+                commit_id = repo.resolve_ref(ref)
+            except (UnknownRefError, EmptyBranchError) as error:
+                last_error = error
+                continue
+            valid_ref = True
+            entry = repo.resolve_entry(
+                ref,
+                logical_path,
+                include_staging=uri.include_staging,
+                commit_id=commit_id,
+            )
+            if entry is not None:
+                return ResolvedScope(
+                    uri=uri,
+                    root=root,
+                    repo=repo,
+                    ref=ref,
+                    path=logical_path,
+                    commit_id=commit_id,
+                    entry=entry,
+                )
+            if not require_file:
+                has_children = next(
+                    repo.store.iter_entries_for_prefix(
+                        commit_id_tree(repo, commit_id), logical_path
+                    ),
+                    None,
+                )
+                if has_children is not None:
+                    return ResolvedScope(
+                        uri=uri,
+                        root=root,
+                        repo=repo,
+                        ref=ref,
+                        path=logical_path,
+                        commit_id=commit_id,
+                        entry=None,
+                    )
+        if valid_ref:
             raise FileNotFoundError(path)
-        return ResolvedEntry(uri=uri, root=root, commit_id=commit_id, entry=entry)
+        if last_error is not None:
+            raise last_error
+        raise FileNotFoundError(path)
+
+    def _resolve_listing(
+        self, uri: ReflakeURI, repo: ReflakeRepository
+    ) -> ResolvedScope:
+        last_error: Exception | None = None
+        valid_ref = False
+        for ref, logical_path in _reference_candidates(uri):
+            try:
+                commit_id = repo.resolve_ref(ref)
+            except (UnknownRefError, EmptyBranchError) as error:
+                last_error = error
+                continue
+            valid_ref = True
+            if logical_path:
+                has_children = next(
+                    repo.store.iter_entries_for_prefix(
+                        commit_id_tree(repo, commit_id), logical_path
+                    ),
+                    None,
+                )
+                if has_children is None:
+                    continue
+            return ResolvedScope(
+                uri=uri,
+                root=self._dataset_root(uri.dataset),
+                repo=repo,
+                ref=ref,
+                path=logical_path,
+                commit_id=commit_id,
+                entry=None,
+            )
+        if valid_ref:
+            raise FileNotFoundError(uri.logical_path)
+        if last_error is not None:
+            raise last_error
+        raise FileNotFoundError(uri.logical_path)
 
     def _repository(self, root: str | Path) -> ReflakeRepository:
         key = str(root)
@@ -186,7 +327,7 @@ class ReflakeFileSystem(AbstractFileSystem):
         raise FileNotFoundError(f"Unknown Reflake dataset: {dataset}")
 
     def _parse_uri(self, path: str, *, allow_empty_path: bool = False) -> ReflakeURI:
-        stripped = self._strip_protocol(path)
+        stripped = path[len("reflake://") :] if path.startswith("reflake://") else path
         if not stripped:
             raise ValueError("Reflake URI cannot be empty")
         if "@" not in stripped:
@@ -206,18 +347,18 @@ class ReflakeFileSystem(AbstractFileSystem):
         else:
             ref_raw, logical_path = remainder, ""
         include_staging = False
-        ref = ref_raw
         if ref_raw.endswith("+staged"):
             include_staging = True
-            ref = ref_raw[: -len("+staged")]
+            ref_raw = ref_raw[: -len("+staged")]
+        ref = unquote(ref_raw)
         _validate_uri_component(ref, "ref")
         if not ref:
             raise ValueError("Reflake URI ref cannot be empty")
-        if "/" in ref:
-            raise ValueError("Reflake URI ref cannot contain path separators")
-        if ref in (".", ".."):
-            raise ValueError("Reflake URI ref cannot be '.' or '..'")
-        logical_path = logical_path.strip("/")
+        if ref.startswith("/") or ref.endswith("/"):
+            raise ValueError("Reflake URI ref cannot start or end with '/'")
+        if any(part in ("", ".", "..") for part in ref.split("/")):
+            raise ValueError("Reflake URI ref contains an invalid path segment")
+        logical_path = unquote(logical_path).strip("/")
         if logical_path:
             logical_path = normalize_repository_path(logical_path)
         elif not allow_empty_path:
@@ -228,6 +369,43 @@ class ReflakeFileSystem(AbstractFileSystem):
             logical_path=logical_path,
             include_staging=include_staging,
         )
+
+def _reference_candidates(uri: ReflakeURI):
+    """Yield ``(ref, path)`` resolutions, exact ref first, then hierarchical.
+
+    A ref may contain ``/`` (``feature/x``), which the URI grammar encodes
+    ambiguously against the logical path. Prefer the exact ref, then consume
+    path components into the ref until a ref exists. This makes
+    ``reflake://ds@feature/x/file.parquet`` work for branch ``feature/x``
+    while preserving the historical ``ref=feature, path=x/file`` meaning.
+    """
+    parts = [part for part in uri.logical_path.split("/") if part]
+    yield uri.ref, uri.logical_path
+    for index in range(1, len(parts)):
+        yield f"{uri.ref}/{'/'.join(parts[:index])}", "/".join(parts[index:])
+    if parts:
+        # Listing a hierarchical ref with no trailing path: the whole logical
+        # path may be the ref (reflake://ds@feature/x).
+        yield f"{uri.ref}/{'/'.join(parts)}", ""
+
+
+def commit_id_tree(repo: ReflakeRepository, commit_id: str) -> str:
+    return repo.read_commit(commit_id).tree
+
+
+def repo_commit(scope: ResolvedScope):
+    return scope.repo.read_commit(scope.commit_id)
+
+
+@dataclass(frozen=True)
+class ResolvedScope:
+    uri: ReflakeURI
+    root: str | Path
+    repo: ReflakeRepository
+    ref: str
+    path: str
+    commit_id: str
+    entry: Entry | None
 
 
 def _validate_uri_component(component: str, name: str) -> None:
@@ -240,6 +418,7 @@ class ResolvedEntry:
     root: str | Path
     commit_id: str
     entry: Entry
+    ref: str = ""
 
 
 fsspec.register_implementation("reflake", ReflakeFileSystem)

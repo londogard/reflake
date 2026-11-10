@@ -50,6 +50,9 @@ class RepoFormat:
             )
         if self.identity not in ("content", "pointer"):
             raise ValueError("identity must be one of: content, pointer")
+        from .repository_support import validate_branch_name
+
+        validate_branch_name(self.default_branch)
 
     def to_json(self) -> bytes:
         return msgspec.json.encode(asdict(self)) + b"\n"

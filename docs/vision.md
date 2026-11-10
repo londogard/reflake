@@ -166,8 +166,9 @@ name**; `name` is a single path component (no `/`, no `.`/`..`, non-empty).
 ```
 
 - `hash` = Blake3 hex (64 lowercase chars). For `b`/`bp` it is the content
-  hash; for `m`/`mp` it is `BLAKE3("<path>\n<size>")` — an *unverifiable
-  reference*, explicitly not a content identity.
+  hash; for `m`/`mp` it is `BLAKE3("<source-version-marker>\n<size>")` — the
+  source's ETag (S3) or content digest (local/fsspec), *not* the source bytes
+  stored by Reflake. It is an unverifiable reference until `promote`.
 - Sharding rule (**I2**): a node has at most `MAX_TREE_ENTRIES` (2 048)
   children. A directory exceeding the bound is stored as contiguous
   name-range shards; each shard body is a **plain** node (shards never nest);
@@ -210,6 +211,13 @@ time. Implementations SHOULD document this, and MAY add an explicit
 | I13 | Path matching is component-aware (`a/b` matches `a/b` and `a/b/…`, never `a/bc`) |
 | I14 | One key-space mapping function for every adapter |
 | I15 | Ref concurrency is CAS-only; no locks, no stale-lock recovery |
+| I16 | A published ref never points at a graph with a missing reachable object (verify before CAS) |
+| I17 | Content-addressed reads verify the hash against the key (trees, footers, commits; blobs on full reads) |
+| I18 | Identity is a pure function of content or an immutable source version — never local time or path |
+| I19 | `status` never reports a committed path as removed solely because ignore rules hide it from the worktree walk |
+| I20 | Every object a client writes is reachable from a ref/tag/staging/reflog root until retention expires |
+| I21 | A write decision reads the real ref; client snapshots are only CAS expectations for retry |
+| I22 | One writer per object kind: commits/refs only through the publisher, trees only through the tree service |
 
 ## 8. Operations (semantics + cost model)
 
@@ -463,7 +471,10 @@ with source ETags**, **hierarchical branch names + branch deletion**, **full
 streaming GC with a pluggable existence source**, **an invariant fuzz test**,
 and **nightly benchmark CI** (`scripts/profile_gc.py` for GC numbers).
 
-Still open (tracked in ROADMAP "Now"): pruning has no execution path yet;
-provenance/author fields; tags/releases; `export`; shared repository config;
-a committed 1M-file commit-path scale harness; the docs split (architecture
-vs ADRs vs roadmap).
+Still open (tracked in ROADMAP "Now"): provenance/author fields; `export`;
+a catalog/discovery convention; Spark/Trino integration; the docs split
+(architecture vs ADRs vs roadmap). Pruned-scan execution, tags/releases,
+shared repository config, and the committed scale harness landed in
+0.4/0.5; the 0.6 hardening pass adds verified reads, GC completeness,
+sync repair, durable local writes, worktree-stale protection, and a
+directory-aware VFS.

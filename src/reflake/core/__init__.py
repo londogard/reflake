@@ -35,6 +35,7 @@ from .domain import (
     UnknownCommitError,
     UnknownRefError,
     VerifyResult,
+    WorktreeStaleError,
 )
 from .entry_codec import CorruptEntryError, Entry
 from .hashing import DEFAULT_CHUNK_SIZE, blake3_digest_file, blake3_digest_stream
@@ -170,6 +171,7 @@ __all__ = [
     "TreeQuery",
     "UnknownCommitError",
     "UnknownRefError",
+    "WorktreeStaleError",
     "EmptyBranchError",
     "build_analytical_index",
     "execute_scan",

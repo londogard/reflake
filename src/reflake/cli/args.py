@@ -264,15 +264,6 @@ class CloneArgs:
 
 
 @dataclass
-class TransferArgs:
-    # Transfer direction: upload (local->S3) or download (S3->local).
-    direction: str = field(default="upload", positional=True, metavar="direction")
-    execute: bool = flag(False, alias="--execute")  # Execute s5cmd/aws commands
-    # Ref to transfer (default: current branch).
-    ref: str | None = field(default=None, alias="--ref")
-
-
-@dataclass
 class DiffArgs:
     from_ref: str = field(positional=True, metavar="from_ref")  # Source ref
     to_ref: str = field(positional=True, metavar="to_ref")  # Target ref
@@ -400,7 +391,6 @@ class ReflakeCLI:
         | PullArgs
         | FetchArgs
         | CloneArgs
-        | TransferArgs
     ) = subparsers(
         {
             "commit": CommitArgs,
@@ -431,7 +421,6 @@ class ReflakeCLI:
             "pull": PullArgs,
             "fetch": FetchArgs,
             "clone": CloneArgs,
-            "transfer": TransferArgs,
         }
     )
     # Repository path or URI (global, before the command).
@@ -487,50 +476,3 @@ def build_parser() -> _CleanParser:
     )
     parser.add_arguments(ReflakeCLI, dest="cli")
     return parser
-
-
-#: Command name for every leaf command object (plus nested-wrapper fallbacks).
-_COMMAND_NAMES: dict[type, str] = {
-    CommitArgs: "commit",
-    AddArgs: "add",
-    RmArgs: "rm",
-    MoveArgs: "mv",
-    StatusArgs: "status",
-    BranchArgs: "branch",
-    DiffArgs: "diff",
-    MergeArgs: "merge",
-    LogArgs: "log",
-    ListArgs: "list",
-    CatArgs: "cat",
-    ReflogArgs: "reflog",
-    BranchesArgs: "branches",
-    CheckoutArgs: "checkout",
-    RestoreArgs: "restore",
-    ResetArgs: "reset",
-    InitArgs: "init",
-    PushArgs: "push",
-    PullArgs: "pull",
-    TagArgs: "tag",
-    FetchArgs: "fetch",
-    CloneArgs: "clone",
-    TransferArgs: "transfer",
-    IdentityVerifyArgs: "identity verify",
-    IdentityPromoteArgs: "identity promote",
-    QueryBuildArgs: "query build",
-    QueryScanArgs: "query scan",
-    FsckArgs: "fsck",
-    ConfigInitArgs: "config init",
-    ConfigSetArgs: "config set",
-    ConfigListArgs: "config list",
-    # Nested-subcommand wrappers (reached only when no inner command exists).
-    IdentityArgs: "identity verify",
-    QueryArgs: "query build",
-    ConfigArgs: "config",
-}
-
-
-def command_name(command: object) -> str:
-    """Human-readable name of a parsed command, for error messages."""
-    inner = getattr(command, "command", None)
-    candidate = inner if inner is not None else command
-    return _COMMAND_NAMES.get(type(candidate), "reflake")

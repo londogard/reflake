@@ -117,10 +117,26 @@ def test_gc_keeps_tagged_commits(tmp_path: Path) -> None:
     assert audit.reachable_commits == 2
     assert repo.store.object_exists("commit", second)
 
+    # ``reset`` also wrote a client reflog entry, and the reflog is an undo
+    # root. Drop that client-local history to test tag reachability alone.
+    for log in (tmp_path / ".reflake" / "reflog").glob("*.log"):
+        log.unlink()
     repo.delete_tag("v1")
     pruned = repo.gc(dry_run=False, grace_seconds=0)
     assert pruned.orphan_commits == 1
     assert not repo.store.object_exists("commit", second)
+
+
+def test_gc_keeps_reflog_only_commits(tmp_path: Path) -> None:
+    """A reset-away commit stays available for redo until the reflog is gone."""
+    repo, first = _repo(tmp_path)
+    (tmp_path / "b.txt").write_text("b")
+    second = repo.commit("second")
+    repo.reset(first)
+
+    audit = repo.gc(dry_run=False, grace_seconds=0)
+    assert audit.reachable_commits == 2
+    assert repo.store.object_exists("commit", second)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -216,3 +232,11 @@ def test_pull_rejects_conflicting_local_tag(
 
     with pytest.raises(ValueError, match="tags are immutable"):
         pull(clone, remote, ref="v1")
+
+
+def test_tag_parent_name_can_be_reused_after_child_delete(tmp_path: Path) -> None:
+    repo, first = _repo(tmp_path)
+    repo.tag("release/v1", first)
+    repo.delete_tag("release/v1")
+    repo.tag("release", first)
+    assert repo.store.read_tag_ref("release") == first

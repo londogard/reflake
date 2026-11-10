@@ -91,6 +91,29 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
 
+  macos-smoke:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run non-integration tests and CLI smoke
+        run: |
+          uv run pytest tests -m "not integration and not benchmark"
+          uv run reflake --help
+
   s3-integration:
     runs-on: ubuntu-latest
 
@@ -151,6 +174,7 @@ jobs:
       [
         lint-and-typecheck,
         test-and-build,
+        macos-smoke,
         s3-integration,
         isolated-install-smoke,
       ]

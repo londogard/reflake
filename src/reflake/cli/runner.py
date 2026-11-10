@@ -32,6 +32,7 @@ from .args import (
     CheckoutArgs,
     CloneArgs,
     CommitArgs,
+    ConfigArgs,
     ConfigInitArgs,
     ConfigListArgs,
     ConfigSetArgs,
@@ -39,6 +40,7 @@ from .args import (
     FetchArgs,
     FsckArgs,
     GcArgs,
+    IdentityArgs,
     IdentityPromoteArgs,
     IdentityVerifyArgs,
     InitArgs,
@@ -48,6 +50,7 @@ from .args import (
     MoveArgs,
     PullArgs,
     PushArgs,
+    QueryArgs,
     QueryBuildArgs,
     QueryScanArgs,
     ReflogArgs,
@@ -56,9 +59,7 @@ from .args import (
     RmArgs,
     StatusArgs,
     TagArgs,
-    TransferArgs,
     build_parser,
-    command_name,
 )
 
 HANDLED_CLI_ERRORS = (
@@ -85,40 +86,46 @@ _MISSING_ERRORS = (
     FileNotFoundError,
 )
 
-#: One handler per leaf command type: ``(command, repo_root, as_json) -> exit``.
-_HANDLERS: dict[type, Callable[..., int]] = {
-    CommitArgs: worktree.handle_commit,
-    AddArgs: worktree.handle_add,
-    RmArgs: worktree.handle_rm,
-    MoveArgs: worktree.handle_mv,
-    StatusArgs: worktree.handle_status,
-    BranchArgs: history.handle_branch,
-    DiffArgs: history.handle_diff,
-    MergeArgs: history.handle_merge,
-    LogArgs: history.handle_log,
-    ListArgs: history.handle_list,
-    CatArgs: history.handle_cat,
-    ReflogArgs: history.handle_reflog,
-    BranchesArgs: history.handle_branches,
-    TagArgs: history.handle_tag,
-    CheckoutArgs: history.handle_checkout,
-    RestoreArgs: history.handle_restore,
-    ResetArgs: history.handle_reset,
-    IdentityVerifyArgs: identity.handle_identity,
-    IdentityPromoteArgs: identity.handle_identity,
-    QueryBuildArgs: query.handle_query_build,
-    QueryScanArgs: query.handle_query_scan,
-    GcArgs: admin.handle_gc,
-    FsckArgs: admin.handle_fsck,
-    InitArgs: admin.handle_init,
-    ConfigInitArgs: admin.handle_config,
-    ConfigSetArgs: admin.handle_config,
-    ConfigListArgs: admin.handle_config,
-    PushArgs: sync.handle_push,
-    PullArgs: sync.handle_pull,
-    FetchArgs: sync.handle_fetch,
-    CloneArgs: sync.handle_clone,
-    TransferArgs: sync.handle_transfer,
+#: One registry: command display name + handler for each leaf command type.
+_COMMANDS: dict[type, tuple[str, Callable[..., int]]] = {
+    CommitArgs: ("commit", worktree.handle_commit),
+    AddArgs: ("add", worktree.handle_add),
+    RmArgs: ("rm", worktree.handle_rm),
+    MoveArgs: ("mv", worktree.handle_mv),
+    StatusArgs: ("status", worktree.handle_status),
+    BranchArgs: ("branch", history.handle_branch),
+    DiffArgs: ("diff", history.handle_diff),
+    MergeArgs: ("merge", history.handle_merge),
+    LogArgs: ("log", history.handle_log),
+    ListArgs: ("list", history.handle_list),
+    CatArgs: ("cat", history.handle_cat),
+    ReflogArgs: ("reflog", history.handle_reflog),
+    BranchesArgs: ("branches", history.handle_branches),
+    TagArgs: ("tag", history.handle_tag),
+    CheckoutArgs: ("checkout", history.handle_checkout),
+    RestoreArgs: ("restore", history.handle_restore),
+    ResetArgs: ("reset", history.handle_reset),
+    IdentityVerifyArgs: ("identity verify", identity.handle_identity),
+    IdentityPromoteArgs: ("identity promote", identity.handle_identity),
+    QueryBuildArgs: ("query build", query.handle_query_build),
+    QueryScanArgs: ("query scan", query.handle_query_scan),
+    GcArgs: ("gc", admin.handle_gc),
+    FsckArgs: ("fsck", admin.handle_fsck),
+    InitArgs: ("init", admin.handle_init),
+    ConfigInitArgs: ("config init", admin.handle_config),
+    ConfigSetArgs: ("config set", admin.handle_config),
+    ConfigListArgs: ("config list", admin.handle_config),
+    PushArgs: ("push", sync.handle_push),
+    PullArgs: ("pull", sync.handle_pull),
+    FetchArgs: ("fetch", sync.handle_fetch),
+    CloneArgs: ("clone", sync.handle_clone),
+}
+
+#: Fallbacks for nested wrappers (no inner command supplied).
+_WRAPPER_NAMES: dict[type, str] = {
+    IdentityArgs: "identity verify",
+    QueryArgs: "query build",
+    ConfigArgs: "config",
 }
 
 
@@ -178,15 +185,16 @@ def run_cli(argv: list[str] | None = None) -> int:
         # exit 2 for retryable conflicts — usage/validation is 1.
         return 0 if not exc.code else 1
     command = args.command
-    command_display = command_name(command)
     inner = getattr(command, "command", None)
     leaf = inner if inner is not None else command
+    display_name = _COMMANDS.get(type(leaf), (None, None))[0]
+    command_display = display_name or _WRAPPER_NAMES.get(type(command), "reflake")
 
     try:
-        handler = _HANDLERS.get(type(leaf))
-        if handler is None:
+        spec = _COMMANDS.get(type(leaf))
+        if spec is None:
             raise AssertionError(f"Unsupported command type: {type(leaf).__name__}")
-        return handler(leaf, args.repo, args.json)
+        return spec[1](leaf, args.repo, args.json)
     except HANDLED_CLI_ERRORS as error:
         code = _error_exit_code(error)
         if args.json:

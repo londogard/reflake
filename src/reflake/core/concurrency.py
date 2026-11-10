@@ -15,8 +15,9 @@ One helper, used everywhere, so every path gets the same behaviour:
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TypeVar
 
 T = TypeVar("T")
@@ -27,6 +28,37 @@ R = TypeVar("R")
 DEFAULT_IO_WORKERS = min(16, max(4, (os.cpu_count() or 4) * 4))
 
 
+def _iter_bounded(
+    function: Callable[[T], R],
+    items: Iterable[T],
+    *,
+    workers: int,
+) -> Iterator[R]:
+    """Yield results in input order with at most *workers* calls in flight.
+
+    The input is consumed lazily, so a million-item transfer plan does not
+    need to be materialized to start moving bytes.
+    """
+    iterator = iter(items)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return
+    if workers < 2:
+        yield function(first)
+        for item in iterator:
+            yield function(item)
+        return
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending: deque[Future[R]] = deque([pool.submit(function, first)])
+        for item in iterator:
+            if len(pending) >= workers:
+                yield pending.popleft().result()
+            pending.append(pool.submit(function, item))
+        while pending:
+            yield pending.popleft().result()
+
+
 def map_bounded(
     function: Callable[[T], R],
     items: Iterable[T],
@@ -34,18 +66,13 @@ def map_bounded(
     workers: int | None = None,
 ) -> list[R]:
     """``list(map(function, items))`` with up to *workers* calls in flight."""
-    materialized = list(items)
-    if not materialized:
-        return []
-
-    def run(item: T) -> R:
-        return function(item)
-
-    resolved_workers = workers or DEFAULT_IO_WORKERS
-    if len(materialized) == 1 or resolved_workers < 2:
-        return [run(item) for item in materialized]
-    with ThreadPoolExecutor(max_workers=resolved_workers) as pool:
-        return list(pool.map(run, materialized))
+    return list(
+        _iter_bounded(
+            function,
+            items,
+            workers=workers or DEFAULT_IO_WORKERS,
+        )
+    )
 
 
 def run_bounded(
@@ -55,4 +82,11 @@ def run_bounded(
     workers: int | None = None,
 ) -> int:
     """Run *function* over *items* with bounded concurrency; return the count."""
-    return len(map_bounded(function, items, workers=workers))
+    return sum(
+        1
+        for _ in _iter_bounded(
+            function,
+            items,
+            workers=workers or DEFAULT_IO_WORKERS,
+        )
+    )

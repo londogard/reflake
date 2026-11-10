@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import atexit
+import importlib.util
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, cast
 
@@ -20,13 +23,16 @@ from .domain import (
     MergeResult,
     MoveResult,
     NotARepositoryError,
+    ObjectMissingError,
     RefConflictError,
     RemoveResult,
     RepositoryObjectKind,
     ResetResult,
     StageChange,
     StageStatus,
+    UnknownCommitError,
     VerifyResult,
+    WorktreeStaleError,
 )
 from .entry_codec import Entry, matches_logical_path
 from .layout import initialize_reflake_layout
@@ -74,7 +80,11 @@ class ReflakeRepository:
         config = BaseConfig.load(root)
         if config is not None:
             config.validate()
-        self.store = store or LocalObjectStore(self.layout.root)
+        self.store = store or LocalObjectStore(
+            self.layout.root,
+            fsync=config.fsync if config else True,
+            use_reflink=config.reflink_blobs if config else True,
+        )
         # Shared format wins over client config: ingest policy must agree
         # across clients, or identical bytes produce different trees.
         try:
@@ -101,6 +111,13 @@ class ReflakeRepository:
             if self.repo_format is not None
             else (config.default_branch if config else "main")
         )
+        if parquet_footer and importlib.util.find_spec("pyarrow") is None:
+            from .domain import ReflakeError
+
+            raise ReflakeError(
+                "This repository has parquet_footer enabled, but pyarrow is not "
+                "installed. Install the query extra: pip install 'reflake[query]'"
+            )
         self.identity_mode = identity_mode
         self.capture_footers = parquet_footer
         if _is_s3_store(self.store) and blob_transfer is not None:
@@ -133,6 +150,26 @@ class ReflakeRepository:
             refs=self.refs,
             stat_cache=self.stat_cache,
         )
+        self._closed = False
+        # The stat cache is the difference between O(changes) and O(bytes)
+        # for the CLI, which opens a fresh repository per process. Persist it
+        # even if the caller never closes explicitly (CLI/library exits).
+        # Register the cache (not the repository) so a long-lived process that
+        # opens many repositories does not retain them all until exit.
+        atexit.register(self.stat_cache.save)
+
+    def close(self) -> None:
+        """Flush client-local caches. Safe to call more than once."""
+        if self._closed:
+            return
+        self._closed = True
+        self.stat_cache.save()
+
+    def __enter__(self) -> ReflakeRepository:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def _reject_pre_v2_repository(self) -> None:
         """Fail clearly on a repository written before the 0.5 format break.
@@ -169,6 +206,14 @@ class ReflakeRepository:
         they belong to the repository, not to one client. Editing client
         config alone would silently do nothing.
         """
+        if parquet_footer:
+            if importlib.util.find_spec("pyarrow") is None:
+                from .domain import ReflakeError
+
+                raise ReflakeError(
+                    "parquet_footer needs pyarrow. Install the query extra: "
+                    "pip install 'reflake[query]'"
+                )
         current = self.repo_format or RepoFormat(
             default_branch=self.current_branch(),
             identity=self.identity_mode,
@@ -226,6 +271,28 @@ class ReflakeRepository:
 
     def set_current_branch(self, branch: str) -> None:
         self.refs.set_current_branch(branch)
+
+    def checkout(self, branch: str) -> None:
+        """Switch the client's branch and mark the worktree as stale.
+
+        The CLI uses this so a subsequent full commit cannot overlay the
+        previous branch's files onto the new head. The low-level
+        ``set_current_branch`` remains available for callers that manage the
+        worktree themselves.
+        """
+        previous = self.head_commit()
+        self.refs.set_current_branch(branch)
+        self.client_state.mark_worktree_stale(
+            branch, previous_commit_id=previous
+        )
+
+    def _mark_stale_if_current(
+        self, branch: str, *, previous_commit_id: str | None
+    ) -> None:
+        if branch == self.current_branch():
+            self.client_state.mark_worktree_stale(
+                branch, previous_commit_id=previous_commit_id
+            )
 
     def head_commit(self) -> str | None:
         return self.refs.head_commit()
@@ -285,6 +352,9 @@ class ReflakeRepository:
             descendant_commit=source_commit,
         ):
             self.refs.fast_forward_branch(target_ref, source_commit, operation="merge")
+            self._mark_stale_if_current(
+                target_ref, previous_commit_id=target_commit
+            )
             return MergeResult(
                 source_ref=source_ref,
                 target_ref=target_ref,
@@ -318,6 +388,9 @@ class ReflakeRepository:
             expected_commit_id=target_commit,
             operation="merge",
         )
+        self._mark_stale_if_current(
+                target_ref, previous_commit_id=target_commit
+            )
         return MergeResult(
             source_ref=source_ref,
             target_ref=target_ref,
@@ -351,6 +424,9 @@ class ReflakeRepository:
             commit_id=target,
             expected_commit_id=current_commit,
             operation="reset",
+        )
+        self._mark_stale_if_current(
+            branch_name, previous_commit_id=current_commit
         )
         return ResetResult(
             ref=branch_name,
@@ -408,16 +484,32 @@ class ReflakeRepository:
         # the effective parent (v1 semantics — staged adds survive a full
         # commit even when the source file is gone).
         additions: list[Entry] = []
-        if staged_additions:
-            additions = [
-                self.entries.entry_from_stage_change(
-                    change,
-                    change.identity_mode or identity_mode,
-                    store_blob=True,
-                )
-                for change in staged_additions.values()
-            ]
-            additions.sort(key=lambda entry: entry.path)
+        for change in staged_additions.values():
+            entry = self.entries.entry_from_stage_change(
+                change,
+                change.identity_mode or identity_mode,
+                store_blob=True,
+            )
+            if entry.blob_hash and not self.store.object_exists(
+                "blob", entry.blob_hash
+            ):
+                # The staged blob was pruned (or manually deleted) after
+                # `add`. Re-materialize from the recorded source when we can;
+                # never publish a tree that points at missing content.
+                if change.source_uri:
+                    entry = self.entries.entry_from_source_uri(
+                        logical_path=change.path,
+                        source_uri=change.source_uri,
+                        identity_mode="content",
+                        store_blob=True,
+                    )
+                else:
+                    raise ObjectMissingError(
+                        f"Staged blob for '{change.path}' is missing and has no "
+                        "source URI; run `reflake add` again"
+                    )
+            additions.append(entry)
+        additions.sort(key=lambda entry: entry.path)
 
         retries = self._STAGED_COMMIT_RETRIES if staged_only else 1
         commit_id: str | None = None
@@ -446,14 +538,51 @@ class ReflakeRepository:
                         removed_prefixes=staged_removed_paths,
                     )
             else:
+                # The worktree is the base; the staged overlay is applied on
+                # top, so a snapshot taken by `add` is never silently replaced
+                # by a later edit to the same file.
                 root_tree = self.tree_writer.build_worktree_tree(
                     worktree_root=self.layout.root,
                     parent_tree=parent_tree,
                     identity_mode=identity_mode,
-                    removed_paths=staged_removed_paths,
-                    staged_additions=additions or None,
                     capture_footers=capture_footers,
                 )
+                if additions or staged_removed_paths:
+                    root_tree = self.tree_writer.overlay_staged(
+                        parent_tree=root_tree,
+                        additions=additions,
+                        removed_prefixes=staged_removed_paths,
+                    )
+                if parent_tree and self.client_state.is_worktree_stale(branch):
+                    # Adding new files is safe; overwriting a committed path
+                    # from a worktree that was never materialized after a
+                    # merge/reset/checkout/pull is the silent-revert bug.
+                    modified = [
+                        change
+                        for change in self.tree_writer.diff_trees(
+                            parent_tree, root_tree
+                        )
+                        if change.change == "modified"
+                    ]
+                    previous = self.client_state.stale_previous_commit(branch)
+                    if previous:
+                        try:
+                            previous_tree = self.refs.read_commit(previous).tree
+                        except UnknownCommitError:
+                            previous_tree = None
+                        if previous_tree:
+                            resurrected = [
+                                change
+                                for change in self.tree_writer.diff_trees(
+                                    previous_tree, parent_tree
+                                )
+                                if change.change == "removed"
+                                and (self.layout.root / change.path).exists()
+                            ]
+                            if resurrected:
+                                modified.extend(resurrected)
+                    if modified:
+                        raise WorktreeStaleError(branch)
 
             try:
                 commit_id = self.tree_writer.write_commit_object(
@@ -483,6 +612,9 @@ class ReflakeRepository:
             root_tree=root_tree,
         )
         self.staging.save(branch, {})
+        if not staged_only:
+            self.client_state.clear_worktree_stale(branch)
+        self.stat_cache.save()
         return CommitId(commit_id, stats)
 
     def _commit_stats(
@@ -614,7 +746,13 @@ class ReflakeRepository:
     def status(
         self, *, ref: str | None = None, working_tree: bool = False
     ) -> StageStatus:
-        return self.staging.status(ref=ref, working_tree=working_tree)
+        result = self.staging.status(ref=ref, working_tree=working_tree)
+        result = replace(
+            result,
+            worktree_stale=self.client_state.is_worktree_stale(result.ref),
+        )
+        self.stat_cache.save()
+        return result
 
     def read_commit(self, commit_id: str) -> CommitObject:
         return self.refs.read_commit(commit_id)
@@ -822,22 +960,6 @@ class ReflakeRepository:
 
         return repo_restore_files(self, ref, paths, force=force)
 
-    def generate_transfer_commands(
-        self,
-        ref: str | None = None,
-        *,
-        mode: str = "upload",
-        include_metadata: bool = False,
-    ) -> list[str]:
-        from .repository_ops import repo_generate_transfer_commands
-
-        return repo_generate_transfer_commands(
-            self,
-            ref,
-            mode=mode,
-            include_metadata=include_metadata,
-        )
-
     def gc(
         self,
         *,
@@ -901,6 +1023,22 @@ class ReflakeRepository:
             tagged_commit = self.store.read_tag_ref(tag)
             if tagged_commit:
                 pending.append(tagged_commit)
+        # The client reflog is an undo root: a reset-away commit must stay
+        # available for redo until the user deletes their reflog.
+        for reflog_commit in self.client_state.iter_reflog_commit_ids():
+            if self.store.object_exists("commit", reflog_commit):
+                pending.append(reflog_commit)
+        # Staged content is reachable-but-not-committed. `add` publishes the
+        # blob before `commit` makes it reachable, and a large import can
+        # legitimately sit staged for longer than the grace window.
+        for change in self.client_state.iter_staged_changes():
+            if change.get("identity_mode") != "pointer":
+                blob_hash = change.get("blob_hash")
+                if isinstance(blob_hash, str) and blob_hash:
+                    reachable_blobs.add(blob_hash)
+            footer_hash = change.get("footer")
+            if isinstance(footer_hash, str) and footer_hash:
+                reachable_footers.add(footer_hash)
         seen_trees: set[str] = set()
         while pending:
             commit_id = pending.pop()
@@ -1020,6 +1158,8 @@ class ReflakeRepository:
         for branch_name in sorted(self.store.iter_branches()):
             state = self.store.read_branch_ref(branch_name)
             commit_id = state.commit_id if state else None
+            if commit_id is None:
+                continue  # deleted-branch tombstone
             message = None
             if commit_id:
                 message = self.read_commit(commit_id).message
@@ -1030,7 +1170,9 @@ class ReflakeRepository:
 
 
 def _default_remote_client_root(worktree_root: Path, repo_uri: str) -> Path:
-    repo_id = blake3(repo_uri.encode("utf-8")).hexdigest()[:16]
+    # Normalize a trailing slash so the same repository always shares one
+    # client-state directory (and therefore one staging area/snapshot set).
+    repo_id = blake3(repo_uri.rstrip("/").encode("utf-8")).hexdigest()[:16]
     return worktree_root / ".reflake" / "clients" / repo_id
 
 
@@ -1060,7 +1202,15 @@ def init_repository(
     repository never mutates it — all creation goes through here.
     """
     from .config import init_config
+    from .repository_support import validate_branch_name
 
+    if isinstance(root, str) and is_s3_uri(root):
+        raise ValueError(
+            "init_repository creates a local repository. Use "
+            "`reflake --repo <s3-uri> init` for a remote repository, or "
+            "`push` to bootstrap an empty prefix."
+        )
+    default_branch = validate_branch_name(default_branch)
     repo_root = Path(root).resolve()
     initialize_reflake_layout(repo_root, create_dirs=True)
     config_path = repo_root / ".reflake" / "config.json"
@@ -1101,7 +1251,7 @@ def open_repository(
     s3_client: object | None = None,
     s3_endpoint: str | None = None,
     blob_transfer: BlobTransferBackend | str | None = None,
-    must_exist: bool = True,
+    must_exist: bool | None = None,
     validate_format: bool = True,
 ) -> ReflakeRepository:
     if isinstance(root, str) and is_s3_uri(root):
@@ -1123,26 +1273,37 @@ def open_repository(
             blob_transfer = build_blob_transfer_backend(
                 blob_transfer, endpoint_url=s3_endpoint
             )
+        store = S3ObjectStore(
+            bucket,
+            prefix,
+            client=store_client,
+            blob_transfer=blob_transfer,
+        )
+        # Opening a remote repository is lazy by default; mutating commands
+        # may bootstrap an empty prefix, while reads can ask for strict
+        # existence explicitly (`must_exist=True`).
+        strict = bool(must_exist) if must_exist is not None else False
+        if strict:
+            has_marker = store.read_repo_format_bytes() is not None
+            has_branches = next(store.iter_branches(), None) is not None
+            if not has_marker and not has_branches:
+                raise NotARepositoryError(root)
         return ReflakeRepository(
             worktree_root,
-            store=S3ObjectStore(
-                bucket,
-                prefix,
-                client=store_client,
-                blob_transfer=blob_transfer,
-            ),
+            store=store,
             client_state=LocalClientState(resolved_client_root),
             validate_format=validate_format,
         )
 
+    strict_local = True if must_exist is None else must_exist
     if root == "." or str(root) == ".":
         cwd = Path(".").resolve()
         if not (cwd / ".reflake").is_dir():
-            root = _find_repo_root(".", must_exist=must_exist)
+            root = _find_repo_root(".", must_exist=strict_local)
         else:
             root = str(cwd)
     repo_root = Path(root).resolve()
-    if must_exist and not (repo_root / ".reflake").is_dir():
+    if strict_local and not (repo_root / ".reflake").is_dir():
         raise NotARepositoryError(repo_root)
 
     config = BaseConfig.load(repo_root)
@@ -1191,6 +1352,10 @@ def open_repository(
     resolved_client_root = Path(client_root).resolve() if client_root else repo_root
     return ReflakeRepository(
         worktree_root,
-        store=LocalObjectStore(repo_root),
+        store=LocalObjectStore(
+            repo_root,
+            fsync=config.fsync if config else True,
+            use_reflink=config.reflink_blobs if config else True,
+        ),
         client_state=LocalClientState(resolved_client_root),
     )

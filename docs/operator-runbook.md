@@ -5,9 +5,10 @@ S3-compatible object storage. It assumes you are already familiar with the
 [Reflake README](../README.md) and [architecture](architecture.md).
 
 > Concurrency safety is CAS-only (architecture §6): branch updates
-> compare-and-set on the commit id (`IfMatch`/`IfNoneMatch` on S3, file
-> locking for local repos). **There are no branch locks** — no `locks/`
-> prefix, no `lock list/cleanup` commands.
+> compare-and-set on the commit id (`IfMatch`/`IfNoneMatch` on S3, POSIX
+> `flock` for local repos). **There are no branch locks** — no `locks/`
+> prefix, no `lock list/cleanup` commands. Local repositories are
+> POSIX-only; Windows is not supported.
 
 ---
 
@@ -65,19 +66,20 @@ Reflake never stores credentials itself.
 
 ## Initialization And Refs
 
-Opening a repository is **side-effect free**: it never writes refs and never
-"creates" a prefix that was not initialized. A branch with no ref yet is
-*unborn* (staging works, the first `commit` creates the ref with a CAS).
+Opening a repository is **lazy**: it never writes refs and never "creates" a
+prefix. Mutating commands may bootstrap an empty prefix; read-only callers can
+pass `must_exist=True` (the library) to reject a typo. A branch with no ref yet
+is *unborn* (staging works, the first `commit` creates the ref with a CAS).
 
 - Bootstrap a remote repository explicitly, once: `reflake --repo . push <s3-uri>` creates `refs/heads/<branch>` on the remote.
 - `reflake pull`/`fetch` into an empty directory bootstrap the local repository (clone flow).
-- Pointing at a typo'd prefix therefore fails loudly instead of silently creating an empty repo.
+- A read-only caller that passes `must_exist=True` fails loudly on a typo'd prefix instead of silently reading an empty repo; mutating commands may bootstrap an empty prefix by design.
 
 `reflake identity verify` is a strictly read-only audit: it walks tree metadata
 and counts unverifiable (`pointer`) entries without writing any object. With
 `--drift` it additionally compares each pointer entry's recorded source
-metadata (size/ETag/last-modified) against the source — one metadata request
-per entry, never a byte read — and exits non-zero on drift. Only
+version against the source — an ETag/HEAD for S3, a content digest re-read for
+local files (mtime is not an identity) — and exits non-zero on drift. Only
 `reflake identity promote` materializes blobs and commits. `reflake checkout`
 changes the client's branch pointer only — it never rewrites a working tree,
 by design (downloads are explicit: `restore`, `pull`, `cat`). `reflake reset
@@ -197,8 +199,10 @@ Everything under the prefix:
 ## Garbage collection
 
 `reflake gc` is audit-only by default: it walks the commit DAG from every
-branch head (following **all** parents of merge commits), then the tree
-DAGs, and reports orphaned commits/trees/blobs/footers.
+branch head and tag (following **all** parents of merge commits), then the
+tree DAGs, and reports orphaned commits/trees/blobs/footers. Reachability also
+includes the client reflog (undo targets) and staged content (blobs/footers
+published by `add` but not yet committed).
 
 ```bash
 reflake --repo s3://my-bucket/my-prefix gc        # audit
@@ -264,8 +268,10 @@ moved before promotion.
 ### Symptom: Corrupted or missing blob
 
 **Cause:** A blob was deleted/truncated (e.g. aggressive lifecycle rule).
-Local writes are atomic (temp file + rename) and hash-verified, so local
-corruption implies disk failure, not torn writes.
+Local writes are atomic (destination-directory temp, `fsync`, rename,
+directory `fsync`) and content-addressed reads re-hash trees/commits (blobs are
+verified on full reads). Local corruption therefore implies disk failure rather
+than a torn write.
 
 **Resolution:**
 1. With bucket versioning: restore the previous version.
@@ -285,7 +291,7 @@ corruption implies disk failure, not torn writes.
 | Task | Command |
 |------|---------|
 | Audit pointer entries | `reflake --repo <URI> identity verify` |
-| Audit source drift (metadata-only) | `reflake --repo <URI> identity verify --drift` |
+| Audit source drift | `reflake --repo <URI> identity verify --drift` |
 | Promote pointers to blobs | `reflake --repo <URI> identity promote` |
 | Undo/redo a branch pointer | `reflake --repo <URI> reset <ref>` |
 | Audit orphaned objects | `reflake --repo <URI> gc` (`--prune` deletes, age-guarded) |

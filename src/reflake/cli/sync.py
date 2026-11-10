@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shlex
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -18,7 +17,7 @@ from ..core import (
     pull,
     push,
 )
-from .args import CloneArgs, FetchArgs, PullArgs, PushArgs, TransferArgs
+from .args import CloneArgs, FetchArgs, PullArgs, PushArgs
 from .helpers import progress_printer
 
 
@@ -119,6 +118,11 @@ def handle_clone(command: CloneArgs, repo_root: str, as_json: bool) -> int:
 
     repo = open_repository(str(target), blob_transfer=command.transfer_backend)
     ref = command.ref or repo.current_branch()
+    if repo.store.read_branch_ref(ref) is None:
+        raise ValueError(
+            f"clone --ref expects a branch; '{ref}' is a tag or commit. "
+            "Clone the default branch, then read the tag with `cat`/`log`."
+        )
     commit_id = repo.resolve_ref(ref)
 
     # A fresh clone owns the branch locally: pin the snapshot so the next
@@ -146,30 +150,6 @@ def handle_clone(command: CloneArgs, repo_root: str, as_json: bool) -> int:
             print(f"  restored {len(restored)} file(s)")
         else:
             print("  files are read on demand: `reflake cat <path>`, VFS, query")
-    return 0
-
-
-def handle_transfer(command: TransferArgs, repo_root: str, as_json: bool) -> int:
-    repo = open_repository(repo_root)
-    cmds = repo.generate_transfer_commands(
-        ref=command.ref,
-        mode=command.direction,
-        include_metadata=True,
-    )
-    executed = 0
-    if command.execute:
-        import subprocess
-
-        for cmd in cmds:
-            subprocess.run(shlex.split(cmd), check=True)
-        executed = len(cmds)
-    if as_json:
-        print(json.dumps({"commands": cmds, "executed": executed}, indent=2))
-    elif command.execute:
-        print(f"Executed {executed} transfer commands")
-    else:
-        for cmd in cmds:
-            print(cmd)
     return 0
 
 

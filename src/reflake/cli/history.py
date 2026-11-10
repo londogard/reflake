@@ -195,8 +195,41 @@ def handle_list(command: ListArgs, repo_root: str, as_json: bool) -> int:
 def handle_cat(command: CatArgs, repo_root: str, as_json: bool) -> int:
     repo = open_repository(repo_root)
     ref = command.ref or repo.current_branch()
-    sys.stdout.buffer.write(repo.cat(ref, command.path))
-    return 0
+    entry = repo.resolve_entry(ref, command.path)
+    if entry is None:
+        raise FileNotFoundError(
+            f"Path not found in ref '{ref}': {command.path}"
+        )
+    if entry.blob_hash:
+        from contextlib import closing
+
+        from blake3 import blake3
+
+        from ..core.domain import BlobIntegrityError
+
+        hasher = blake3()
+        with closing(repo.open_blob_stream(entry.blob_hash)) as handle:
+            while chunk := handle.read(1024 * 1024):
+                hasher.update(chunk)
+                sys.stdout.buffer.write(chunk)
+        actual = hasher.hexdigest()
+        if actual != entry.blob_hash:
+            raise BlobIntegrityError(
+                expected=entry.blob_hash,
+                actual=actual,
+                context="cat",
+            )
+        return 0
+    if entry.source_uri:
+        from ..core.objects import open_source_uri, source_client
+
+        with open_source_uri(
+            entry.source_uri, client=source_client(repo.store)
+        ) as handle:
+            while chunk := handle.read(1024 * 1024):
+                sys.stdout.buffer.write(chunk)
+        return 0
+    raise FileNotFoundError(f"Entry has no readable content: {command.path}")
 
 
 def handle_reflog(command: ReflogArgs, repo_root: str, as_json: bool) -> int:
@@ -236,7 +269,7 @@ def handle_branches(command: BranchesArgs, repo_root: str, as_json: bool) -> int
 
 def handle_checkout(command: CheckoutArgs, repo_root: str, as_json: bool) -> int:
     repo = open_repository(repo_root)
-    repo.set_current_branch(command.name)
+    repo.checkout(command.name)
     if as_json:
         print(json.dumps({"branch": command.name}, indent=2))
     else:

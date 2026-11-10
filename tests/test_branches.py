@@ -117,3 +117,19 @@ def test_cli_branch_json_and_delete(tmp_path: Path, capsys) -> None:
         run_cli(["--repo", str(tmp_path), "--json", "branch", "-d", "feature/x"]) == 0
     )
     assert json.loads(capsys.readouterr().out) == {"deleted": "feature/x"}
+
+
+def test_deleted_branch_tombstone_does_not_block_hierarchical_name(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a.txt").write_text("a")
+    repo = create_repository(str(tmp_path))
+    repo.commit("base")
+    repo.branch("feature")
+    repo.delete_branch("feature")
+
+    # The tombstone is hidden from listings and no longer reserves the
+    # namespace, so a child branch can be created.
+    assert all(entry["branch"] != "feature" for entry in repo.branches())
+    repo.branch("feature/x")
+    assert repo.resolve_ref("feature/x")

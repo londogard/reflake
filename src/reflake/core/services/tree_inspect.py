@@ -3,9 +3,9 @@
 Split out of ``TreeWriter`` (``services/tree.py``) so write-path and
 read-path responsibilities live in separate classes:
 
-- ``TreeInspector`` — ``iter_tree_hashes`` / ``iter_leaf_refs`` (reachable-set
-  walks shared by GC and sync planning) plus ``export_derived_manifest``, the
-  optional client-side JSONL flattening of a tree.
+- ``TreeInspector`` — ``iter_tree_hashes`` (reachable-set walks shared by GC
+  and sync planning) plus ``export_derived_manifest``, the optional
+  client-side JSONL flattening of a tree.
 - ``TreeWriter`` keeps thin delegating methods with the same names so
   existing callers (``repository.gc``, sync planning, VFS) are unaffected.
 """
@@ -67,64 +67,6 @@ class TreeInspector:
             for entry in reversed(entries):
                 if entry.is_subtree:
                     stack.append(entry.hash)
-
-    def iter_leaf_refs(
-        self,
-        root_tree: str,
-        memo: dict[str, tuple[tuple[str | None, str | None], ...]] | None = None,
-    ) -> Iterator[tuple[str | None, str | None]]:
-        """Yield ``(blob_hash, footer_hash)`` for every leaf in the tree DAG.
-
-        Metadata-only leaves yield ``(None, None)`` — they reference no
-        canonical object. Used by GC to compute the reachable set.
-
-        Pass a shared *memo* to walk subtrees shared across commits only
-        once (GC over a DAG, sync planning over many commits).
-        """
-        from ..objects.tree import KIND_BLOB, KIND_BP
-
-        leaf_refs_memo: dict[str, tuple[tuple[str | None, str | None], ...]] = (
-            {} if memo is None else memo
-        )
-        yield from self._collect_leaf_refs(
-            root_tree, leaf_refs_memo, KIND_BLOB, KIND_BP
-        )
-
-    def _collect_leaf_refs(
-        self,
-        root_tree: str,
-        memo: dict[str, tuple[tuple[str | None, str | None], ...]],
-        kind_blob: str,
-        kind_bp: str,
-    ) -> tuple[tuple[str | None, str | None], ...]:
-        """Memoized, iterative collection of a tree's leaf references."""
-        stack = [root_tree]
-        while stack:
-            tree_hash = stack[-1]
-            if tree_hash in memo:
-                stack.pop()
-                continue
-            entries = self._walker.load_entries(tree_hash)
-            if entries is None:
-                memo[tree_hash] = ()
-                stack.pop()
-                continue
-            subtree_hashes = [entry.hash for entry in entries if entry.is_subtree]
-            unresolved = [h for h in subtree_hashes if h not in memo]
-            if unresolved:
-                stack.extend(unresolved)
-                continue
-            refs: list[tuple[str | None, str | None]] = []
-            for entry in entries:
-                if entry.is_subtree:
-                    refs.extend(memo[entry.hash])
-                elif entry.kind in (kind_blob, kind_bp):
-                    refs.append((entry.hash, entry.footer))
-                elif entry.footer is not None:
-                    refs.append((None, entry.footer))
-            memo[tree_hash] = tuple(refs)
-            stack.pop()
-        return memo[root_tree]
 
     # ── Structural diff ─────────────────────────────────────────────
 
@@ -243,7 +185,9 @@ class TreeInspector:
         if cache_path.exists():
             return cache_path
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(mode="wb", suffix=".jsonl", delete=False) as temp:
+        with NamedTemporaryFile(
+            mode="wb", suffix=".jsonl", dir=cache_path.parent, delete=False
+        ) as temp:
             temp_path = Path(temp.name)
         try:
             with temp_path.open("wb") as handle:

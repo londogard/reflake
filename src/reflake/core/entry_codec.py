@@ -167,9 +167,10 @@ class Entry:
     def is_verified(self) -> bool:
         """True when the entry is backed by a canonical content blob.
 
-        Pointer entries are *unverifiable*: their identity is derived from
-        path and size, not from content bytes. Use ``promote`` to read the
-        source blob, compute a content hash, and promote the entry.
+        Pointer entries are *unverifiable* in the canonical store: their
+        identity is a source-version marker plus size, and no blob is stored.
+        Use ``promote`` to read the source, store the bytes, and replace the
+        pointer with a content identity.
         """
         return self.identity_mode == "content"
 

@@ -4,6 +4,78 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and Reflake currently tracks changes before its first public alpha release.
 
+## [0.6.0] - 2026-11-10
+
+**Production-hardening pass from the 0.5.1 review.** No on-disk format change:
+tree/commit/staging encodings are unchanged, but pointer identities now use a
+source version (ETag or content digest) rather than mtime.
+
+### Fixed (data safety)
+
+- **Stat cache persistence.** `StatCache.save()` was never called, so every
+  CLI invocation re-hashed every file. It is now persisted on commit/status,
+  on `ReflakeRepository.close()`, and at process exit.
+- **GC keeps staged and reflog-only objects (same client).** Reachability now
+  includes staged content blobs/footers and the client reflog. A staged blob is
+  never pruned out from under `commit --staged`. In a shared repository these
+  roots are still client-local; the shared staging/undo lease design is in
+  `docs/staging-lease.md` and remains the P0 follow-up.
+- **Commit completeness.** `commit` re-materializes a missing staged blob from
+  its source or fails, instead of publishing a tree with dangling content.
+- **Sync repairs partial transfers.** Push/pull/fetch plan from the target
+  tip, so a crash after commits/trees but before blobs cannot advance a ref
+  over missing content. `--metadata-only` leaves a partial marker and the next
+  ordinary pull/fetch hydrates the blobs.
+- **Fresh-ref fast-forward.** `fast_forward_branch` reads the real ref, not a
+  cached client snapshot; a stale snapshot can no longer report up-to-date
+  while the shared ref is unborn.
+- **Verified reads.** Tree/footer reads re-hash bytes against their keys and
+  commit reads re-derive the commit id from `{message, tree, parents}`.
+  `fsck` reports tampered trees/commits.
+- **Durability/portability.** Local writes `fsync` file and directory, publish
+  trees/footers through a destination-directory temp (no `EXDEV` on tmpfs),
+  and honour `reflink_blobs`. POSIX is the supported platform.
+- **Worktree safety.** A full commit applies the staged overlay on top of the
+  worktree; a stale worktree after `checkout`/`merge`/`reset`/`pull` cannot
+  silently revert a committed path (`WorktreeStaleError`).
+- **Pointer identity purity.** Local pointer identity is a content digest, not
+  mtime; moves preserve identity and `identity verify --drift` no longer
+  reports a freshly committed local pointer as drifted.
+- Deleted branches are hidden from listings and no longer block hierarchical
+  names (`feature` tombstone → `feature/x`).
+- Local repositories are relocatable (`dataset_root` is informational).
+- Ref names from config/`repo.json`/HEAD are validated (no traversal).
+- `query scan "col = null"` is rejected (use `IS NULL`).
+- `status` no longer reports ignored, committed files as removed.
+- VFS is directory-aware (`ls`/`info`/`isdir`/`glob`/`find`) and supports
+  hierarchical refs.
+- Remote `must_exist=True` is honoured; opening is lazy by default.
+- S3 `DeleteObjects` checks per-key `Errors`.
+- `parquet_footer=true` fails early with an actionable error when pyarrow is
+  missing.
+- `cat` streams with a hash check; `query scan --json` streams its envelope;
+  sync transfer plans and the bounded executor stream items instead of
+  materializing every `TransferItem` (the s5cmd manifest path still batches).
+
+### Removed
+
+- The broken `transfer` CLI command (it emitted bare `cp` commands for S3 and
+  could not work). Use `push`/`pull` or a transfer backend directly.
+- Dead `iter_leaf_refs` memo machinery.
+- Windows-specific ref-locking code (POSIX-only support).
+
+### Changed
+
+- **One object-store core over a six-method KV surface.** Local and S3 now
+  share `objects/kv.py::KeyValueObjectStore` for commits, trees, footers,
+  refs, tags, listings, deletion, and tree queries. Adding a backend means
+  implementing `_kv_get/_put/_put_file/_delete/_list/_exists` (plus ranged
+  reads), not re-implementing refs/tags/GC key mapping.
+- CLI dispatch is a single command registry (`runner._COMMANDS`).
+- Tree-level three-way merge lives in `services/tree_merge.py`.
+- `ObjectStore` no longer claims both local-path and remote-URI capabilities;
+  no adapter has both.
+
 ## [0.5.1] - 2026-10-21
 
 ### Added

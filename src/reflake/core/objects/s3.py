@@ -21,6 +21,7 @@ from ..entry_codec import Entry
 from ..layout import object_relative_key, ref_relative_key
 from . import multipart
 from .backends import BlobTransferBackend
+from .kv import KeyValueObjectStore
 from .query import TreeCache, TreeWalker
 from .source import (
     _mtime_ns,
@@ -37,7 +38,7 @@ def _client_error() -> type[BaseException]:
     return optional_import("botocore.exceptions", extra="s3").ClientError
 
 
-class S3ObjectStore:
+class S3ObjectStore(KeyValueObjectStore):
     def __init__(
         self,
         bucket: str,
@@ -67,123 +68,123 @@ class S3ObjectStore:
     def object_uri(self, kind: RepositoryObjectKind, object_id: str) -> str:
         return f"s3://{self.bucket}/{self._key(kind, object_id)}"
 
-    def read_commit_bytes(self, commit_id: str) -> bytes | None:
+    # ── KV primitives (keys already include the repo prefix) ────────────
+
+    def _kv_path(self, key: str) -> Path | None:
+        return None
+
+    def _kv_uri(self, key: str) -> str | None:
+        return f"s3://{self.bucket}/{key}"
+
+    def _kv_get(self, key: str) -> bytes | None:
         try:
-            response = self.client.get_object(
-                Bucket=self.bucket,
-                Key=self._key("commit", commit_id),
-            )
+            response = self.client.get_object(Bucket=self.bucket, Key=key)
         except _client_error() as error:
             if self._missing(error):
                 return None
-            raise self._translate(error, "read_commit_bytes") from error
+            raise self._translate(error, "get_object") from error
         return response["Body"].read()
 
-    def write_commit_bytes(
-        self,
-        commit_id: str,
-        payload: bytes,
-        *,
-        if_missing: bool = False,
-    ) -> None:
-        kwargs = {
+    def _kv_put(
+        self, key: str, payload: bytes, *, if_absent: bool = False
+    ) -> bool:
+        kwargs: dict[str, Any] = {
             "Bucket": self.bucket,
-            "Key": self._key("commit", commit_id),
+            "Key": key,
             "Body": payload,
         }
-        if if_missing:
+        if if_absent:
             kwargs["IfNoneMatch"] = "*"
         try:
             self.client.put_object(**kwargs)
         except _client_error() as error:
-            if if_missing and self._precondition_failed(error):
-                raise OptimisticLockError(
-                    f"Commit already exists: {commit_id}"
-                ) from error
-            raise self._translate(error, "write_commit_bytes") from error
+            if if_absent and self._precondition_failed(error):
+                return False
+            raise self._translate(error, "put_object") from error
+        return True
 
-    def read_tree_bytes(self, tree_hash: str) -> bytes | None:
+    def _kv_put_file(
+        self, key: str, source: Path, *, if_absent: bool = False
+    ) -> bool:
+        with source.open("rb") as handle:
+            try:
+                self._put_stream(
+                    key=key,
+                    body=handle,
+                    if_missing=if_absent,
+                    error_message=f"Object already exists: {key}",
+                )
+            except OptimisticLockError:
+                return False
+        return True
+
+    def _kv_delete(self, keys: Iterable[str]) -> int:
+        ids = list(keys)
+        deleted = 0
+        for start in range(0, len(ids), self._DELETE_BATCH_SIZE):
+            batch = ids[start : start + self._DELETE_BATCH_SIZE]
+            try:
+                response = self.client.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={
+                        "Objects": [{"Key": key} for key in batch],
+                        "Quiet": True,
+                    },
+                )
+            except _client_error() as error:
+                raise self._translate(error, "delete_objects") from error
+            errors = response.get("Errors") or []
+            if errors:
+                first = errors[0]
+                if isinstance(first, dict):
+                    detail = f"{first.get('Key', '?')}: {first.get('Message', '?')}"
+                else:
+                    detail = str(first)
+                raise StorageUnavailableError(
+                    f"delete_objects: {len(errors)} key(s) failed ({detail})"
+                )
+            deleted += len(batch)
+        return deleted
+
+    def _kv_list(self, prefix: str) -> Iterator[tuple[str, int]]:
+        paginator = self.client.get_paginator("list_objects_v2")
+        try:
+            pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+            for page in pages:
+                for obj in page.get("Contents", []):
+                    key = str(obj["Key"])
+                    yield key, _mtime_ns(obj.get("LastModified"))
+        except _client_error() as error:
+            raise self._translate(error, "list_objects") from error
+
+    def _kv_exists(self, key: str) -> bool:
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except _client_error() as error:
+            if self._missing(error):
+                return False
+            raise self._translate(error, "object_exists") from error
+
+    def _kv_read_range(self, key: str, offset: int, length: int) -> bytes:
+        if length <= 0:
+            return b""
         try:
             response = self.client.get_object(
                 Bucket=self.bucket,
-                Key=self._key("tree", tree_hash),
+                Key=key,
+                Range=f"bytes={offset}-{offset + length - 1}",
             )
         except _client_error() as error:
-            if self._missing(error):
-                return None
-            raise self._translate(error, "read_tree_bytes") from error
+            raise self._translate(error, "read_blob_range") from error
         return response["Body"].read()
 
-    def write_tree_bytes(
-        self,
-        tree_hash: str,
-        payload: bytes,
-        *,
-        if_missing: bool = True,
-    ) -> None:
-        try:
-            self._put_stream(
-                key=self._key("tree", tree_hash),
-                body=payload,
-                if_missing=if_missing,
-                error_message=f"Tree already exists: {tree_hash}",
-            )
-        except OptimisticLockError:
-            if if_missing:
-                return
-            raise
 
-    def write_tree_file(
-        self,
-        tree_hash: str,
-        source_path: str | Path,
-        *,
-        if_missing: bool = True,
-    ) -> None:
-        with Path(source_path).open("rb") as handle:
-            try:
-                self._put_stream(
-                    key=self._key("tree", tree_hash),
-                    body=handle,
-                    if_missing=if_missing,
-                    error_message=f"Tree already exists: {tree_hash}",
-                )
-            except OptimisticLockError:
-                if if_missing:
-                    return
-                raise
 
-    def read_footer_bytes(self, footer_hash: str) -> bytes | None:
-        try:
-            response = self.client.get_object(
-                Bucket=self.bucket,
-                Key=self._key("footer", footer_hash),
-            )
-        except _client_error() as error:
-            if self._missing(error):
-                return None
-            raise self._translate(error, "read_footer_bytes") from error
-        return response["Body"].read()
 
-    def write_footer_file(
-        self,
-        footer_hash: str,
-        source_path: str | Path,
-        *,
-        if_missing: bool = True,
-    ) -> None:
-        with Path(source_path).open("rb") as handle:
-            try:
-                self._put_stream(
-                    key=self._key("footer", footer_hash),
-                    body=handle,
-                    if_missing=if_missing,
-                    error_message=f"Footer already exists: {footer_hash}",
-                )
-            except OptimisticLockError:
-                if if_missing:
-                    return
-                raise
+
+
+
 
     def iter_all_entries(self, tree_hash: str) -> Iterator[Entry]:
         yield from self._walker.iter_all_entries(tree_hash)
@@ -278,133 +279,23 @@ class S3ObjectStore:
 
     # ── Tags ─────────────────────────────────────────────────────────────
 
-    def read_tag_ref(self, tag: str) -> str | None:
-        try:
-            response = self.client.get_object(
-                Bucket=self.bucket, Key=self._ref_key("tags", tag)
-            )
-        except _client_error() as error:
-            if self._missing(error):
-                return None
-            raise self._translate(error, "read_tag_ref") from error
-        return response["Body"].read().decode("utf-8").strip() or None
 
-    def create_tag_ref(self, tag: str, commit_id: str) -> bool:
-        # Create-only: ``IfNoneMatch="*"`` makes concurrent creates atomic,
-        # so an existing tag is never retargeted (tags are immutable).
-        try:
-            self.client.put_object(
-                Bucket=self.bucket,
-                Key=self._ref_key("tags", tag),
-                Body=f"{commit_id}\n".encode(),
-                IfNoneMatch="*",
-            )
-        except _client_error() as error:
-            if self._precondition_failed(error):
-                return False
-            raise self._translate(error, "create_tag_ref") from error
-        return True
 
-    def delete_tag_ref(self, tag: str) -> None:
-        try:
-            self.client.delete_object(
-                Bucket=self.bucket, Key=self._ref_key("tags", tag)
-            )
-        except _client_error() as error:
-            raise self._translate(error, "delete_tag_ref") from error
 
-    def iter_tags(self) -> Iterator[str]:
-        prefix = self._ref_key("tags")
-        paginator = self.client.get_paginator("list_objects_v2")
-        try:
-            pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
-            for page in pages:
-                for obj in page.get("Contents", []):
-                    key = str(obj["Key"])
-                    yield key[len(prefix) :] if key.startswith(prefix) else key
-        except _client_error() as error:
-            raise self._translate(error, "list_objects") from error
 
     def _blob_uri(self, blob_hash: str) -> str:
         return f"s3://{self.bucket}/{self._key('blob', blob_hash)}"
 
     # ── Enumeration (GC) ────────────────────────────────────────────────
 
-    def iter_branches(self) -> Iterator[str]:
-        prefix = self._key("ref", "")
-        paginator = self.client.get_paginator("list_objects_v2")
-        try:
-            pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
-            for page in pages:
-                for obj in page.get("Contents", []):
-                    key = str(obj["Key"])
-                    relative = key[len(prefix) :] if key.startswith(prefix) else key
-                    yield relative
-        except _client_error() as error:
-            raise self._translate(error, "list_objects") from error
 
-    def iter_object_ids(self, kind: RepositoryObjectKind) -> Iterator[str]:
-        for object_id, _ in self.iter_object_ids_with_mtimes(kind):
-            yield object_id
 
-    def iter_object_ids_with_mtimes(
-        self, kind: RepositoryObjectKind
-    ) -> Iterator[tuple[str, int]]:
-        if kind == "blob":
-            prefix = self._key("blob", "")
-            for key, mtime_ns in self._iter_keys_with_mtimes(prefix):
-                relative = key[len(prefix) :] if key.startswith(prefix) else key
-                yield relative.replace("/", ""), mtime_ns
-        elif kind in ("tree", "footer"):
-            prefix = self._key(kind, "")
-            for key, mtime_ns in self._iter_keys_with_mtimes(prefix):
-                relative = key[len(prefix) :] if key.startswith(prefix) else key
-                yield relative, mtime_ns
-        elif kind == "commit":
-            prefix = self._key("commit", "")
-            for key, mtime_ns in self._iter_keys_with_mtimes(prefix):
-                name = key.rsplit("/", 1)[-1]
-                if name.endswith(".json"):
-                    yield name[: -len(".json")], mtime_ns
 
     #: S3 ``DeleteObjects`` accepts at most 1000 keys per request.
     _DELETE_BATCH_SIZE = 1000
 
-    def delete_objects(
-        self, kind: RepositoryObjectKind, object_ids: Iterable[str]
-    ) -> int:
-        ids = list(object_ids)
-        deleted = 0
-        for start in range(0, len(ids), self._DELETE_BATCH_SIZE):
-            batch = ids[start : start + self._DELETE_BATCH_SIZE]
-            try:
-                self.client.delete_objects(
-                    Bucket=self.bucket,
-                    Delete={
-                        "Objects": [
-                            {"Key": self._key(kind, object_id)} for object_id in batch
-                        ],
-                        "Quiet": True,
-                    },
-                )
-            except _client_error() as error:
-                raise self._translate(error, "delete_objects") from error
-            deleted += len(batch)
-        return deleted
 
-    def _iter_keys(self, prefix: str) -> Iterator[str]:
-        paginator = self.client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
-        for page in pages:
-            for obj in page.get("Contents", []):
-                yield str(obj["Key"])
 
-    def _iter_keys_with_mtimes(self, prefix: str) -> Iterator[tuple[str, int]]:
-        paginator = self.client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
-        for page in pages:
-            for obj in page.get("Contents", []):
-                yield str(obj["Key"]), _mtime_ns(obj.get("LastModified"))
 
     # ── Blob operations ───────────────────────────────────────────────────
 
@@ -436,18 +327,6 @@ class S3ObjectStore:
             raise self._translate(error, "open_blob") from error
         return response["Body"]
 
-    def read_blob_range(self, blob_hash: str, offset: int, length: int) -> bytes:
-        if length <= 0:
-            return b""
-        try:
-            response = self.client.get_object(
-                Bucket=self.bucket,
-                Key=self._key("blob", blob_hash),
-                Range=f"bytes={offset}-{offset + length - 1}",
-            )
-        except _client_error() as error:
-            raise self._translate(error, "read_blob_range") from error
-        return response["Body"].read()
 
     def write_blob_file(
         self,
@@ -619,35 +498,7 @@ class S3ObjectStore:
 
         return f"{self.prefix}/{REPO_FORMAT_KEY}" if self.prefix else REPO_FORMAT_KEY
 
-    def read_repo_format_bytes(self) -> bytes | None:
-        try:
-            response = self.client.get_object(
-                Bucket=self.bucket, Key=self._repo_format_key()
-            )
-        except _client_error() as error:
-            if self._missing(error):
-                return None
-            raise self._translate(error, "read_repo_format_bytes") from error
-        return response["Body"].read()
 
-    def write_repo_format_bytes(
-        self, payload: bytes, *, if_missing: bool = True
-    ) -> None:
-        # Create-only by default: concurrent `init`s must not retarget an
-        # existing repository's format, and identical payloads are harmless.
-        kwargs: dict[str, Any] = {
-            "Bucket": self.bucket,
-            "Key": self._repo_format_key(),
-            "Body": payload,
-        }
-        if if_missing:
-            kwargs["IfNoneMatch"] = "*"
-        try:
-            self.client.put_object(**kwargs)
-        except _client_error() as error:
-            if if_missing and self._precondition_failed(error):
-                return
-            raise self._translate(error, "write_repo_format_bytes") from error
 
     def object_exists(self, kind: RepositoryObjectKind, object_id: str) -> bool:
         if kind == "blob" and self._blob_transfer is not None:

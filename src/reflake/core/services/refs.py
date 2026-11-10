@@ -6,10 +6,12 @@ read and every mutation flows through one consistent place.
 
 from __future__ import annotations
 
+import json
 from collections import OrderedDict
 from typing import Any
 
 import msgspec
+from blake3 import blake3
 
 from ..client_state import LocalClientState
 from ..domain import (
@@ -154,6 +156,10 @@ class RefManager:
         for other in others:
             if other == name:
                 continue
+            if kind == "branch":
+                state = self.store.read_branch_ref(other)
+                if state is None or state.commit_id is None:
+                    continue  # deleted branch tombstone: name is free again
             if other.startswith(prefix) or name.startswith(f"{other}/"):
                 raise ValueError(
                     f"{kind.capitalize()} name '{name}' conflicts with existing "
@@ -234,12 +240,32 @@ class RefManager:
             data = msgspec.json.decode(commit_payload)
             raw_generation = data.get("generation")
             generation = None if raw_generation is None else int(raw_generation)
+            message = str(data["message"])
+            tree = str(data["tree"])
+            parents = tuple(str(p) for p in (data.get("parents") or []))
+            stored_id = str(data["id"])
+            created_at = str(data["created_at"])
+            # Content addressing is only a guarantee if the identity is
+            # re-derived on read. The commit file name is not enough: shared
+            # buckets are untrusted input, and a mutated message/tree must not
+            # be reported as a valid commit.
+            canonical = json.dumps(
+                {"message": message, "tree": tree, "parents": list(parents)},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            computed_id = blake3(canonical).hexdigest()
+            if stored_id != commit_id or computed_id != commit_id:
+                raise ValueError(
+                    "commit id does not match its content "
+                    f"(stored={stored_id}, computed={computed_id})"
+                )
             commit = CommitObject(
-                id=str(data["id"]),
-                message=str(data["message"]),
-                tree=str(data["tree"]),
-                parents=tuple(str(p) for p in (data.get("parents") or [])),
-                created_at=str(data["created_at"]),
+                id=commit_id,
+                message=message,
+                tree=tree,
+                parents=parents,
+                created_at=created_at,
                 generation=generation,
             )
         except (
@@ -260,6 +286,11 @@ class RefManager:
     def cache_commit(self, commit: CommitObject) -> None:
         """Insert a freshly created commit into the cache."""
         self._commit_cache[commit.id] = commit
+
+    def clear_commit_cache(self) -> None:
+        """Drop cached commits (fsck must re-verify bytes on disk)."""
+        self._commit_cache.clear()
+        self._generations = _GenerationProvider(self.read_commit)
 
     def ensure_branch_exists(self, branch: str) -> None:
         """Validate that *branch* can be operated on.
@@ -322,9 +353,14 @@ class RefManager:
         *,
         operation: str,
     ) -> bool:
-        """Advance a branch only if its current head is an ancestor of target."""
-        branch_state = self.require_branch_state(branch)
-        current_commit = branch_state.commit_id
+        """Advance a branch only if its current head is an ancestor of target.
+
+        The *real* ref is read here, never the client snapshot: a snapshot is
+        only an expectation for retries, and using it as the current state can
+        silently report "up to date" while the shared ref is unborn or behind.
+        """
+        current_state = self.store.read_branch_ref(branch)
+        current_commit = current_state.commit_id if current_state else None
         if current_commit == target_commit:
             return False
         if current_commit and not self.is_ancestor(

@@ -82,13 +82,12 @@ class EntryFactory:
                 continue
             if not matches_import_patterns(relative_path, normalized_patterns):
                 continue
+            marker: str | None = None
             if identity_mode == "content":
                 identity_value = self.store_blob_from_source_uri(obj.source_uri)
             elif identity_mode == "pointer":
-                identity_value = pointer_identity(
-                    size=obj.size,
-                    marker=obj.etag or f"mtime:{obj.mtime_ns}",
-                )
+                marker = self.source_marker(obj.source_uri, etag=obj.etag)
+                identity_value = pointer_identity(size=obj.size, marker=marker)
             else:
                 raise ValueError("identity_mode must be one of: content, pointer")
             yield Entry.with_identity(
@@ -98,7 +97,7 @@ class EntryFactory:
                 identity_mode,
                 source_uri=obj.source_uri,
                 footer=self._capture_footer(obj.source_uri, obj.size),
-                source_etag=obj.etag,
+                source_etag=marker,
             )
 
     def entry_from_working_path(
@@ -114,15 +113,15 @@ class EntryFactory:
         stat = source_path.stat()
         source_uri = source_path.as_uri()
         footer = self._capture_footer(source_uri, stat.st_size)
+        marker: str | None = None
         if identity_mode == "content":
             identity_value = blake3_digest_file(source_path)
             if store_blob:
                 self.store_blob(source_path, identity_value)
         elif identity_mode == "pointer":
-            identity_value = pointer_identity(
-                size=stat.st_size,
-                marker=f"mtime:{stat.st_mtime_ns}",
-            )
+            digest = blake3_digest_file(source_path)
+            marker = f"blake3:{digest}"
+            identity_value = pointer_identity(size=stat.st_size, marker=marker)
         else:
             raise ValueError("identity_mode must be one of: content, pointer")
         return Entry.with_identity(
@@ -132,6 +131,7 @@ class EntryFactory:
             identity_mode,
             source_uri=source_uri if identity_mode == "pointer" else None,
             footer=footer,
+            source_etag=marker if identity_mode == "pointer" else None,
         )
 
     def entry_from_stage_change(
@@ -162,22 +162,17 @@ class EntryFactory:
                 source_etag=change.source_etag,
             )
         if mode == "pointer" and change.size is not None and change.source_uri:
+            marker = change.source_etag
+            if marker is None:
+                marker = self.source_marker(change.source_uri)
             return Entry.with_identity(
                 change.path,
-                pointer_identity(
-                    size=change.size,
-                    marker=change.source_etag
-                    or (
-                        f"mtime:{change.mtime_ns}"
-                        if change.mtime_ns is not None
-                        else None
-                    ),
-                ),
+                pointer_identity(size=change.size, marker=marker),
                 change.size,
                 "pointer",
                 source_uri=change.source_uri,
                 footer=change.footer,
-                source_etag=change.source_etag,
+                source_etag=marker,
             )
         # Fallback (hand-built staging, or a change staged by an older
         # client): materialize from the source.
@@ -207,13 +202,14 @@ class EntryFactory:
     ) -> Entry:
         metadata = describe_source_uri(source_uri, client=source_client(self.store))
         footer = self._capture_footer(source_uri, metadata.size)
+        marker: str | None = None
         if identity_mode == "content":
             identity_value = self.store_blob_from_source_uri(source_uri)
         elif identity_mode == "pointer":
-            identity_value = pointer_identity(
-                size=metadata.size,
-                marker=metadata.etag or f"mtime:{metadata.mtime_ns}",
+            marker = self.source_marker(
+                source_uri, etag=metadata.etag, client=source_client(self.store)
             )
+            identity_value = pointer_identity(size=metadata.size, marker=marker)
         else:
             raise ValueError("identity_mode must be one of: content, pointer")
         return Entry.with_identity(
@@ -223,8 +219,31 @@ class EntryFactory:
             identity_mode,
             source_uri=metadata.source_uri if identity_mode == "pointer" else None,
             footer=footer,
-            source_etag=metadata.etag if identity_mode == "pointer" else None,
+            source_etag=marker,
         )
+
+    def source_marker(
+        self,
+        source_uri: str,
+        *,
+        etag: str | None = None,
+        client: object | None = None,
+    ) -> str:
+        """Immutable source-version marker for a pointer entry.
+
+        S3 objects use their ETag (cheap metadata). Local and fsspec sources
+        use a content digest: mtime is not an identity, because the same
+        bytes on two machines, or after a `touch`, must not produce a
+        different tree. The digest is computed once at ingest and stored on
+        the entry; no canonical blob is written.
+        """
+        if source_uri.startswith("s3://") and etag:
+            return etag
+        hasher = blake3()
+        with open_source_uri(source_uri, client=client) as source:
+            while chunk := source.read(DEFAULT_CHUNK_SIZE):
+                hasher.update(chunk)
+        return f"blake3:{hasher.hexdigest()}"
 
     def store_blob(self, source_file: Path, content_hash: str) -> None:
         self.store.write_blob_file(content_hash, source_file, if_missing=True)

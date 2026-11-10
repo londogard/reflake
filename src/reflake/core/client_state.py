@@ -28,6 +28,7 @@ class LocalClientState:
         self.refs_dir = self.reflake_dir / "refs"
         self.state_dir = self.reflake_dir / "state"
         self.branch_state_dir = self.state_dir / "branch-snapshots"
+        self.partial_dir = self.state_dir / "partial"
         self.staging_dir = self.reflake_dir / "staging"
         self.cache_dir = self.reflake_dir / "cache"
         self.reflog_dir = self.reflake_dir / "reflog"
@@ -38,6 +39,7 @@ class LocalClientState:
             self.refs_dir,
             self.state_dir,
             self.branch_state_dir,
+            self.partial_dir,
             self.staging_dir,
             self.cache_dir,
             self.reflog_dir,
@@ -70,6 +72,49 @@ class LocalClientState:
             if raw.strip():
                 yield raw
 
+    def iter_staged_changes(self) -> Iterator[dict[str, object]]:
+        """Every staged change in client scope (all branches), best effort.
+
+        GC must treat staged content as a root: ``add`` publishes a blob
+        before the commit that makes it reachable, and a staged import can
+        legitimately outlive the prune grace window. A corrupt staging file is
+        ignored here (it cannot make a live ref unreachable; the ordinary
+        command path reports the decode error).
+        """
+        if not self.staging_dir.is_dir():
+            return
+        for path in sorted(self.staging_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(payload, list):
+                for change in payload:
+                    if isinstance(change, dict):
+                        yield change
+
+    def iter_reflog_commit_ids(self) -> Iterator[str]:
+        """Commit ids mentioned by the client reflog (undo/redo roots).
+
+        The reflog is client-local and never synced; a local ``gc`` on the
+        same client must not prune a commit the user can still reset to.
+        """
+        if not self.reflog_dir.is_dir():
+            return
+        zero = "0" * 64
+        for path in sorted(self.reflog_dir.glob("*.log")):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                parts = line.split(" ", 3)
+                if len(parts) < 3:
+                    continue
+                for commit_id in parts[:2]:
+                    if commit_id and commit_id != zero:
+                        yield commit_id
+
     def derived_manifest_path(self, tree_hash: str) -> Path:
         """Path of the cached derived manifest for *tree_hash*.
 
@@ -79,6 +124,9 @@ class LocalClientState:
         return self.cache_dir / "derived" / f"{tree_hash}.jsonl"
 
     def ensure_current_branch(self, default_branch: str) -> None:
+        from .repository_support import validate_branch_name
+
+        default_branch = validate_branch_name(default_branch)
         if not self.head_path.exists():
             self.set_current_branch(default_branch)
 
@@ -86,9 +134,15 @@ class LocalClientState:
         content = self.head_path.read_text(encoding="utf-8").strip()
         if not content.startswith("refs/heads/"):
             raise ValueError("HEAD must be a symbolic ref under refs/heads/")
-        return content.split("refs/heads/", maxsplit=1)[1]
+        branch = content.split("refs/heads/", maxsplit=1)[1]
+        from .repository_support import validate_branch_name
+
+        return validate_branch_name(branch)
 
     def set_current_branch(self, branch: str) -> None:
+        from .repository_support import validate_branch_name
+
+        branch = validate_branch_name(branch)
         self._atomic_write_text(self.head_path, f"refs/heads/{branch}\n")
 
     def read_staging_payload(self, branch: str) -> str | None:
@@ -136,6 +190,47 @@ class LocalClientState:
 
     def stage_path(self, branch: str) -> Path:
         return self.staging_dir / f"{encode_branch_name(branch)}.json"
+
+    def partial_path(self, branch: str) -> Path:
+        """Marker for a metadata-only pull/fetch waiting for blob hydration."""
+        return self.partial_dir / f"{encode_branch_name(branch)}.json"
+
+    def stale_path(self, branch: str) -> Path:
+        return self.state_dir / "worktree-stale" / f"{encode_branch_name(branch)}.json"
+
+    def mark_worktree_stale(
+        self, branch: str, *, previous_commit_id: str | None = None
+    ) -> None:
+        payload = json.dumps({"previous_commit_id": previous_commit_id}) + "\n"
+        self._atomic_write_text(self.stale_path(branch), payload)
+
+    def clear_worktree_stale(self, branch: str) -> None:
+        self.stale_path(branch).unlink(missing_ok=True)
+
+    def is_worktree_stale(self, branch: str) -> bool:
+        return self.stale_path(branch).exists()
+
+    def stale_previous_commit(self, branch: str) -> str | None:
+        path = self.stale_path(branch)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("previous_commit_id")
+        return value if isinstance(value, str) else None
+
+    def mark_partial(self, branch: str) -> None:
+        self._atomic_write_text(self.partial_path(branch), "{}\n")
+
+    def clear_partial(self, branch: str) -> None:
+        self.partial_path(branch).unlink(missing_ok=True)
+
+    def is_partial(self, branch: str) -> bool:
+        return self.partial_path(branch).exists()
 
     def _atomic_write_text(self, path: Path, payload: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

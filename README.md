@@ -45,7 +45,7 @@ Reflake separates data into three layers:
 | **Commit** | `{tree, parents[], message}` — parents form a real DAG, so merges are first-class. The commit id hashes only content, so identical content yields identical ids across branches. |
 | **Branch** | A pointer updated with compare-and-swap on the commit id (S3 conditional writes) — safe under concurrent clients without locks. |
 | **Staging** | Per-client, per-branch overlay of adds/removes applied onto the parent tree by `commit --staged`. |
-| **Identity modes** | `content` (content hash, default) or `pointer` (path+size reference, unverifiable until promoted). |
+| **Identity modes** | `content` (content hash, default) or `pointer` (source-version reference; no canonical blob until promoted). |
 
 ### Command map
 
@@ -61,7 +61,7 @@ command: `reflake --repo <uri> commit -m x` and `reflake commit -m x --repo
 | Branch | `branch [-d]`, `tag <name> [-d] [-l]`, `checkout`, `merge` (fast-forward + 3-way metadata merge), `reset` (undo/redo) |
 | Mutate | `rm [--keep-worktree]`, `mv [--keep-worktree]`, `gc [--prune] [--grace-seconds N]`, `restore [<path>...] [--ref]` |
 | Audit | `fsck [--ref] [--verify-blobs]` — refs → commits → trees → leaves, object existence, optional byte verification |
-| Sync | `push`, `pull [--metadata-only]`, `fetch [--metadata-only]`, `clone`, `transfer` |
+| Sync | `push`, `pull [--metadata-only]`, `fetch [--metadata-only]`, `clone` |
 | Analyze | `query build` (DuckDB/Parquet), `query scan` (pruned reads; `--explain` for the plan only) |
 
 Worktree walks honor `.reflakeignore` (plus built-in `.reflake/` and `.git/`)
@@ -88,6 +88,12 @@ repository ref/object. Every command with structured output honors `--json`.
 - `blake3` for hashing, `msgspec` for the object codec
 - Merkle trees + JSONL commit/tree objects
 - Optional: `boto3` (S3), `duckdb` + `pyarrow` (query), `fsspec` (VFS)
+
+## Platform support
+
+Reflake supports POSIX platforms (Linux, macOS). Windows is not supported:
+the local ref lock and atomic publish paths are POSIX-specific. The S3 backend
+itself is platform-independent.
 
 ## Install
 
@@ -189,14 +195,16 @@ Reflake supports two identity modes for entries:
 Set the mode per staged addition with `reflake add --identity pointer`, or set the
 repository-wide default for `reflake commit` with `reflake config set identity pointer`.
 
-This is useful for large bootstrap imports where strong content verification can be deferred.
+This is useful for large bootstrap imports where copying bytes into the canonical store can be deferred.
 
 ### Durability contract for `pointer`
 
-Pointer (`pointer`) revisions are **unverifiable**: the entry's
-identity is derived from path and size, not from content bytes. Until you run
-`reflake identity promote`, Reflake cannot prove that the content at
-`source_uri` matches what was originally imported.
+Pointer (`pointer`) revisions have **no canonical bytes**: the entry's
+identity is the source version (ETag or content digest), and Reflake has not
+stored the content. Until you run `reflake identity promote`, Reflake cannot
+prove that the content at `source_uri` is still the imported content. Drift
+detection can compare a local content digest or an S3 ETag, but only promotion
+creates a canonical, verifiable blob.
 
 **Warnings.** The CLI emits a warning to stderr whenever you stage with
 `--identity pointer` or commit a repository whose identity is configured to `pointer`,
@@ -225,21 +233,20 @@ retention requirement is lifted for those entries.
 
 ### Drift detection (metadata-only)
 
-Pointer entries imported from S3 record the source object's size,
-last-modified time, and ETag (the optional trailing field on `m`/`mp` tree
-lines). `reflake identity verify --drift` then compares those recorded values
-against the source with **one metadata request per entry — never a byte
-read**, and exits non-zero when a source was overwritten, resized, or
-deleted:
+Pointer entries record a source version marker (an S3 ETag, or a content
+digest for local/fsspec sources). `reflake identity verify --drift` compares
+that marker against the source: metadata-only for S3, a content re-read for
+local files (because mtime is not an identity), and exits non-zero when a
+source was overwritten, resized, or deleted:
 
 ```bash
 uv run reflake --repo s3://my-bucket/datasets/demo identity verify --drift
 ```
 
-Drift detection is a best-effort metadata comparison (local-file sources have
-no ETag, so size + mtime are used there); it proves *change*, not content
-equality. `identity promote` remains the only way to make a pointer entry
-verifiable.
+Drift detection proves *change*, not canonical equality: S3 uses metadata,
+local sources use a content digest, and an entry without a stored marker
+(legacy) is reported as unchecked rather than falsely drifted. `identity
+promote` remains the only way to make a pointer entry canonically verifiable.
 
 ## Identity: Audit And Promotion
 
@@ -296,6 +303,10 @@ uv run reflake --repo /tmp/reflake-demo merge feature main
 - The source ref can be a branch or commit; the target must be a branch.
 - Fast-forward when the target head is an ancestor of the source.
 - **Diverged histories get a metadata-only three-way merge** against the merge base: one-sided changes win, identical additions are kept, and conflicts raise `MergeConflictError` listing the paths. Merge commits record both parents.
+- `merge`, `reset`, `checkout`, and `pull` move refs without materializing the
+  worktree. A later full `commit` refuses to overwrite a committed path from
+  that stale worktree (`WorktreeStaleError`); run `reflake restore --force` or
+  use `commit --staged`.
 - Ancestry checks walk the full parent DAG, so merged branches fast-forward, push, and pull correctly afterwards.
 
 ## Metadata-Only Remove And Move
@@ -338,7 +349,9 @@ external file explicitly with `add --as`.
 client-local symbolic ref); it never rewrites the working tree. Materializing
 data is an explicit, separate step: `restore [<path>...]` (optionally `--ref <ref>`),
 `pull`, `cat`, or the read-only VFS. Files are only ever downloaded because you
-asked for them.
+asked for them. A full `commit` after checkout refuses to overwrite or
+resurrect paths from the previous branch's worktree (`WorktreeStaleError`);
+use `restore --force` or `commit --staged`.
 
 ### Staging semantics: `add` snapshots content
 
@@ -424,6 +437,10 @@ uv run reflake --repo . fetch s3://my-bucket/datasets/demo
 ```
 
 - Objects transfer plan-first: the exact missing set (commits, trees, footers, blobs) is computed, then executed via `boto3` per-object or batched through [`s5cmd`](https://github.com/peak/s5cmd) when configured (`config set transfer_backend s5cmd`).
+- Every push/pull/fetch plans from the target tip, so a previous interrupted
+  transfer is repaired before the ref moves. A `--metadata-only` pull/fetch
+  leaves a client-local partial marker; the next ordinary pull/fetch hydrates
+  the missing blobs even when the branch heads already match.
 - Planning is adaptive: small plans probe object existence one by one; plans over ~64 objects list the destination's object ids once per kind instead of issuing N HEAD requests.
 - Divergent history is rejected before any bytes move (`NonFastForwardError`); the final ref update is a CAS, so concurrent pushes surface conflicts instead of overwriting.
 - Push after a local merge transfers the entire merged lineage, including both parents' commits.
@@ -520,8 +537,9 @@ not to the size of the tree:
   reading shard bodies only where both sides changed the same range.
 - A client-local **stat cache** (`path -> size, mtime, digest`) makes
   `status` and `commit` O(changes): unchanged files are never opened. It is
-  on by default (`config set stat_cache false` forces a full re-hash) and can
-  be deleted at any time — it is only an accelerator.
+  on by default, persisted at command exit (and by `ReflakeRepository.close()`),
+  `config set stat_cache false` forces a full re-hash, and it can be deleted at
+  any time — it is only an accelerator.
 - Commits read each new file **once**: hashing and publishing happen in the
   same pass (local stores additionally publish blobs as copy-on-write clones
   on APFS/btrfs/XFS). Blob writes, transfers, restores and multipart parts run
@@ -544,7 +562,7 @@ with fs.open("reflake://my_data@feature+staged/a.txt", "rb") as handle:
     staged_data = handle.read()
 ```
 
-In `pointer` snapshots, Reflake reads from `source_uri` when no canonical `blobs/` object exists.
+In `pointer` snapshots, Reflake reads from `source_uri` when no canonical `blobs/` object exists. The VFS is directory-aware (`ls`, `isdir`, `glob`, `find`) and accepts hierarchical refs either literally (`reflake://ds@feature/x/file`) or encoded (`feature%2Fx`).
 
 ### DuckDB over `reflake://`
 
@@ -614,7 +632,9 @@ Reflake creates `.reflake/` under each dataset root:
 - `refs/tags/` - immutable tag pointers (create-only, never retargeted)
 - `refs/HEAD` - **client-local** symbolic active branch reference (never shared)
 - `state/` - client-local branch snapshots (never shared, never a ref)
-- `staging/`, `cache/` (stat cache), `index/`, `reflog/` - client-local state
+- `staging/`, `cache/` (stat cache), `index/`, `reflog/`, `state/` - client-local state
+- `state/partial/` - metadata-only pull/fetch markers awaiting blob hydration
+- `state/worktree-stale/` - ref moves whose worktree still needs `restore`
 
 Every object kind has exactly one physical location, defined by
 `layout.object_relative_key()` — the local filesystem and the S3 key space are
@@ -633,6 +653,7 @@ uv run reflake --repo /tmp/reflake-demo fsck --verify-blobs   # also re-hash eve
 ```
 
 `fsck` resolves every branch and tag, walks the commit and tree DAGs,
+re-derives every commit id, re-hashes every tree node against its key,
 re-parses every node (sorted, duplicate-free, single-component names), and
 checks that every referenced commit/tree/blob/footer object exists. Existence
 checks adapt like sync planning: per-object probes for small reachable sets,
@@ -655,22 +676,32 @@ than a grace window (`gc_grace_seconds`, default 24h; override with
 *before* it CASes its ref: without the window, mark-and-sweep would race that
 window and delete live data. Unknown object ages are treated as young.
 
-The sweep streams the store listing, tests reachability as it goes, and
-deletes in 1000-key batches, so memory stays proportional to the *reachable*
-object set rather than to the store size. The listing comes from a pluggable
+Reachability roots include branch heads, tags, the client reflog (so an undo
+target survives until the client deletes its reflog), and staged content
+blobs/footers (so a long-lived `add` is never pruned before its commit). The
+sweep streams the store listing, tests reachability as it goes, and deletes in
+1000-key batches, so memory stays proportional to the *reachable* object set
+rather than to the store size. The listing comes from a pluggable
 existence source (the seam a future S3 Inventory adapter plugs into). Sweeps
 are idempotent — re-run one instead of resuming it; an entry a crashed sweep
 missed is simply found next time. Run `gc` (audit) before pruning in a shared
 repository, as always.
 
+**Shared-repository limitation (0.6.0):** staging and reflog roots are
+client-local. Another client's `gc --prune` can still collect a long-lived
+staged blob or a reset-away commit after the grace window. The lease design
+that closes this is in [docs/staging-lease.md](docs/staging-lease.md); until it
+ships, treat `gc --prune` as requiring quiescence in a shared repository.
+
 ## Concurrency Model
 
 There are no locks. Every shared mutation goes through compare-and-swap:
 
-- Local repos serialise CAS through an OS file lock (`flock`/`msvcrt`) and write atomically (temp file + rename).
+- Local repos serialise CAS through a POSIX `flock` and publish atomically (temp file in the destination directory, `fsync`, rename, directory `fsync`).
 - S3 repos use conditional `PutObject` (`IfMatch`/`IfNoneMatch`) so the check-and-write is atomic server-side.
 - `commit --staged` re-applies its overlay onto the new parent and retries on conflict; other mutations surface `RefConflictError` with both commit ids.
-- Opening a repository never mutates it: a branch with no ref yet is *unborn* (staging works, the first `commit` creates the ref).
+- A full commit is the worktree *plus* the staged overlay; staged additions win over a later edit to the same file. After a metadata-only `checkout`/`merge`/`reset`/`pull`, a stale worktree cannot silently overwrite a committed path: the commit fails with `WorktreeStaleError` until `restore --force` (or `commit --staged`).
+- Opening a repository is lazy; a branch with no ref yet is *unborn* (staging works, the first `commit` creates the ref). `must_exist=True` is available for callers that want a strict existence check.
 
 ## Mandatory Validation Coverage
 

@@ -1,7 +1,9 @@
 # Reflake Roadmap
 
-**Status (2026-10).** The v2 Merkle-tree model is the design of record and
-is shipped through **v0.5.0** (2026-10-21), which made trees canonical
+**Status (2026-11-10).** The v2 Merkle-tree model is the design of record and
+is shipped through **v0.6.0** (2026-11-10), the hardening release: verified
+reads, GC/sync completeness, durable writes, worktree safety, directory-aware
+VFS, streaming plans, and the KV store core. Version 0.5.0 made trees canonical
 (no mtime in entries), moved to a client stat cache, parallelised all
 latency-bound I/O, and made `rm`/`mv` worktree-safe. Through **v0.4.0**
 (2026-10-03): tree objects with shard locality
@@ -33,7 +35,10 @@ Reflake stays client-driven with a shared object-storage repository:
 
 ## Now
 
-0. **Format 2 follow-ups** — `reflake migrate` from 0.4.x (entry lines, tree
+0. **0.6 hardening follow-ups** — provenance, the catalog/discovery
+   convention, and cross-client staging/reflog GC roots. The review blockers
+   and streaming plans are fixed; see CHANGELOG "Unreleased".
+1. **Format 2 follow-ups** — `reflake migrate` from 0.4.x (entry lines, tree
    fanout, pointer identity all changed); an S3 Inventory-backed existence
    source for `gc`/sync planning. **Landed in 0.5.1:** a format-2 marker with
    a clear pre-2 error, `reflake fsck` (including `--verify-blobs`), and the

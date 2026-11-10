@@ -109,3 +109,18 @@ class IgnoreRules:
             if pattern.search(relative_path) is not None:
                 ignored = not negated
         return ignored
+
+    def ignores_path(self, relative_path: str) -> bool:
+        """True when a *file* is ignored, directly or via an ignored ancestor.
+
+        A directory-only rule (``scratch/``) prunes the walk, so a committed
+        file below it never appears in the worktree. Treating that absence as
+        a deletion makes ``status`` lie about what a commit would do.
+        """
+        if self.ignores(relative_path, is_dir=False):
+            return True
+        parts = relative_path.split("/")
+        for index in range(1, len(parts)):
+            if self.ignores("/".join(parts[:index]), is_dir=True):
+                return True
+        return False

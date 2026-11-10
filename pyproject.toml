@@ -1,6 +1,6 @@
 [project]
 name = "reflake"
-version = "0.5.1"
+version = "0.6.0"
 description = "A client-first, object-storage-first data versioning engine"
 readme = "README.md"
 authors = [{ name = "Hampus Londögård", email = "hampus.londogard@gmail.com" }]
@@ -17,7 +17,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",

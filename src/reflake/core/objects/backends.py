@@ -7,8 +7,9 @@ of docs/architecture.md (plan-then-batch sync).
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections import Counter
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 
@@ -51,7 +52,11 @@ class TransferPlan:
     """A batch of object copies in one direction."""
 
     direction: TransferDirection
-    items: tuple[TransferItem, ...] = ()
+    items: Iterable[TransferItem] = ()
+    #: Optional known item count (progress); plans may be lazy generators.
+    total: int | None = None
+    #: Per-kind counts, filled as a lazy plan is consumed.
+    counts: Counter[str] = field(default_factory=Counter)
 
     def __post_init__(self) -> None:
         if self.direction not in ("upload", "download"):

@@ -187,6 +187,10 @@ class StageStatus:
     #: Symbolic links found in the worktree. They are not versioned; reported
     #: so an omission is visible rather than silent.
     skipped_symlinks: list[str] = field(default_factory=list)
+    #: True when a metadata-only ref move (merge/reset/checkout/pull) left
+    #: the worktree behind the branch head. A full commit is refused until
+    #: the user restores or commits with ``--staged``.
+    worktree_stale: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "added", list(self.added))

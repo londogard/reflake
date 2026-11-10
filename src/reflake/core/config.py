@@ -7,11 +7,11 @@ from typing import Literal
 
 import msgspec
 
-#: Bumped whenever the on-disk model changes incompatibly. Version 2 is the
-#: canonical-entry model (no mtime in tree entries, 2 048-entry nodes,
-#: version-based pointer identity) introduced in 0.5.0.
-CURRENT_FORMAT_VERSION = 2
-SUPPORTED_FORMAT_VERSIONS: frozenset[int] = frozenset({2})
+#: One format constant for both client config and the shared ``repo.json``.
+#: Version 2 is the canonical-entry model introduced in 0.5.0.
+from .repo_format import CURRENT_FORMAT_VERSION
+
+SUPPORTED_FORMAT_VERSIONS: frozenset[int] = frozenset({CURRENT_FORMAT_VERSION})
 
 BackendType = Literal["local", "s3"]
 
@@ -39,6 +39,9 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
     #: Protects objects a concurrent writer published between its object
     #: writes and its ref CAS (mark-and-sweep races with no coordination).
     gc_grace_seconds: int = 86400
+    #: Flush local object/ref writes to stable storage. Disable only for
+    #: disposable repositories or tests; the default is crash-safe.
+    fsync: bool = True
 
     def __post_init__(self) -> None:
         if self.format_version not in SUPPORTED_FORMAT_VERSIONS:
@@ -60,6 +63,9 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
             raise ValueError("dataset_root must not be empty")
         if not self.default_branch:
             raise ValueError("default_branch must not be empty")
+        from .repository_support import validate_branch_name
+
+        validate_branch_name(self.default_branch)
 
     @staticmethod
     def load(root: str | Path) -> ReflakeConfig | None:
@@ -87,9 +93,10 @@ class BaseConfig(msgspec.Struct, tag_field="backend"):
 
 class LocalConfig(BaseConfig, tag="local"):
     def validate(self) -> None:
-        root_path = Path(self.dataset_root)
-        if not root_path.exists():
-            raise ValueError(f"Local dataset root does not exist: {self.dataset_root}")
+        # ``dataset_root`` is informational. It must not make a repository
+        # unopenable after the directory is moved or copied; the repository
+        # root is the argument to init/open, not a stored absolute path.
+        return None
 
 
 class S3Config(BaseConfig, tag="s3"):

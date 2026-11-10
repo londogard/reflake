@@ -7,7 +7,7 @@ from typing import Any
 
 from ..domain import BlobIntegrityError, ObjectMissingError, StorageUnavailableError
 from ..hashing import blake3_digest_file
-from .backends import S3ObjectMetadata, TransferPlan
+from .backends import S3ObjectMetadata, TransferItem, TransferPlan
 from .source import S3StorageBackend, _mtime_ns, build_s3_client, parse_s3_uri
 
 
@@ -41,13 +41,16 @@ class S3BlobTransferBackend:
         return False
 
     def transfer(self, plan: TransferPlan) -> int:
+        count = 0
         if plan.direction == "upload":
             for item in plan.items:
                 self.upload(item.local_path, item.remote_uri, if_not_exists=True)
+                count += 1
         else:
             for item in plan.items:
                 self.download(item.remote_uri, item.local_path)
-        return len(plan.items)
+                count += 1
+        return count
 
     def _backend(self, remote_uri: str) -> tuple[S3StorageBackend, str]:
         bucket, key = parse_s3_uri(remote_uri)
@@ -113,29 +116,32 @@ class S5CmdBlobTransferBackend:
         return True
 
     def transfer(self, plan: TransferPlan) -> int:
+        # s5cmd consumes a line-oriented manifest, so this path necessarily
+        # materializes the batch; the per-object boto3 path streams.
+        items = list(plan.items)
         lines: list[str] = []
         if plan.direction == "upload":
-            for item in plan.items:
+            for item in items:
                 _require_batch_safe(item.local_path, item.remote_uri)
                 lines.append(f"cp --if-not-exists {item.local_path} {item.remote_uri}")
         else:
-            for item in plan.items:
+            for item in items:
                 _require_batch_safe(item.remote_uri, item.local_path)
                 Path(item.local_path).parent.mkdir(parents=True, exist_ok=True)
                 lines.append(f"cp {item.remote_uri} {item.local_path}")
         self._run(["run"], input_data="\n".join(lines) + "\n")
         if plan.direction == "download":
-            self._verify_downloaded_blobs(plan)
-        return len(plan.items)
+            self._verify_downloaded_blobs(items)
+        return len(items)
 
     @staticmethod
-    def _verify_downloaded_blobs(plan: TransferPlan) -> None:
+    def _verify_downloaded_blobs(items: list[TransferItem]) -> None:
         """Check downloaded blobs against their content-addressed ids.
 
         s5cmd transfers bytes without parsing them; a silent mismatch would
         poison the local object store, so every blob is re-hashed once.
         """
-        for item in plan.items:
+        for item in items:
             if item.kind != "blob":
                 continue
             local_path = Path(item.local_path)
